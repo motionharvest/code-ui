@@ -3,6 +3,17 @@ use ratatui::layout::Rect;
 
 use crate::layout::SplitSide;
 
+/// Stored in layout/preset when the pane should spawn `$SHELL` (or `/bin/sh`).
+pub(crate) const LOGIN_SHELL_SENTINEL: &str = "__SHELL__";
+
+pub(crate) fn resolve_login_shell_command(command: &str) -> String {
+    if command == LOGIN_SHELL_SENTINEL {
+        std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
+    } else {
+        command.to_string()
+    }
+}
+
 pub(crate) fn contains(rect: Rect, x: u16, y: u16) -> bool {
     x >= rect.x
         && x < rect.x.saturating_add(rect.width)
@@ -10,23 +21,11 @@ pub(crate) fn contains(rect: Rect, x: u16, y: u16) -> bool {
         && y < rect.y.saturating_add(rect.height)
 }
 
-pub(crate) fn shrink_by_border(rect: Rect) -> Rect {
-    if rect.width <= 2 || rect.height <= 2 {
-        rect
-    } else {
-        Rect {
-            x: rect.x + 1,
-            y: rect.y + 1,
-            width: rect.width - 2,
-            height: rect.height - 2,
-        }
-    }
-}
-
 pub(crate) fn key_to_bytes(key: KeyEvent) -> Vec<u8> {
     match key.code {
         KeyCode::Backspace => vec![0x7f],
         KeyCode::Tab => vec![b'\t'],
+        KeyCode::BackTab => esc_seq(b"[Z"),
         KeyCode::Enter => vec![b'\r'],
         KeyCode::Left => esc_seq(b"[D"),
         KeyCode::Right => esc_seq(b"[C"),
@@ -66,12 +65,6 @@ pub(crate) fn key_to_bytes(key: KeyEvent) -> Vec<u8> {
         }
         _ => Vec::new(),
     }
-}
-
-pub(crate) fn is_close_pane_shortcut(key: &KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL)
-        && key.modifiers.contains(KeyModifiers::ALT)
-        && matches!(key.code, KeyCode::Char('-') | KeyCode::Char('_'))
 }
 
 pub(crate) fn arrow_key_to_split_side(code: KeyCode) -> Option<SplitSide> {

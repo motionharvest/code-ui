@@ -1,0 +1,9 @@
+focused=3
+layout=S(H,3517,L(0),S(H,5295,L(3),L(5)))
+default_agent=1
+title=0:Pi
+command=0:__SHELL__
+title=3:Terminal
+command=3:__SHELL__
+title=5:Pane%206
+command=5:pi
