@@ -14,7 +14,7 @@ pub(crate) struct Theme {
     pub(crate) title_bar: Color,
 }
 
-pub(crate) const THEMES: [Theme; 7] = [
+pub(crate) const THEMES: [Theme; 8] = [
     Theme {
         name: "Classic",
         background: Color::Black,
@@ -62,6 +62,14 @@ pub(crate) const THEMES: [Theme; 7] = [
         muted: Color::Rgb(101, 123, 131),
         accent: Color::Rgb(38, 139, 210),
         title_bar: Color::Rgb(7, 54, 66),
+    },
+    Theme {
+        name: "Synthwave",
+        background: Color::Rgb(22, 7, 43),
+        foreground: Color::Rgb(255, 230, 250),
+        muted: Color::Rgb(120, 96, 173),
+        accent: Color::Rgb(255, 79, 222),
+        title_bar: Color::Rgb(43, 16, 76),
     },
     Theme {
         name: "Light",

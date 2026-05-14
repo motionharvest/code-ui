@@ -5,7 +5,7 @@ use ratatui::{
     widgets::Borders,
 };
 
-use crate::{pane::Pane, ui::AGENT_PRESETS};
+use crate::{pane::Pane, ui::{truncate_to_width, AGENT_PRESETS}};
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct ExposedSides {
@@ -15,7 +15,7 @@ pub(crate) struct ExposedSides {
     pub(crate) right: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SplitSide {
     Top,
     Bottom,
@@ -75,6 +75,8 @@ pub(crate) const PANE_INNER_MARGIN: u16 = 1;
 // Single row of title text directly under the top border. PANE_INNER_MARGIN
 // below already separates it from the pane contents.
 pub(crate) const PANE_TITLE_BAR_HEIGHT: u16 = 1;
+/// Empty column between the inner title-bar edge and the title glyphs.
+pub(crate) const PANE_TITLE_LEFT_PADDING: u16 = 1;
 
 pub(crate) fn pane_borders(_exposed: ExposedSides) -> Borders {
     // Every pane owns all four borders. Adjacent panes therefore have distinct
@@ -97,6 +99,18 @@ pub(crate) fn pane_title_bar_area(area: Rect) -> Rect {
     }
 }
 
+/// Columns reserved on the right of the title bar for maximize / close
+/// controls (`main.rs` must stay in sync with these thresholds).
+pub(crate) fn pane_title_chrome_reserve(pane_area_width: u16) -> u16 {
+    if pane_area_width >= 9 {
+        8
+    } else if pane_area_width >= 6 {
+        4
+    } else {
+        0
+    }
+}
+
 pub(crate) fn pane_inner_area(area: Rect, _exposed: ExposedSides) -> Rect {
     let inset = 1 + PANE_INNER_MARGIN;
     let top_chrome = 1 + PANE_TITLE_BAR_HEIGHT + PANE_INNER_MARGIN;
@@ -116,20 +130,30 @@ pub(crate) fn pane_title_hit_area(area: Rect, title: &str) -> Option<Rect> {
         return None;
     }
 
-    // The title centers over the full title-bar width (between the left and
-    // right borders). Maximize/close take priority in click handling, so an
-    // overlap with the controls is harmless.
+    // Title is left-aligned in the bar; leave room for maximize/close on the
+    // right. Those controls take priority in click handling.
     let bar_width = area.width.saturating_sub(2);
     if bar_width == 0 {
         return None;
     }
 
-    let text_width = (title.chars().count() as u16).min(bar_width);
-    let offset = bar_width.saturating_sub(text_width) / 2;
+    let available = bar_width.saturating_sub(pane_title_chrome_reserve(area.width));
+    if available == 0 {
+        return None;
+    }
+
+    let text_budget = available.saturating_sub(PANE_TITLE_LEFT_PADDING) as usize;
+    let display = truncate_to_width(title, text_budget);
+    let text_width = display.chars().count() as u16;
+    let hit_width = PANE_TITLE_LEFT_PADDING.saturating_add(text_width).min(available);
+    if hit_width == 0 {
+        return None;
+    }
+
     Some(Rect {
-        x: area.x.saturating_add(1).saturating_add(offset),
+        x: area.x.saturating_add(1),
         y: title_y,
-        width: text_width,
+        width: hit_width,
         height: 1,
     })
 }

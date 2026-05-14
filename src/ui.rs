@@ -7,6 +7,24 @@ use ratatui::{
 
 use crate::{theme::Theme, theme::THEMES, utils::LOGIN_SHELL_SENTINEL};
 
+/// Truncate to a maximum number of terminal cells (counted as Unicode scalar
+/// values, matching ratatui's default monospace assumption).
+pub(crate) fn truncate_to_width(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+
+    if width == 0 {
+        String::new()
+    } else if width == 1 {
+        "…".to_string()
+    } else {
+        let mut out: String = text.chars().take(width.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct AgentPreset {
     pub label: &'static str,
@@ -38,7 +56,7 @@ pub(crate) const AGENT_PRESETS: [AgentPreset; 5] = [
         binary: Some("codex"),
     },
     AgentPreset {
-        label: "OpenCode",
+        label: "Opencode",
         command: "opencode",
         binary: Some("opencode"),
     },
@@ -87,9 +105,16 @@ impl PanelSettingsFocus {
 pub(crate) enum Modal {
     Help,
     Theme,
-    DefaultAgent {
+    NewPanePicker {
+        pane_id: usize,
+        source_pane_id: usize,
+        close_on_cancel: bool,
+        name: String,
+        cursor: usize,
+        name_selected: bool,
         agent_index: usize,
     },
+    #[allow(dead_code)]
     PanelSettings {
         pane_id: usize,
         name: String,
@@ -158,56 +183,6 @@ pub(crate) fn render_settings_button(f: &mut ratatui::Frame<'_>, size: Rect, the
     f.render_widget(button, area);
 }
 
-pub(crate) fn default_agent_button_area(size: Rect, label: &str) -> Rect {
-    let width = (2u16.saturating_add(label.chars().count() as u16))
-        .min(size.width)
-        .max(4);
-    Rect {
-        x: size.right().saturating_sub(width),
-        y: size.y,
-        width,
-        height: 1.min(size.height),
-    }
-}
-
-pub(crate) fn render_default_agent_button(
-    f: &mut ratatui::Frame<'_>,
-    size: Rect,
-    theme: Theme,
-    label: &str,
-    active: bool,
-) {
-    let area = default_agent_button_area(size, label);
-
-    // "Default" caption rendered to the left of the button. Purely cosmetic;
-    // the click hit area still maps to the button rect only.
-    const PREFIX: &str = "Default ";
-    let prefix_len = PREFIX.chars().count() as u16;
-    if area.x >= size.x.saturating_add(prefix_len) {
-        let prefix_area = Rect {
-            x: area.x.saturating_sub(prefix_len),
-            y: area.y,
-            width: prefix_len,
-            height: area.height,
-        };
-        f.render_widget(
-            Paragraph::new(PREFIX)
-                .alignment(Alignment::Left)
-                .style(Style::default().fg(theme.muted).bg(theme.background)),
-            prefix_area,
-        );
-    }
-
-    let button = Paragraph::new(format!("[{label}]"))
-        .alignment(Alignment::Center)
-        .style(if active {
-            Style::default().fg(theme.accent).bg(theme.background)
-        } else {
-            Style::default().fg(theme.foreground).bg(theme.background)
-        });
-    f.render_widget(button, area);
-}
-
 pub(crate) fn render_help_modal(
     f: &mut ratatui::Frame<'_>,
     size: Rect,
@@ -262,7 +237,7 @@ pub(crate) fn render_help_modal(
 T: Theme selector\n\
 D: Toggle container debug boxes\n\
 Ctrl+Q: Quit\n\
-Ctrl+Alt+Arrows: Split pane\n\
+Ctrl+Alt+Arrows: Split pane (pick agent)\n\
 Ctrl+Shift+A / B: Split right / down\n\
 Ctrl+PgUp/PgDn: Cycle pane focus\n\
 Ctrl+W: Close focused pane\n\
@@ -411,34 +386,99 @@ pub(crate) fn panel_settings_confirm_button_area(area: Rect) -> Rect {
     }
 }
 
-pub(crate) fn default_agent_dropdown_area(size: Rect) -> Rect {
-    let width = 18.min(size.width);
-    let height = (AGENT_PRESETS.len() as u16 + 2).min(size.height.saturating_sub(1).max(1));
+pub(crate) fn new_pane_picker_modal_area(container: Rect) -> Rect {
+    let width = 26.min(container.width);
+    let height = (AGENT_PRESETS.len() as u16 + 9).min(container.height);
     Rect {
-        x: size.right().saturating_sub(width),
-        y: size.y.saturating_add(1),
+        x: container.x + (container.width.saturating_sub(width)) / 2,
+        y: container.y + (container.height.saturating_sub(height)) / 2,
         width,
         height,
     }
 }
 
-pub(crate) fn render_default_agent_dropdown(
+pub(crate) fn new_pane_picker_name_input_area(area: Rect) -> Rect {
+    let inner = Block::default().borders(Borders::ALL).inner(area);
+    Rect {
+        x: inner.x,
+        y: inner.y + 2,
+        width: inner.width,
+        height: 3,
+    }
+}
+
+pub(crate) fn new_pane_picker_list_area(area: Rect) -> Rect {
+    let inner = Block::default().borders(Borders::ALL).inner(area);
+    Rect {
+        x: inner.x,
+        y: inner.y + 6,
+        width: inner.width,
+        height: AGENT_PRESETS.len() as u16,
+    }
+}
+
+pub(crate) fn render_new_pane_picker_modal(
     f: &mut ratatui::Frame<'_>,
-    size: Rect,
+    container: Rect,
     theme: Theme,
+    name: &str,
+    cursor: usize,
+    name_selected: bool,
     agent_index: usize,
 ) {
-    let area = default_agent_dropdown_area(size);
+    let area = new_pane_picker_modal_area(container);
     f.render_widget(Clear, area);
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("Agent")
+        .title("New Pane")
         .style(Style::default().fg(theme.foreground).bg(theme.background))
         .border_style(Style::default().fg(theme.accent));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    let hint = Paragraph::new("Type name, L/R cursor, U/D agent")
+        .style(Style::default().fg(theme.muted).bg(theme.background));
+    f.render_widget(
+        hint,
+        Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: 1,
+        },
+    );
+
+    let name_label =
+        Paragraph::new("Name").style(Style::default().fg(theme.foreground).bg(theme.background));
+    f.render_widget(
+        name_label,
+        Rect {
+            x: inner.x,
+            y: inner.y + 1,
+            width: inner.width,
+            height: 1,
+        },
+    );
+
+    let name_area = new_pane_picker_name_input_area(area);
+    let name_block = Block::default()
+        .borders(Borders::ALL)
+        .style(Style::default().fg(theme.foreground).bg(theme.background))
+        .border_style(Style::default().fg(theme.accent));
+    let name_inner = name_block.inner(name_area);
+    f.render_widget(name_block, name_area);
+    f.render_widget(
+        Paragraph::new(name.to_string())
+            .style(if name_selected {
+                Style::default().fg(theme.background).bg(theme.accent)
+            } else {
+                Style::default().fg(theme.foreground).bg(theme.background)
+            }),
+        name_inner,
+    );
+
+    let list_area = new_pane_picker_list_area(area);
     let mut lines: Vec<Line<'static>> = Vec::new();
     for (idx, preset) in AGENT_PRESETS.iter().enumerate() {
         let selected = idx == agent_index;
@@ -460,8 +500,17 @@ pub(crate) fn render_default_agent_dropdown(
         Paragraph::new(Text::from(lines))
             .style(Style::default().fg(theme.foreground).bg(theme.background))
             .wrap(Wrap { trim: false }),
-        inner,
+        list_area,
     );
+
+    let clamped_cursor = if name_selected {
+        name.chars().count()
+    } else {
+        cursor.min(name.chars().count())
+    };
+    let cursor_x =
+        name_inner.x.saturating_add(clamped_cursor.min(name_inner.width.saturating_sub(1) as usize) as u16);
+    f.set_cursor(cursor_x, name_inner.y);
 }
 
 pub(crate) fn render_panel_settings_modal(

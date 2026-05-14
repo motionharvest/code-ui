@@ -29,12 +29,14 @@ use ratatui::{
     Frame, Terminal,
 };
 
-use app::App;
-use layout::{pane_borders, pane_inner_area, pane_title_bar_area, pane_title_y};
+use app::{App, MousePointerShape};
+use layout::{
+    pane_borders, pane_inner_area, pane_title_bar_area, pane_title_chrome_reserve,
+    pane_title_y, PANE_TITLE_LEFT_PADDING,
+};
 use ui::{
-    render_close_confirm_modal, render_default_agent_button, render_default_agent_dropdown,
-    render_help_modal, render_panel_settings_modal, render_settings_button, render_theme_modal,
-    AGENT_PRESETS,
+    render_close_confirm_modal, render_help_modal, render_new_pane_picker_modal,
+    render_panel_settings_modal, render_settings_button, render_theme_modal, truncate_to_width,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -90,6 +92,7 @@ fn main() -> anyhow::Result<()> {
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) {
     let _ = disable_raw_mode();
     let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags,);
+    let _ = set_mouse_pointer_shape(terminal.backend_mut(), MousePointerShape::Default);
     let _ = execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
@@ -130,22 +133,6 @@ fn is_input_output_error(err: &anyhow::Error) -> bool {
             .downcast_ref::<io::Error>()
             .is_some_and(|io_err| io_err.raw_os_error() == Some(5))
     })
-}
-
-fn truncate_to_width(text: &str, width: usize) -> String {
-    if text.chars().count() <= width {
-        return text.to_string();
-    }
-
-    if width == 0 {
-        String::new()
-    } else if width == 1 {
-        "…".to_string()
-    } else {
-        let mut out: String = text.chars().take(width.saturating_sub(1)).collect();
-        out.push('…');
-        out
-    }
 }
 
 fn render_debug_divider(f: &mut ratatui::Frame<'_>, area: Rect, style: Style) {
@@ -194,6 +181,8 @@ fn horizontal_divider_glyphs(width: u16) -> String {
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> anyhow::Result<()> {
     let mut cursor_visible = false;
     let mut mouse_capture_enabled = true;
+    let mut mouse_pointer_shape = MousePointerShape::Default;
+    let mut last_mouse_position: Option<(u16, u16)> = None;
     let mut last_size = terminal.size()?;
     app.resize(last_size.height, last_size.width);
     // Force an initial paint.
@@ -223,17 +212,6 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                 );
 
                 render_settings_button(f, f.size(), theme);
-                let default_label = AGENT_PRESETS
-                    .get(app.default_agent_index)
-                    .map(|p| p.label)
-                    .unwrap_or(AGENT_PRESETS[0].label);
-                render_default_agent_button(
-                    f,
-                    f.size(),
-                    theme,
-                    default_label,
-                    matches!(app.modal, Some(ui::Modal::DefaultAgent { .. })),
-                );
 
                 let debug_mode = false;
                 let (debug_containers, debug_placements) = if debug_mode {
@@ -297,14 +275,16 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         continue;
                     }
 
-                    let chrome_style = if focused || in_resize_preview {
-                        Style::default()
-                            .fg(theme.accent)
-                            .bg(theme.background)
-                            .add_modifier(Modifier::BOLD)
+                    let border_color = if focused || in_resize_preview {
+                        theme.accent
                     } else {
-                        Style::default().fg(theme.muted).bg(theme.background)
+                        theme.muted
                     };
+                    let mut chrome_style =
+                        Style::default().fg(border_color).bg(theme.background);
+                    if focused || in_resize_preview {
+                        chrome_style = chrome_style.add_modifier(Modifier::BOLD);
+                    }
 
                     let block = Block::default()
                         .borders(pane_borders(placement.exposed))
@@ -326,22 +306,25 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                     let title_y = pane_title_y(pane_area);
                     if title_y < pane_area.bottom() {
                         let title_bar_width = pane_area.width.saturating_sub(2);
-                        if title_bar_width > 0 {
+                        if title_bar_width > PANE_TITLE_LEFT_PADDING {
                             let preview = if in_resize_preview { " resizing" } else { "" };
                             let title = format!("{}{}", pane.title, preview);
-                            let title_text = if focused {
-                                truncate_to_width(&format!("▶ {title} ◀"), title_bar_width as usize)
-                            } else {
-                                truncate_to_width(&title, title_bar_width as usize)
-                            };
+                            let title_max = title_bar_width
+                                .saturating_sub(pane_title_chrome_reserve(pane_area.width))
+                                .saturating_sub(PANE_TITLE_LEFT_PADDING) as usize;
+                            let title_text = truncate_to_width(&title, title_max);
+                            let title_slot_w = title_bar_width.saturating_sub(PANE_TITLE_LEFT_PADDING);
                             f.render_widget(
                                 Paragraph::new(title_text)
-                                    .alignment(Alignment::Center)
+                                    .alignment(Alignment::Left)
                                     .style(chrome_style.bg(theme.title_bar)),
                                 Rect {
-                                    x: pane_area.x.saturating_add(1),
+                                    x: pane_area
+                                        .x
+                                        .saturating_add(1)
+                                        .saturating_add(PANE_TITLE_LEFT_PADDING),
                                     y: title_y,
-                                    width: title_bar_width,
+                                    width: title_slot_w,
                                     height: 1,
                                 },
                             );
@@ -430,8 +413,29 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         ui::Modal::Theme => {
                             render_theme_modal(f, f.size(), app.theme_preview_index, theme)
                         }
-                        ui::Modal::DefaultAgent { agent_index } => {
-                            render_default_agent_dropdown(f, f.size(), theme, *agent_index);
+                        ui::Modal::NewPanePicker {
+                            pane_id,
+                            name,
+                            cursor,
+                            name_selected,
+                            agent_index,
+                            ..
+                        } => {
+                            let container = app
+                                .pane_placements(App::content_area(f.size()))
+                                .into_iter()
+                                .find(|placement| placement.pane_id == *pane_id)
+                                .map(|placement| placement.area)
+                                .unwrap_or(App::content_area(f.size()));
+                            render_new_pane_picker_modal(
+                                f,
+                                container,
+                                theme,
+                                name,
+                                *cursor,
+                                *name_selected,
+                                *agent_index,
+                            );
                         }
                         ui::Modal::PanelSettings {
                             name,
@@ -458,10 +462,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
         let should_show_cursor = app.modal.is_none()
             || matches!(
                 app.modal,
-                Some(ui::Modal::PanelSettings {
-                    focus: ui::PanelSettingsFocus::Name,
-                    ..
-                })
+                Some(ui::Modal::NewPanePicker { .. })
+                    | Some(ui::Modal::PanelSettings {
+                        focus: ui::PanelSettingsFocus::Name,
+                        ..
+                    })
             );
         if should_show_cursor != cursor_visible {
             if should_show_cursor {
@@ -479,6 +484,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                     dirty = true;
                 }
                 Event::Mouse(mouse) => {
+                    last_mouse_position = Some((mouse.column, mouse.row));
                     app.handle_mouse(mouse, size)?;
                     dirty = true;
                 }
@@ -493,6 +499,18 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
             }
         }
 
+        let desired_pointer_shape = if app.mouse_capture_enabled() {
+            last_mouse_position
+                .map(|(x, y)| app.pointer_shape_at(size, x, y))
+                .unwrap_or(MousePointerShape::Default)
+        } else {
+            MousePointerShape::Default
+        };
+        if desired_pointer_shape != mouse_pointer_shape {
+            set_mouse_pointer_shape(terminal.backend_mut(), desired_pointer_shape)?;
+            mouse_pointer_shape = desired_pointer_shape;
+        }
+
         if app.mouse_capture_enabled() != mouse_capture_enabled {
             if app.mouse_capture_enabled() {
                 execute!(terminal.backend_mut(), EnableMouseCapture)?;
@@ -504,6 +522,19 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
     }
 
     Ok(())
+}
+
+fn set_mouse_pointer_shape(
+    out: &mut impl io::Write,
+    shape: MousePointerShape,
+) -> io::Result<()> {
+    let name = match shape {
+        MousePointerShape::Default => "default",
+        MousePointerShape::HorizontalResize => "ew-resize",
+        MousePointerShape::VerticalResize => "ns-resize",
+    };
+    write!(out, "\x1b]22;{}\x1b\\", name)?;
+    out.flush()
 }
 
 fn render_fancy_selected_border(f: &mut Frame<'_>, area: Rect, style: Style) {

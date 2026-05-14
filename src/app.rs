@@ -18,12 +18,13 @@ use crate::{
     theme::{load_persisted_theme_index, save_persisted_theme, Theme, THEMES},
     ui::{
         close_confirm_cancel_button_area, close_confirm_confirm_button_area,
-        close_confirm_modal_area, default_agent_button_area, default_agent_dropdown_area,
-        help_close_button_area, help_debug_toggle_button_area, help_modal_area,
-        panel_settings_agent_list_area, panel_settings_cancel_button_area,
-        panel_settings_close_button_area, panel_settings_confirm_button_area,
-        panel_settings_modal_area, panel_settings_modal_inner, panel_settings_name_input_area,
-        settings_button_area, Modal, PanelSettingsFocus, AGENT_PRESETS,
+        close_confirm_modal_area, help_close_button_area, help_debug_toggle_button_area,
+        help_modal_area, new_pane_picker_list_area, new_pane_picker_modal_area,
+        new_pane_picker_name_input_area, panel_settings_agent_list_area,
+        panel_settings_cancel_button_area, panel_settings_close_button_area,
+        panel_settings_confirm_button_area, panel_settings_modal_area,
+        panel_settings_modal_inner, panel_settings_name_input_area, settings_button_area, Modal,
+        PanelSettingsFocus, AGENT_PRESETS,
     },
     utils::{arrow_key_to_split_side, contains, key_to_bytes},
 };
@@ -41,7 +42,6 @@ pub(crate) struct App {
     theme_index: usize,
     pub(crate) default_agent_index: usize,
     pub(crate) theme_preview_index: usize,
-    last_title_click: Option<(usize, Instant)>,
     debug_container_boxes: bool,
     mouse_capture_enabled: bool,
 }
@@ -62,7 +62,16 @@ struct ResizeTarget {
     pane_ids: Vec<usize>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MousePointerShape {
+    Default,
+    HorizontalResize,
+    VerticalResize,
+}
+
 impl App {
+    const NEW_PANE_PLACEHOLDER_COMMAND: &'static str = "cat";
+
     pub(crate) fn new(rows: u16, cols: u16) -> anyhow::Result<Self> {
         let content_rows = rows.saturating_sub(2).max(1);
         let content_cols = cols.saturating_sub(3).max(1);
@@ -131,7 +140,6 @@ impl App {
             theme_index,
             default_agent_index,
             theme_preview_index: theme_index,
-            last_title_click: None,
             debug_container_boxes: parse_debug_flag("SPLIT_TUI_DEBUG_CONTAINERS"),
             mouse_capture_enabled: true,
         })
@@ -268,15 +276,32 @@ impl App {
             return Ok(());
         };
 
-        let (rows, cols) = {
-            let pane = &self.panes[pos];
-            (pane.rows, pane.cols)
-        };
         let command = AGENT_PRESETS
             .get(agent_index)
             .map(|p| p.command)
             .unwrap_or(AGENT_PRESETS[0].command)
             .to_string();
+
+        let (rows, cols, command_changed, title_changed) = {
+            let pane = &self.panes[pos];
+            (
+                pane.rows,
+                pane.cols,
+                pane.command != command,
+                pane.title != name,
+            )
+        };
+
+        if !command_changed && !title_changed {
+            return Ok(());
+        }
+
+        if !command_changed {
+            self.panes[pos].title = name;
+            self.focus_pane(pane_id);
+            self.persist_layout();
+            return Ok(());
+        }
 
         // Changing the agent of a pane discards any prior resume hint.
         self.panes[pos] = Pane::new(pane_id, name, command, None, rows, cols)?;
@@ -378,38 +403,100 @@ impl App {
                     self.modal = Some(Modal::Theme);
                     return Ok(());
                 }
-                Modal::DefaultAgent { mut agent_index } => {
+                Modal::NewPanePicker {
+                    pane_id,
+                    source_pane_id,
+                    close_on_cancel,
+                    mut name,
+                    mut cursor,
+                    mut name_selected,
+                    mut agent_index,
+                } => {
                     match key.code {
                         KeyCode::Esc => {
+                            if close_on_cancel {
+                                self.focus_pane(pane_id);
+                                self.close_pane();
+                                self.focus_pane(source_pane_id);
+                            }
                             self.modal = None;
                             return Ok(());
                         }
                         KeyCode::Up | KeyCode::Left => {
-                            agent_index = if agent_index == 0 {
-                                AGENT_PRESETS.len() - 1
+                            if key.code == KeyCode::Up {
+                                agent_index = if agent_index == 0 {
+                                    AGENT_PRESETS.len() - 1
+                                } else {
+                                    agent_index - 1
+                                };
                             } else {
-                                agent_index - 1
-                            };
+                                if name_selected {
+                                    cursor = 0;
+                                    name_selected = false;
+                                } else {
+                                    cursor = cursor.saturating_sub(1);
+                                }
+                            }
                         }
                         KeyCode::Down | KeyCode::Right => {
-                            agent_index = (agent_index + 1) % AGENT_PRESETS.len();
+                            if key.code == KeyCode::Down {
+                                agent_index = (agent_index + 1) % AGENT_PRESETS.len();
+                            } else {
+                                if name_selected {
+                                    cursor = name.chars().count();
+                                    name_selected = false;
+                                } else {
+                                    cursor = (cursor + 1).min(name.chars().count());
+                                }
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            if name_selected {
+                                name.clear();
+                                cursor = 0;
+                                name_selected = false;
+                            } else {
+                                remove_char_before_cursor(&mut name, &mut cursor);
+                            }
+                        }
+                        KeyCode::Delete => {
+                            if name_selected {
+                                name.clear();
+                                cursor = 0;
+                                name_selected = false;
+                            } else {
+                                remove_char_at_cursor(&mut name, cursor);
+                            }
+                        }
+                        KeyCode::Char(c)
+                            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                                && !key.modifiers.contains(KeyModifiers::ALT) =>
+                        {
+                            if name_selected {
+                                name.clear();
+                                cursor = 0;
+                                name_selected = false;
+                            }
+                            insert_char_at_cursor(&mut name, &mut cursor, c);
                         }
                         KeyCode::Enter => {
                             self.default_agent_index = agent_index;
+                            self.apply_panel_settings(pane_id, name, agent_index)?;
                             self.modal = None;
                             return Ok(());
-                        }
-                        KeyCode::Char(c) if c.is_ascii_digit() => {
-                            if let Some(idx) = c.to_digit(10).map(|n| n as usize) {
-                                if idx >= 1 && idx <= AGENT_PRESETS.len() {
-                                    agent_index = idx - 1;
-                                }
-                            }
                         }
                         _ => {}
                     }
 
-                    self.modal = Some(Modal::DefaultAgent { agent_index });
+                    self.modal = Some(Modal::NewPanePicker {
+                        pane_id,
+                        source_pane_id,
+                        close_on_cancel,
+                        name,
+                        cursor,
+                        name_selected,
+                        agent_index,
+                    });
                     return Ok(());
                 }
                 Modal::PanelSettings {
@@ -537,9 +624,29 @@ impl App {
             && key.modifiers.contains(KeyModifiers::ALT)
         {
             if let Some(side) = arrow_key_to_split_side(key.code) {
-                let focused = self.focused;
-                let new_id = self.split_pane(focused, side, size)?;
-                self.focus_pane(new_id);
+                let source_pane_id = self.focused;
+                let pane_id = self.split_pane_with_command(
+                    source_pane_id,
+                    side,
+                    Self::NEW_PANE_PLACEHOLDER_COMMAND,
+                    size,
+                )?;
+                self.focus_pane(pane_id);
+                let pane_name = self
+                    .panes
+                    .iter()
+                    .find(|pane| pane.id == pane_id)
+                    .map(|pane| pane.title.clone())
+                    .unwrap_or_else(|| format!("Pane {}", pane_id + 1));
+                self.modal = Some(Modal::NewPanePicker {
+                    pane_id,
+                    source_pane_id,
+                    close_on_cancel: true,
+                    cursor: pane_name.chars().count(),
+                    name_selected: true,
+                    name: pane_name,
+                    agent_index: self.default_agent_index,
+                });
                 return Ok(());
             }
         }
@@ -620,6 +727,33 @@ impl App {
                         focus,
                     });
                 }
+                Modal::NewPanePicker {
+                    pane_id,
+                    source_pane_id,
+                    close_on_cancel,
+                    mut name,
+                    mut cursor,
+                    mut name_selected,
+                    agent_index,
+                } => {
+                    if name_selected {
+                        name.clear();
+                        cursor = 0;
+                        name_selected = false;
+                    }
+                    for ch in text.chars() {
+                        insert_char_at_cursor(&mut name, &mut cursor, ch);
+                    }
+                    self.modal = Some(Modal::NewPanePicker {
+                        pane_id,
+                        source_pane_id,
+                        close_on_cancel,
+                        name,
+                        cursor,
+                        name_selected,
+                        agent_index,
+                    });
+                }
                 other => {
                     self.modal = Some(other);
                 }
@@ -696,26 +830,49 @@ impl App {
                     self.modal = Some(Modal::Theme);
                     return Ok(());
                 }
-                Modal::DefaultAgent { agent_index } => {
-                    let area = default_agent_dropdown_area(size);
-                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                        if contains(area, mouse.column, mouse.row) {
-                            let inner = Rect {
-                                x: area.x + 1,
-                                y: area.y + 1,
-                                width: area.width.saturating_sub(2),
-                                height: area.height.saturating_sub(2),
-                            };
-                            let selected = mouse.row.saturating_sub(inner.y) as usize;
+                Modal::NewPanePicker {
+                    pane_id,
+                    source_pane_id,
+                    close_on_cancel,
+                    name,
+                    mut cursor,
+                    mut name_selected,
+                    mut agent_index,
+                } => {
+                    let container = self
+                        .pane_placements(Self::content_area(size))
+                        .into_iter()
+                        .find(|placement| placement.pane_id == pane_id)
+                        .map(|placement| placement.area)
+                        .unwrap_or(Self::content_area(size));
+                    let area = new_pane_picker_modal_area(container);
+                    let name_area = new_pane_picker_name_input_area(area);
+                    let name_inner = ratatui::widgets::Block::default()
+                        .borders(ratatui::widgets::Borders::ALL)
+                        .inner(name_area);
+                    let list_area = new_pane_picker_list_area(area);
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                    {
+                        if contains(list_area, mouse.column, mouse.row) {
+                            let selected = mouse.row.saturating_sub(list_area.y) as usize;
                             if selected < AGENT_PRESETS.len() {
-                                self.default_agent_index = selected;
-                                self.modal = None;
-                                return Ok(());
+                                agent_index = selected;
                             }
+                        } else if contains(name_inner, mouse.column, mouse.row) {
+                            let click_col = mouse.column.saturating_sub(name_inner.x) as usize;
+                            cursor = click_col.min(name.chars().count());
+                            name_selected = false;
                         }
                     }
-
-                    self.modal = Some(Modal::DefaultAgent { agent_index });
+                    self.modal = Some(Modal::NewPanePicker {
+                        pane_id,
+                        source_pane_id,
+                        close_on_cancel,
+                        name,
+                        cursor,
+                        name_selected,
+                        agent_index,
+                    });
                     return Ok(());
                 }
                 Modal::PanelSettings {
@@ -808,17 +965,6 @@ impl App {
             return Ok(());
         }
 
-        if contains(
-            default_agent_button_area(size, AGENT_PRESETS[self.default_agent_index].label),
-            mouse.column,
-            mouse.row,
-        ) && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-        {
-            let agent_index = self.default_agent_index;
-            self.modal = Some(Modal::DefaultAgent { agent_index });
-            return Ok(());
-        }
-
         let clicked = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
         let Some(placement) = self.placement_at(size, mouse.column, mouse.row) else {
             return Ok(());
@@ -881,27 +1027,21 @@ impl App {
 
         if clicked && placement.title_hit(&pane_title, was_focused, mouse.column, mouse.row) {
             self.focus_pane(placement.pane_id);
-            let now = Instant::now();
-            if self.last_title_click.is_some_and(|(pane_id, last)| {
-                pane_id == placement.pane_id
-                    && now.duration_since(last) <= Duration::from_millis(500)
-            }) {
-                self.last_title_click = None;
-                let agent_index = self
-                    .panes
-                    .iter()
-                    .find(|pane| pane.id == placement.pane_id)
-                    .map(|pane| agent_index_for_command(&pane.command))
-                    .unwrap_or(0);
-                self.modal = Some(Modal::PanelSettings {
-                    pane_id: placement.pane_id,
-                    name: pane_title.clone(),
-                    agent_index,
-                    focus: PanelSettingsFocus::Name,
-                });
-            } else {
-                self.last_title_click = Some((placement.pane_id, now));
-            }
+            let agent_index = self
+                .panes
+                .iter()
+                .find(|pane| pane.id == placement.pane_id)
+                .map(|pane| agent_index_for_command(&pane.command))
+                .unwrap_or(0);
+            self.modal = Some(Modal::NewPanePicker {
+                pane_id: placement.pane_id,
+                source_pane_id: placement.pane_id,
+                close_on_cancel: false,
+                name: pane_title.clone(),
+                cursor: pane_title.chars().count(),
+                name_selected: true,
+                agent_index,
+            });
             return Ok(());
         }
 
@@ -940,6 +1080,30 @@ impl App {
         side: SplitSide,
         terminal_size: Rect,
     ) -> anyhow::Result<usize> {
+        self.split_pane_with_agent(pane_id, side, self.default_agent_index, terminal_size)
+    }
+
+    pub(crate) fn split_pane_with_agent(
+        &mut self,
+        pane_id: usize,
+        side: SplitSide,
+        agent_index: usize,
+        terminal_size: Rect,
+    ) -> anyhow::Result<usize> {
+        let command = AGENT_PRESETS
+            .get(agent_index)
+            .map(|preset| preset.command)
+            .unwrap_or(AGENT_PRESETS[0].command);
+        self.split_pane_with_command(pane_id, side, command, terminal_size)
+    }
+
+    fn split_pane_with_command(
+        &mut self,
+        pane_id: usize,
+        side: SplitSide,
+        command: &str,
+        terminal_size: Rect,
+    ) -> anyhow::Result<usize> {
         let new_id = self.next_pane_id;
         self.next_pane_id = self.next_pane_id.saturating_add(1);
 
@@ -947,7 +1111,7 @@ impl App {
         self.panes.push(Pane::new(
             new_id,
             title,
-            AGENT_PRESETS[self.default_agent_index].command,
+            command,
             None,
             1,
             1,
@@ -1182,6 +1346,26 @@ impl App {
         self.mouse_capture_enabled
     }
 
+    pub(crate) fn pointer_shape_at(&self, size: Rect, x: u16, y: u16) -> MousePointerShape {
+        if self.modal.is_some() {
+            return MousePointerShape::Default;
+        }
+
+        if let Some(drag) = &self.drag_resize {
+            return match drag.direction {
+                Direction::Horizontal => MousePointerShape::HorizontalResize,
+                Direction::Vertical => MousePointerShape::VerticalResize,
+            };
+        }
+
+        self.resize_target_at(size, x, y)
+            .map(|target| match target.direction {
+                Direction::Horizontal => MousePointerShape::HorizontalResize,
+                Direction::Vertical => MousePointerShape::VerticalResize,
+            })
+            .unwrap_or(MousePointerShape::Default)
+    }
+
     pub(crate) fn resize_preview_pane_ids(&self) -> Option<&[usize]> {
         self.drag_resize
             .as_ref()
@@ -1374,4 +1558,37 @@ fn agent_index_for_command(command: &str) -> usize {
         .iter()
         .position(|preset| preset.command == normalized)
         .unwrap_or(1)
+}
+
+fn char_to_byte_idx(text: &str, char_idx: usize) -> usize {
+    text.char_indices()
+        .nth(char_idx)
+        .map(|(idx, _)| idx)
+        .unwrap_or(text.len())
+}
+
+fn insert_char_at_cursor(text: &mut String, cursor: &mut usize, ch: char) {
+    let byte_idx = char_to_byte_idx(text, *cursor);
+    text.insert(byte_idx, ch);
+    *cursor += 1;
+}
+
+fn remove_char_before_cursor(text: &mut String, cursor: &mut usize) {
+    if *cursor == 0 {
+        return;
+    }
+    let start = char_to_byte_idx(text, *cursor - 1);
+    let end = char_to_byte_idx(text, *cursor);
+    text.replace_range(start..end, "");
+    *cursor -= 1;
+}
+
+fn remove_char_at_cursor(text: &mut String, cursor: usize) {
+    let len = text.chars().count();
+    if cursor >= len {
+        return;
+    }
+    let start = char_to_byte_idx(text, cursor);
+    let end = char_to_byte_idx(text, cursor + 1);
+    text.replace_range(start..end, "");
 }

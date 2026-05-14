@@ -1,9 +1,9 @@
-focused=3
-layout=S(H,3517,L(0),S(H,5295,L(3),L(5)))
+focused=6
+layout=S(V,4000,S(H,5218,L(6),L(8)),L(7))
 default_agent=1
-title=0:Pi
-command=0:__SHELL__
-title=3:Terminal
-command=3:__SHELL__
-title=5:Pane%206
-command=5:pi
+title=6:Pane%207
+command=6:codex
+title=7:Resizable
+command=7:pi
+title=8:Pane%209
+command=8:pi
