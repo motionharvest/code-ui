@@ -5,7 +5,10 @@ use ratatui::{
     widgets::Borders,
 };
 
-use crate::{pane::Pane, ui::{truncate_to_width, AGENT_PRESETS}};
+use crate::{
+    pane::Pane,
+    ui::{truncate_to_width, AGENT_PRESETS},
+};
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct ExposedSides {
@@ -23,9 +26,15 @@ pub(crate) enum SplitSide {
     Right,
 }
 
-pub(crate) struct PersistedLayout {
+pub(crate) struct PersistedWorkspace {
+    pub(crate) name: String,
     pub(crate) layout: Node,
     pub(crate) focused: usize,
+}
+
+pub(crate) struct PersistedLayout {
+    pub(crate) workspaces: Vec<PersistedWorkspace>,
+    pub(crate) active_workspace: usize,
     pub(crate) default_agent_index: usize,
     pub(crate) titles: BTreeMap<usize, String>,
     pub(crate) commands: BTreeMap<usize, String>,
@@ -33,6 +42,8 @@ pub(crate) struct PersistedLayout {
     /// present at startup, the pane is launched by running this verbatim via
     /// `/bin/sh -c` rather than the canonical agent command.
     pub(crate) resume_commands: BTreeMap<usize, String>,
+    /// Most recent submitted command per pane.
+    pub(crate) last_commands: BTreeMap<usize, String>,
 }
 
 pub(crate) struct Placement {
@@ -72,40 +83,39 @@ const RATIO_SCALE: u16 = 10_000;
 const RATIO_HALF: u16 = RATIO_SCALE / 2;
 
 pub(crate) const PANE_INNER_MARGIN: u16 = 1;
-// Single row of title text directly under the top border. PANE_INNER_MARGIN
-// below already separates it from the pane contents.
+// Single row of title text on the pane's top edge. PANE_INNER_MARGIN below
+// already separates it from the pane contents.
 pub(crate) const PANE_TITLE_BAR_HEIGHT: u16 = 1;
-/// Empty column between the inner title-bar edge and the title glyphs.
+/// Extra left padding before the title glyphs.
 pub(crate) const PANE_TITLE_LEFT_PADDING: u16 = 1;
 
 pub(crate) fn pane_borders(_exposed: ExposedSides) -> Borders {
-    // Every pane owns all four borders. Adjacent panes therefore have distinct
-    // edge cells instead of visually sharing one edge.
+    // The pane uses a normal rounded frame on all sides; the title is rendered
+    // as a cutout in the top border row.
     Borders::ALL
 }
 
 pub(crate) fn pane_title_y(area: Rect) -> u16 {
-    // Title text sits on the first row of the title bar (just under the top
-    // border).
-    area.y.saturating_add(1)
+    // Title text sits on the top row of the title bar.
+    area.y
 }
 
 pub(crate) fn pane_title_bar_area(area: Rect) -> Rect {
     Rect {
         x: area.x.saturating_add(1),
-        y: area.y.saturating_add(1),
+        y: area.y,
         width: area.width.saturating_sub(2),
-        height: PANE_TITLE_BAR_HEIGHT.min(area.height.saturating_sub(2)),
+        height: PANE_TITLE_BAR_HEIGHT.min(area.height),
     }
 }
 
 /// Columns reserved on the right of the title bar for maximize / close
 /// controls (`main.rs` must stay in sync with these thresholds).
 pub(crate) fn pane_title_chrome_reserve(pane_area_width: u16) -> u16 {
-    if pane_area_width >= 9 {
-        8
+    if pane_area_width >= 11 {
+        7
     } else if pane_area_width >= 6 {
-        4
+        3
     } else {
         0
     }
@@ -113,7 +123,7 @@ pub(crate) fn pane_title_chrome_reserve(pane_area_width: u16) -> u16 {
 
 pub(crate) fn pane_inner_area(area: Rect, _exposed: ExposedSides) -> Rect {
     let inset = 1 + PANE_INNER_MARGIN;
-    let top_chrome = 1 + PANE_TITLE_BAR_HEIGHT + PANE_INNER_MARGIN;
+    let top_chrome = PANE_TITLE_BAR_HEIGHT + PANE_INNER_MARGIN;
     Rect {
         x: area.x.saturating_add(inset),
         y: area.y.saturating_add(top_chrome),
@@ -130,10 +140,12 @@ pub(crate) fn pane_title_hit_area(area: Rect, title: &str) -> Option<Rect> {
         return None;
     }
 
-    // Title is left-aligned in the bar; leave room for maximize/close on the
-    // right. Those controls take priority in click handling.
     let bar_width = area.width.saturating_sub(2);
     if bar_width == 0 {
+        return None;
+    }
+
+    if bar_width <= PANE_TITLE_LEFT_PADDING {
         return None;
     }
 
@@ -142,18 +154,14 @@ pub(crate) fn pane_title_hit_area(area: Rect, title: &str) -> Option<Rect> {
         return None;
     }
 
-    let text_budget = available.saturating_sub(PANE_TITLE_LEFT_PADDING) as usize;
-    let display = truncate_to_width(title, text_budget);
-    let text_width = display.chars().count() as u16;
-    let hit_width = PANE_TITLE_LEFT_PADDING.saturating_add(text_width).min(available);
-    if hit_width == 0 {
-        return None;
-    }
+    let title_max = available.saturating_sub(PANE_TITLE_LEFT_PADDING + 1) as usize;
+    let rendered_title = truncate_to_width(title, title_max);
+    let title_width = rendered_title.chars().count() as u16 + 2;
 
     Some(Rect {
-        x: area.x.saturating_add(1),
+        x: area.x.saturating_add(1 + PANE_TITLE_LEFT_PADDING),
         y: title_y,
-        width: hit_width,
+        width: title_width.min(available),
         height: 1,
     })
 }
@@ -164,7 +172,7 @@ impl Placement {
     }
 
     pub(crate) fn maximize_hit(&self, x: u16, y: u16) -> bool {
-        if self.area.width < 9 || self.area.height <= PANE_TITLE_BAR_HEIGHT {
+        if self.area.width < 11 || self.area.height <= PANE_TITLE_BAR_HEIGHT {
             return false;
         }
 
@@ -189,7 +197,7 @@ impl Placement {
             Rect {
                 x: self.area.right().saturating_sub(4),
                 y: pane_title_y(self.area),
-                width: 3,
+                width: 2,
                 height: 1,
             },
             x,
@@ -795,6 +803,31 @@ impl Node {
         }
     }
 
+    pub(crate) fn swap_leaf_ids(&mut self, pane_a: usize, pane_b: usize) -> bool {
+        if pane_a == pane_b || !self.contains_pane_id(pane_a) || !self.contains_pane_id(pane_b) {
+            return false;
+        }
+
+        self.swap_leaf_ids_unchecked(pane_a, pane_b);
+        true
+    }
+
+    fn swap_leaf_ids_unchecked(&mut self, pane_a: usize, pane_b: usize) {
+        match self {
+            Self::Leaf { pane_id } => {
+                if *pane_id == pane_a {
+                    *pane_id = pane_b;
+                } else if *pane_id == pane_b {
+                    *pane_id = pane_a;
+                }
+            }
+            Self::Split { first, second, .. } => {
+                first.swap_leaf_ids_unchecked(pane_a, pane_b);
+                second.swap_leaf_ids_unchecked(pane_a, pane_b);
+            }
+        }
+    }
+
     /// True if any vertical (row-wise) split exists. Purely horizontal layouts only partition
     /// width; without a vertical split there is no ratio to adjust for Ctrl+Shift+↑/↓.
     pub(crate) fn has_vertical_split(&self) -> bool {
@@ -954,19 +987,59 @@ fn layout_persistence_path() -> Option<PathBuf> {
 pub(crate) fn load_persisted_layout() -> Option<PersistedLayout> {
     let path = layout_persistence_path()?;
     let content = fs::read_to_string(path).ok()?;
-    let mut focused = None;
-    let mut layout = None;
+    let mut legacy_focused = None;
+    let mut legacy_layout = None;
+    let mut active_workspace = 0usize;
+    let mut workspace_names = BTreeMap::new();
+    let mut workspace_layouts = BTreeMap::new();
+    let mut workspace_focused = BTreeMap::new();
     let mut default_agent_index = 1usize;
     let mut titles = BTreeMap::new();
     let mut commands = BTreeMap::new();
     let mut resume_commands = BTreeMap::new();
+    let mut last_commands = BTreeMap::new();
 
     for line in content.lines() {
         let line = line.trim();
-        if let Some(value) = line.strip_prefix("focused=") {
-            focused = value.trim().parse().ok();
+        if let Some(value) = line.strip_prefix("active_workspace=") {
+            if let Ok(idx) = value.trim().parse::<usize>() {
+                active_workspace = idx;
+            }
+        } else if let Some(value) = line.strip_prefix("workspace=") {
+            let Some((idx, encoded_name)) = value.split_once(':') else {
+                continue;
+            };
+            let Ok(idx) = idx.trim().parse::<usize>() else {
+                continue;
+            };
+            if let Some(name) = decode_persisted_text(encoded_name.trim()) {
+                workspace_names.insert(idx, name);
+            }
+        } else if let Some(value) = line.strip_prefix("workspace_layout=") {
+            let Some((idx, encoded_layout)) = value.split_once(':') else {
+                continue;
+            };
+            let Ok(idx) = idx.trim().parse::<usize>() else {
+                continue;
+            };
+            if let Some(layout) = Node::deserialize(encoded_layout.trim()) {
+                workspace_layouts.insert(idx, layout);
+            }
+        } else if let Some(value) = line.strip_prefix("workspace_focused=") {
+            let Some((idx, focused_value)) = value.split_once(':') else {
+                continue;
+            };
+            let Ok(idx) = idx.trim().parse::<usize>() else {
+                continue;
+            };
+            let Ok(focused) = focused_value.trim().parse::<usize>() else {
+                continue;
+            };
+            workspace_focused.insert(idx, focused);
+        } else if let Some(value) = line.strip_prefix("focused=") {
+            legacy_focused = value.trim().parse().ok();
         } else if let Some(value) = line.strip_prefix("layout=") {
-            layout = Node::deserialize(value.trim());
+            legacy_layout = Node::deserialize(value.trim());
         } else if let Some(value) = line.strip_prefix("default_agent=") {
             if let Ok(idx) = value.trim().parse::<usize>() {
                 default_agent_index = idx.min(AGENT_PRESETS.len().saturating_sub(1));
@@ -1003,27 +1076,80 @@ pub(crate) fn load_persisted_layout() -> Option<PersistedLayout> {
                     resume_commands.insert(pane_id, resume);
                 }
             }
+        } else if let Some(value) = line.strip_prefix("last_command=") {
+            let Some((id, encoded_command)) = value.split_once(':') else {
+                continue;
+            };
+            let Ok(pane_id) = id.trim().parse() else {
+                continue;
+            };
+            if let Some(command) = decode_persisted_text(encoded_command.trim()) {
+                if !command.trim().is_empty() {
+                    last_commands.insert(pane_id, command);
+                }
+            }
         }
     }
 
-    let layout = layout?;
-    let focused = focused
-        .filter(|id| layout.contains_pane_id(*id))
-        .unwrap_or_else(|| layout.first_leaf_id());
+    let mut workspace_ids = workspace_layouts.keys().copied().collect::<Vec<_>>();
+    workspace_ids.extend(workspace_names.keys().copied());
+    workspace_ids.extend(workspace_focused.keys().copied());
+    workspace_ids.sort_unstable();
+    workspace_ids.dedup();
+
+    let mut workspaces = workspace_ids
+        .into_iter()
+        .filter_map(|idx| {
+            let layout = workspace_layouts.get(&idx)?.clone();
+            let focused = workspace_focused
+                .get(&idx)
+                .copied()
+                .filter(|id| layout.contains_pane_id(*id))
+                .unwrap_or_else(|| layout.first_leaf_id());
+            let name = workspace_names
+                .get(&idx)
+                .filter(|name| !name.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| format!("Workspace {}", idx + 1));
+            Some(PersistedWorkspace {
+                name,
+                layout,
+                focused,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if workspaces.is_empty() {
+        if let Some(layout) = legacy_layout {
+            let focused = legacy_focused
+                .filter(|id| layout.contains_pane_id(*id))
+                .unwrap_or_else(|| layout.first_leaf_id());
+            workspaces.push(PersistedWorkspace {
+                name: "Workspace 1".to_string(),
+                layout,
+                focused,
+            });
+        }
+    }
+    if workspaces.is_empty() {
+        return None;
+    }
+    let active_workspace = active_workspace.min(workspaces.len().saturating_sub(1));
 
     Some(PersistedLayout {
-        layout,
-        focused,
+        workspaces,
+        active_workspace,
         default_agent_index,
         titles,
         commands,
         resume_commands,
+        last_commands,
     })
 }
 
 pub(crate) fn save_persisted_layout(
-    layout: &Node,
-    focused: usize,
+    workspaces: &[PersistedWorkspace],
+    active_workspace: usize,
     default_agent_index: usize,
     panes: &[Pane],
 ) -> io::Result<()> {
@@ -1036,12 +1162,38 @@ pub(crate) fn save_persisted_layout(
     }
 
     let default_agent_index = default_agent_index.min(AGENT_PRESETS.len().saturating_sub(1));
+    let active_workspace = active_workspace.min(workspaces.len().saturating_sub(1));
     let mut content = format!(
-        "focused={}\nlayout={}\ndefault_agent={}\n",
-        focused,
-        layout.serialize(),
-        default_agent_index
+        "active_workspace={}\ndefault_agent={}\n",
+        active_workspace, default_agent_index
     );
+    if let Some(active) = workspaces.get(active_workspace) {
+        let focused = active
+            .layout
+            .contains_pane_id(active.focused)
+            .then_some(active.focused)
+            .unwrap_or_else(|| active.layout.first_leaf_id());
+        content.push_str(&format!("focused={}\n", focused));
+        content.push_str(&format!("layout={}\n", active.layout.serialize()));
+    }
+    for (idx, workspace) in workspaces.iter().enumerate() {
+        let focused = workspace
+            .layout
+            .contains_pane_id(workspace.focused)
+            .then_some(workspace.focused)
+            .unwrap_or_else(|| workspace.layout.first_leaf_id());
+        content.push_str(&format!(
+            "workspace={}:{}\n",
+            idx,
+            encode_persisted_text(&workspace.name)
+        ));
+        content.push_str(&format!(
+            "workspace_layout={}:{}\n",
+            idx,
+            workspace.layout.serialize()
+        ));
+        content.push_str(&format!("workspace_focused={}:{}\n", idx, focused));
+    }
     for pane in panes {
         content.push_str(&format!(
             "title={}:{}\n",
@@ -1059,6 +1211,15 @@ pub(crate) fn save_persisted_layout(
                     "resume={}:{}\n",
                     pane.id,
                     encode_persisted_text(resume)
+                ));
+            }
+        }
+        if let Some(last_command) = &pane.last_command {
+            if !last_command.trim().is_empty() {
+                content.push_str(&format!(
+                    "last_command={}:{}\n",
+                    pane.id,
+                    encode_persisted_text(last_command)
                 ));
             }
         }
@@ -1508,6 +1669,38 @@ mod tests {
         ));
 
         assert!(!layout.has_vertical_split());
+    }
+
+    #[test]
+    fn swap_leaf_ids_swaps_positions_in_layout_tree() {
+        let mut layout = Node::Split {
+            direction: Direction::Horizontal,
+            ratio: 50,
+            first: Box::new(Node::Leaf { pane_id: 0 }),
+            second: Box::new(Node::Split {
+                direction: Direction::Vertical,
+                ratio: 50,
+                first: Box::new(Node::Leaf { pane_id: 1 }),
+                second: Box::new(Node::Leaf { pane_id: 2 }),
+            }),
+        };
+
+        assert!(layout.swap_leaf_ids(0, 2));
+        assert_eq!(layout.serialize(), "S(H,50,L(2),S(V,50,L(1),L(0)))");
+    }
+
+    #[test]
+    fn swap_leaf_ids_returns_false_for_unknown_pane_id() {
+        let mut layout = Node::Split {
+            direction: Direction::Horizontal,
+            ratio: 50,
+            first: Box::new(Node::Leaf { pane_id: 0 }),
+            second: Box::new(Node::Leaf { pane_id: 1 }),
+        };
+
+        let before = layout.serialize();
+        assert!(!layout.swap_leaf_ids(0, 9));
+        assert_eq!(layout.serialize(), before);
     }
 
     #[test]

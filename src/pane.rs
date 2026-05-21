@@ -10,6 +10,7 @@ use crate::{
     ui::agent_binary_for_command,
     utils::{resolve_login_shell_command, LOGIN_SHELL_SENTINEL},
 };
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton};
 use nix::{
     pty::{forkpty, ForkptyResult, Winsize},
     sys::wait::{waitpid, WaitPidFlag},
@@ -23,6 +24,19 @@ use ratatui::{
 };
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PaneMouseEventKind {
+    Down,
+    Up,
+    Drag,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PaneSelection {
+    pub(crate) start: (u16, u16),
+    pub(crate) end: (u16, u16),
+}
+
 pub(crate) struct Pane {
     pub(crate) id: usize,
     pub(crate) title: String,
@@ -34,6 +48,8 @@ pub(crate) struct Pane {
     /// child process exits and the pane's output contained a recognizable
     /// resume line. Persisted so the pane can be brought back on next launch.
     pub(crate) resume_command: Option<String>,
+    /// Most recent command submitted by the user in this pane.
+    pub(crate) last_command: Option<String>,
     /// Binary token used for scraping resume hints; `None` disables capture.
     agent_binary: Option<&'static str>,
     /// Set once we've observed the PTY reader thread disconnect.
@@ -50,6 +66,9 @@ pub(crate) struct Pane {
     pub(crate) rows: u16,
     pub(crate) scrollback: usize,
     pub(crate) scrollback_max: usize,
+    last_replayed_command: Option<String>,
+    input_buffer: String,
+    input_cursor: usize,
     cached_view: Option<Text<'static>>,
     view_dirty: bool,
 }
@@ -69,6 +88,7 @@ impl Pane {
         title: impl Into<String>,
         command: impl Into<String>,
         resume_command: Option<String>,
+        last_command: Option<String>,
         rows: u16,
         cols: u16,
     ) -> anyhow::Result<Self> {
@@ -106,6 +126,7 @@ impl Pane {
                     title: title.into(),
                     command,
                     resume_command,
+                    last_command,
                     agent_binary,
                     exited: false,
                     relaunch_failed: false,
@@ -117,6 +138,9 @@ impl Pane {
                     rows,
                     scrollback: 0,
                     scrollback_max: 0,
+                    last_replayed_command: None,
+                    input_buffer: String::new(),
+                    input_cursor: 0,
                     cached_view: None,
                     view_dirty: true,
                 };
@@ -201,6 +225,8 @@ impl Pane {
     pub(crate) fn relaunch_as_shell(&mut self) -> anyhow::Result<()> {
         let command = self.command.clone();
         let resume_command = self.resume_command.clone();
+        let last_command = self.last_command.clone();
+        let last_replayed_command = self.last_replayed_command.clone();
         let agent_binary = self.agent_binary;
 
         let mut new = Pane::new(
@@ -208,12 +234,16 @@ impl Pane {
             self.title.clone(),
             LOGIN_SHELL_SENTINEL,
             None,
+            None,
             self.rows.max(1),
             self.cols.max(1),
         )?;
         new.command = command;
         new.resume_command = resume_command;
+        new.last_command = last_command;
+        new.last_replayed_command = last_replayed_command;
         new.agent_binary = agent_binary;
+        let _ = new.replay_last_command();
 
         // Drop sends SIGTERM/waitpid for the old (already-exited) child.
         *self = new;
@@ -276,8 +306,8 @@ impl Pane {
         }
 
         let button = if up { 64 } else { 65 };
-        let x = x.saturating_add(1);
-        let y = y.saturating_add(1);
+        let x = x.min(self.cols.saturating_sub(1)).saturating_add(1);
+        let y = y.min(self.rows.saturating_sub(1)).saturating_add(1);
         let bytes = match screen.mouse_protocol_encoding() {
             MouseProtocolEncoding::Sgr => format!("\x1b[<{};{};{}M", button, x, y).into_bytes(),
             MouseProtocolEncoding::Default | MouseProtocolEncoding::Utf8 => {
@@ -299,24 +329,215 @@ impl Pane {
         Ok(true)
     }
 
+    pub(crate) fn send_mouse_button(
+        &mut self,
+        button: MouseButton,
+        event_kind: PaneMouseEventKind,
+        modifiers: KeyModifiers,
+        x: u16,
+        y: u16,
+    ) -> anyhow::Result<bool> {
+        let screen = self.parser.screen();
+        let mode = screen.mouse_protocol_mode();
+        if mode == MouseProtocolMode::None {
+            return Ok(false);
+        }
+
+        if matches!(event_kind, PaneMouseEventKind::Up)
+            && !matches!(
+                mode,
+                MouseProtocolMode::PressRelease
+                    | MouseProtocolMode::ButtonMotion
+                    | MouseProtocolMode::AnyMotion
+            )
+        {
+            return Ok(false);
+        }
+
+        if matches!(event_kind, PaneMouseEventKind::Drag)
+            && !matches!(
+                mode,
+                MouseProtocolMode::ButtonMotion | MouseProtocolMode::AnyMotion
+            )
+        {
+            return Ok(false);
+        }
+
+        let button_code = match button {
+            MouseButton::Left => 0u16,
+            MouseButton::Middle => 1u16,
+            MouseButton::Right => 2u16,
+        };
+        let modifier_bits = mouse_modifier_bits(modifiers);
+
+        let code = match event_kind {
+            PaneMouseEventKind::Down => button_code + modifier_bits,
+            PaneMouseEventKind::Drag => button_code + modifier_bits + 32,
+            PaneMouseEventKind::Up => match screen.mouse_protocol_encoding() {
+                MouseProtocolEncoding::Sgr => button_code + modifier_bits,
+                MouseProtocolEncoding::Default | MouseProtocolEncoding::Utf8 => 3 + modifier_bits,
+            },
+        };
+
+        let x = x.min(self.cols.saturating_sub(1)).saturating_add(1);
+        let y = y.min(self.rows.saturating_sub(1)).saturating_add(1);
+
+        let bytes = match screen.mouse_protocol_encoding() {
+            MouseProtocolEncoding::Sgr => {
+                let suffix = if matches!(event_kind, PaneMouseEventKind::Up) {
+                    'm'
+                } else {
+                    'M'
+                };
+                format!("\x1b[<{};{};{}{}", code, x, y, suffix).into_bytes()
+            }
+            MouseProtocolEncoding::Default | MouseProtocolEncoding::Utf8 => {
+                if x > 223 || y > 223 {
+                    return Ok(false);
+                }
+                vec![
+                    0x1b,
+                    b'[',
+                    b'M',
+                    (32 + code) as u8,
+                    (32 + x) as u8,
+                    (32 + y) as u8,
+                ]
+            }
+        };
+
+        self.send(&bytes)?;
+        Ok(true)
+    }
+
+    pub(crate) fn track_key_event(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter => self.finalize_tracked_command(),
+            KeyCode::Tab => self.insert_tracked_text("\t"),
+            KeyCode::Left => {
+                self.input_cursor = self.input_cursor.saturating_sub(1);
+            }
+            KeyCode::Right => {
+                self.input_cursor = (self.input_cursor + 1).min(self.input_buffer.chars().count());
+            }
+            KeyCode::Home => {
+                self.input_cursor = 0;
+            }
+            KeyCode::End => {
+                self.input_cursor = self.input_buffer.chars().count();
+            }
+            KeyCode::Backspace => {
+                self.remove_tracked_char_before_cursor();
+            }
+            KeyCode::Delete => {
+                self.remove_tracked_char_at_cursor();
+            }
+            KeyCode::Up | KeyCode::Down => {
+                // Shell history state isn't observable to us, so avoid
+                // carrying stale partially-typed input across history jumps.
+                self.clear_pending_input();
+            }
+            KeyCode::Char(ch)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                let mut buf = [0u8; 4];
+                let text = ch.encode_utf8(&mut buf);
+                self.insert_tracked_text(text);
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn track_paste(&mut self, text: &str) {
+        for ch in text.chars() {
+            if ch == '\r' || ch == '\n' {
+                self.finalize_tracked_command();
+            } else {
+                let mut buf = [0u8; 4];
+                let text = ch.encode_utf8(&mut buf);
+                self.insert_tracked_text(text);
+            }
+        }
+    }
+
+    pub(crate) fn clear_pending_input(&mut self) {
+        self.input_buffer.clear();
+        self.input_cursor = 0;
+    }
+
+    pub(crate) fn replay_last_command(&mut self) -> anyhow::Result<bool> {
+        let Some(command) = self
+            .last_command
+            .as_deref()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+        else {
+            return Ok(false);
+        };
+
+        if self.last_replayed_command.as_deref() == Some(command.as_str()) {
+            return Ok(false);
+        }
+
+        self.send_paste(&command)?;
+        self.send(&[b'\r'])?;
+        self.last_replayed_command = Some(command);
+        Ok(true)
+    }
+
+    fn finalize_tracked_command(&mut self) {
+        let command = self.input_buffer.trim();
+        if !command.is_empty() {
+            self.last_command = Some(command.to_string());
+            self.last_replayed_command = None;
+        }
+        self.clear_pending_input();
+    }
+
+    fn insert_tracked_text(&mut self, text: &str) {
+        let idx = char_index_to_byte_index(&self.input_buffer, self.input_cursor);
+        self.input_buffer.insert_str(idx, text);
+        self.input_cursor = self.input_cursor.saturating_add(text.chars().count());
+    }
+
+    fn remove_tracked_char_before_cursor(&mut self) {
+        if self.input_cursor == 0 {
+            return;
+        }
+        let start = char_index_to_byte_index(&self.input_buffer, self.input_cursor - 1);
+        let end = char_index_to_byte_index(&self.input_buffer, self.input_cursor);
+        self.input_buffer.replace_range(start..end, "");
+        self.input_cursor = self.input_cursor.saturating_sub(1);
+    }
+
+    fn remove_tracked_char_at_cursor(&mut self) {
+        let char_len = self.input_buffer.chars().count();
+        if self.input_cursor >= char_len {
+            return;
+        }
+        let start = char_index_to_byte_index(&self.input_buffer, self.input_cursor);
+        let end = char_index_to_byte_index(&self.input_buffer, self.input_cursor + 1);
+        self.input_buffer.replace_range(start..end, "");
+    }
+
     fn sync_scrollback(&mut self) {
         let desired = self.scrollback;
-        let max_safe_offset = self.rows as usize;
 
         self.parser.set_scrollback(usize::MAX);
-        self.scrollback_max = self.parser.screen().scrollback().min(max_safe_offset);
+        self.scrollback_max = self.parser.screen().scrollback();
         self.scrollback = desired.min(self.scrollback_max);
         self.parser.set_scrollback(self.scrollback);
     }
 
     pub(crate) fn scroll_by(&mut self, delta: isize) {
-        let max_safe_offset = self.rows as usize;
         let next = if delta.is_negative() {
             self.scrollback.saturating_sub((-delta) as usize)
         } else {
             self.scrollback.saturating_add(delta as usize)
         };
-        let new_scrollback = next.min(self.scrollback_max).min(max_safe_offset);
+        let new_scrollback = next.min(self.scrollback_max);
         if new_scrollback != self.scrollback {
             self.scrollback = new_scrollback;
             self.parser.set_scrollback(self.scrollback);
@@ -341,7 +562,7 @@ impl Pane {
     }
 
     pub(crate) fn scroll_top(&mut self) {
-        let target = self.scrollback_max.min(self.rows as usize);
+        let target = self.scrollback_max;
         if target != self.scrollback {
             self.scrollback = target;
             self.parser.set_scrollback(self.scrollback);
@@ -385,21 +606,36 @@ impl Pane {
     /// cached and only rebuilt when the underlying screen has actually changed
     /// (new PTY bytes, scroll, or resize). When clean, this just clones the
     /// cached value.
-    pub(crate) fn styled_view(&mut self) -> Text<'static> {
+    pub(crate) fn styled_view(&mut self, selection: Option<PaneSelection>) -> Text<'static> {
+        if let Some(selection) = selection {
+            return self.build_styled_view(Some(selection));
+        }
+
         if !self.view_dirty {
             if let Some(cached) = &self.cached_view {
                 return cached.clone();
             }
         }
-        let text = self.build_styled_view();
+        let text = self.build_styled_view(None);
         self.cached_view = Some(text.clone());
         self.view_dirty = false;
         text
     }
 
-    fn build_styled_view(&self) -> Text<'static> {
+    pub(crate) fn selected_text(&self, selection: PaneSelection) -> String {
+        let ((start_col, start_row), (end_col, end_row)) = normalized_selection(selection);
+        self.parser.screen().contents_between(
+            start_row,
+            start_col,
+            end_row,
+            end_col.saturating_add(1),
+        )
+    }
+
+    fn build_styled_view(&self, selection: Option<PaneSelection>) -> Text<'static> {
         let screen = self.parser.screen();
         let (rows, cols) = screen.size();
+        let normalized = selection.map(normalized_selection);
         let mut lines = Vec::with_capacity(usize::from(rows));
 
         for row in 0..rows {
@@ -420,7 +656,10 @@ impl Pane {
                 } else {
                     " ".to_string()
                 };
-                let style = cell_style(cell);
+                let mut style = cell_style(cell);
+                if selection_contains(normalized, col, row) {
+                    style = style.fg(Color::Black).bg(Color::White);
+                }
 
                 if current_style == Some(style) {
                     current_text.push_str(&text);
@@ -454,6 +693,11 @@ impl Pane {
     }
 
     pub(crate) fn cursor_position_in(&self, area: Rect) -> Option<(u16, u16)> {
+        let (col, row) = self.cursor_cell()?;
+        Some((area.x + col, area.y + row))
+    }
+
+    pub(crate) fn cursor_cell(&self) -> Option<(u16, u16)> {
         if self.scrollback > 0 {
             return None;
         }
@@ -463,11 +707,12 @@ impl Pane {
             return None;
         }
 
+        let (rows, cols) = screen.size();
         let (row, col) = screen.cursor_position();
-        let row = row.min(area.height.saturating_sub(1));
-        let col = col.min(area.width.saturating_sub(1));
+        let row = row.min(rows.saturating_sub(1));
+        let col = col.min(cols.saturating_sub(1));
 
-        Some((area.x + col, area.y + row))
+        Some((col, row))
     }
 
     fn rendered_height(&self, viewport_width: u16) -> usize {
@@ -495,9 +740,56 @@ impl Pane {
     }
 }
 
+fn normalized_selection(selection: PaneSelection) -> ((u16, u16), (u16, u16)) {
+    if (selection.start.1, selection.start.0) <= (selection.end.1, selection.end.0) {
+        (selection.start, selection.end)
+    } else {
+        (selection.end, selection.start)
+    }
+}
+
+fn selection_contains(selection: Option<((u16, u16), (u16, u16))>, col: u16, row: u16) -> bool {
+    let Some(((start_col, start_row), (end_col, end_row))) = selection else {
+        return false;
+    };
+
+    if row < start_row || row > end_row {
+        return false;
+    }
+    if start_row == end_row {
+        return col >= start_col && col <= end_col;
+    }
+    if row == start_row {
+        return col >= start_col;
+    }
+    if row == end_row {
+        return col <= end_col;
+    }
+    true
+}
+
+fn mouse_modifier_bits(modifiers: KeyModifiers) -> u16 {
+    let mut bits = 0u16;
+    if modifiers.contains(KeyModifiers::SHIFT) {
+        bits += 4;
+    }
+    if modifiers.contains(KeyModifiers::ALT) {
+        bits += 8;
+    }
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        bits += 16;
+    }
+    bits
+}
+
 fn cell_style(cell: &vt100::Cell) -> Style {
     let mut fg = vt100_color_to_tui(cell.fgcolor());
-    let mut bg = vt100_color_to_tui(cell.bgcolor());
+    // Leave default terminal cells unset so the pane widget's base background
+    // can show through.
+    let mut bg = match cell.bgcolor() {
+        vt100::Color::Default => None,
+        color => vt100_color_to_tui(color),
+    };
 
     if cell.inverse() {
         std::mem::swap(&mut fg, &mut bg);
@@ -633,6 +925,13 @@ fn find_token(haystack: &str, needle: &str) -> Option<usize> {
     None
 }
 
+fn char_index_to_byte_index(text: &str, char_idx: usize) -> usize {
+    text.char_indices()
+        .nth(char_idx)
+        .map(|(idx, _)| idx)
+        .unwrap_or(text.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -686,5 +985,14 @@ mod tests {
             extract_resume_command("codex", &rows).as_deref(),
             Some("codex resume bbbb")
         );
+    }
+
+    #[test]
+    fn default_background_leaves_base_style_visible() {
+        let mut parser = vt100::Parser::new(1, 1, 0);
+        parser.process(b"A");
+        let cell = parser.screen().cell(0, 0).expect("cell");
+
+        assert_eq!(cell_style(cell).bg, None);
     }
 }

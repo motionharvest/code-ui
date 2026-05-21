@@ -25,18 +25,21 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, Wrap},
+    text::{Line, Text},
+    widgets::{Block, BorderType, Borders, Paragraph, Scrollbar, ScrollbarOrientation, Wrap},
     Frame, Terminal,
 };
 
 use app::{App, MousePointerShape};
 use layout::{
-    pane_borders, pane_inner_area, pane_title_bar_area, pane_title_chrome_reserve,
-    pane_title_y, PANE_TITLE_LEFT_PADDING,
+    pane_borders, pane_inner_area, pane_title_bar_area, pane_title_chrome_reserve, pane_title_y,
+    PANE_TITLE_LEFT_PADDING,
 };
+use theme::Theme;
 use ui::{
-    render_close_confirm_modal, render_help_modal, render_new_pane_picker_modal,
-    render_panel_settings_modal, render_settings_button, render_theme_modal, truncate_to_width,
+    commander_item_area, render_help_modal, render_new_pane_picker_modal,
+    render_panel_settings_modal, render_theme_modal, render_top_chrome,
+    render_workspace_settings_modal, render_workspace_sidebar, truncate_to_width,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -68,12 +71,7 @@ fn main() -> anyhow::Result<()> {
     // Ctrl+Q without exiting each agent first).
     app.shutdown_panes(SHUTDOWN_GRACE);
 
-    let _ = layout::save_persisted_layout(
-        &app.layout,
-        app.focused,
-        app.default_agent_index,
-        &app.panes,
-    );
+    app.persist_layout();
 
     restore_terminal(&mut terminal);
 
@@ -211,7 +209,18 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                     f.size(),
                 );
 
-                render_settings_button(f, f.size(), theme);
+                render_top_chrome(f, f.size(), theme);
+                let workspace_names = app.workspace_names();
+                render_workspace_sidebar(
+                    f,
+                    App::workspace_sidebar_area(f.size()),
+                    theme,
+                    &workspace_names,
+                    app.active_workspace_index(),
+                    app.commander_focused(),
+                    app.sidebar_workspace_focused(),
+                    app.sidebar_add_button_focused(),
+                );
 
                 let debug_mode = false;
                 let (debug_containers, debug_placements) = if debug_mode {
@@ -237,14 +246,21 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
 
                 let placements = app.pane_placements(App::content_area(f.size()));
                 let preview_pane_ids = app.resize_preview_pane_ids().map(|ids| ids.to_vec());
+                let swap_preview_target = app.pane_swap_preview_target();
                 let modal_is_none = app.modal.is_none();
-                let focused_pane_id = app.focused;
+                let commander_focused = app.commander_focused();
+                let focused_pane_id = (!commander_focused
+                    && app.sidebar_workspace_focused().is_none()
+                    && !app.sidebar_add_button_focused())
+                .then_some(app.focused);
+                render_commander_sidebar_panel(f, app, theme, modal_is_none);
 
                 for placement in placements {
-                    let focused = placement.pane_id == focused_pane_id;
+                    let focused = focused_pane_id == Some(placement.pane_id);
                     let in_resize_preview = preview_pane_ids
                         .as_ref()
                         .is_some_and(|pane_ids| pane_ids.contains(&placement.pane_id));
+                    let in_swap_preview = swap_preview_target == Some(placement.pane_id);
                     let Some(pane_index) = app
                         .panes
                         .iter()
@@ -252,6 +268,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                     else {
                         continue;
                     };
+                    let is_maximized = app.is_maximized();
+                    let selection = app.pane_selection(placement.pane_id);
                     let pane = &mut app.panes[pane_index];
 
                     let pane_area = if debug_mode {
@@ -275,54 +293,43 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         continue;
                     }
 
-                    let border_color = if focused || in_resize_preview {
+                    let border_color = if focused || in_resize_preview || in_swap_preview {
                         theme.accent
                     } else {
                         theme.muted
                     };
-                    let mut chrome_style =
-                        Style::default().fg(border_color).bg(theme.background);
-                    if focused || in_resize_preview {
+                    let mut chrome_style = Style::default().fg(border_color).bg(theme.background);
+                    if focused || in_resize_preview || in_swap_preview {
                         chrome_style = chrome_style.add_modifier(Modifier::BOLD);
                     }
 
                     let block = Block::default()
                         .borders(pane_borders(placement.exposed))
+                        .border_type(BorderType::Rounded)
                         .style(Style::default().bg(theme.background))
                         .border_style(chrome_style);
                     f.render_widget(block, pane_area);
-                    if focused {
-                        render_fancy_selected_border(f, pane_area, chrome_style);
-                    }
 
                     let title_bar = pane_title_bar_area(pane_area);
-                    if title_bar.width > 0 && title_bar.height > 0 {
-                        f.render_widget(
-                            Paragraph::new("").style(Style::default().bg(theme.title_bar)),
-                            title_bar,
-                        );
-                    }
-
                     let title_y = pane_title_y(pane_area);
                     if title_y < pane_area.bottom() {
-                        let title_bar_width = pane_area.width.saturating_sub(2);
+                        let title_bar_width = title_bar.width;
                         if title_bar_width > PANE_TITLE_LEFT_PADDING {
                             let preview = if in_resize_preview { " resizing" } else { "" };
                             let title = format!("{}{}", pane.title, preview);
                             let title_max = title_bar_width
                                 .saturating_sub(pane_title_chrome_reserve(pane_area.width))
-                                .saturating_sub(PANE_TITLE_LEFT_PADDING) as usize;
-                            let title_text = truncate_to_width(&title, title_max);
-                            let title_slot_w = title_bar_width.saturating_sub(PANE_TITLE_LEFT_PADDING);
+                                .saturating_sub(PANE_TITLE_LEFT_PADDING + 1)
+                                as usize;
+                            let title_text = format!(" {} ", truncate_to_width(&title, title_max));
+                            let title_slot_w =
+                                title_bar_width.saturating_sub(PANE_TITLE_LEFT_PADDING);
                             f.render_widget(
                                 Paragraph::new(title_text)
                                     .alignment(Alignment::Left)
-                                    .style(chrome_style.bg(theme.title_bar)),
+                                    .style(chrome_style),
                                 Rect {
-                                    x: pane_area
-                                        .x
-                                        .saturating_add(1)
-                                        .saturating_add(PANE_TITLE_LEFT_PADDING),
+                                    x: title_bar.x.saturating_add(PANE_TITLE_LEFT_PADDING),
                                     y: title_y,
                                     width: title_slot_w,
                                     height: 1,
@@ -330,9 +337,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                             );
                         }
 
-                        if pane_area.width >= 9 {
+                        if pane_area.width >= 11 {
+                            let maximize_icon = if is_maximized { "🗗" } else { "⛶" };
                             f.render_widget(
-                                Paragraph::new("[=]").style(chrome_style.bg(theme.title_bar)),
+                                Paragraph::new(format!(" {} ", maximize_icon)).style(chrome_style),
                                 Rect {
                                     x: pane_area.right().saturating_sub(8),
                                     y: title_y,
@@ -344,11 +352,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
 
                         if pane_area.width >= 6 {
                             f.render_widget(
-                                Paragraph::new("🗙").style(chrome_style.bg(theme.title_bar)),
+                                Paragraph::new("🗙 ").style(chrome_style),
                                 Rect {
                                     x: pane_area.right().saturating_sub(4),
                                     y: title_y,
-                                    width: 3,
+                                    width: 2,
                                     height: 1,
                                 },
                             );
@@ -357,6 +365,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
 
                     let inner = pane_inner_area(pane_area, placement.exposed);
                     if inner.width > 0 && inner.height > 0 {
+                        if in_swap_preview {
+                            render_pane_swap_drop_overlay(f, inner, theme, chrome_style);
+                            continue;
+                        }
+
                         let scrollbar_needed =
                             inner.width > 1 && pane.needs_scrollbar(inner.width - 1, inner.height);
                         let content_area = if scrollbar_needed {
@@ -370,7 +383,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                             inner
                         };
 
-                        let paragraph = Paragraph::new(pane.styled_view())
+                        let pane_view =
+                            pane_view_for_render(pane.styled_view(selection), theme, focused);
+                        let paragraph = Paragraph::new(pane_view)
                             .wrap(Wrap { trim: false })
                             .style(Style::default().bg(theme.background));
                         f.render_widget(paragraph, content_area);
@@ -397,7 +412,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                             );
                         }
 
-                        if modal_is_none && focused {
+                        if modal_is_none && focused && !commander_focused {
                             if let Some((x, y)) = pane.cursor_position_in(content_area) {
                                 f.set_cursor(x, y);
                             }
@@ -416,6 +431,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         ui::Modal::NewPanePicker {
                             pane_id,
                             name,
+                            name_error,
                             cursor,
                             name_selected,
                             agent_index,
@@ -427,32 +443,54 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                                 .find(|placement| placement.pane_id == *pane_id)
                                 .map(|placement| placement.area)
                                 .unwrap_or(App::content_area(f.size()));
+                            let availability = app.agent_availability_for_pane(*pane_id);
                             render_new_pane_picker_modal(
                                 f,
                                 container,
                                 theme,
                                 name,
+                                name_error.as_deref(),
                                 *cursor,
                                 *name_selected,
                                 *agent_index,
+                                &availability,
                             );
                         }
                         ui::Modal::PanelSettings {
+                            pane_id,
                             name,
+                            name_error,
                             agent_index,
                             focus,
                             ..
-                        } => render_panel_settings_modal(
+                        } => {
+                            let availability = app.agent_availability_for_pane(*pane_id);
+                            render_panel_settings_modal(
+                                f,
+                                f.size(),
+                                theme,
+                                name,
+                                name_error.as_deref(),
+                                *agent_index,
+                                *focus,
+                                &availability,
+                            )
+                        }
+                        ui::Modal::WorkspaceSettings {
+                            name,
+                            name_error,
+                            cursor,
+                            action_index,
+                            ..
+                        } => render_workspace_settings_modal(
                             f,
                             f.size(),
                             theme,
                             name,
-                            *agent_index,
-                            *focus,
+                            name_error.as_deref(),
+                            *cursor,
+                            *action_index,
                         ),
-                        ui::Modal::CloseConfirm { .. } => {
-                            render_close_confirm_modal(f, f.size(), theme)
-                        }
                     }
                 }
             })?;
@@ -467,6 +505,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         focus: ui::PanelSettingsFocus::Name,
                         ..
                     })
+                    | Some(ui::Modal::WorkspaceSettings { .. })
             );
         if should_show_cursor != cursor_visible {
             if should_show_cursor {
@@ -524,10 +563,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
     Ok(())
 }
 
-fn set_mouse_pointer_shape(
-    out: &mut impl io::Write,
-    shape: MousePointerShape,
-) -> io::Result<()> {
+fn set_mouse_pointer_shape(out: &mut impl io::Write, shape: MousePointerShape) -> io::Result<()> {
     let name = match shape {
         MousePointerShape::Default => "default",
         MousePointerShape::HorizontalResize => "ew-resize",
@@ -537,29 +573,508 @@ fn set_mouse_pointer_shape(
     out.flush()
 }
 
-fn render_fancy_selected_border(f: &mut Frame<'_>, area: Rect, style: Style) {
-    if area.width < 2 || area.height < 2 {
+fn render_pane_swap_drop_overlay(f: &mut Frame<'_>, area: Rect, theme: Theme, style: Style) {
+    f.render_widget(
+        Paragraph::new("").style(Style::default().fg(theme.foreground).bg(theme.title_bar)),
+        area,
+    );
+
+    f.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(style)
+            .style(Style::default().bg(theme.title_bar)),
+        area,
+    );
+
+    let message_y = area.y + area.height.saturating_sub(1) / 2;
+    let message_area = Rect {
+        x: area.x,
+        y: message_y,
+        width: area.width,
+        height: 1,
+    };
+    f.render_widget(
+        Paragraph::new("Drop to swap")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(theme.foreground).bg(theme.title_bar)),
+        message_area,
+    );
+}
+
+fn render_commander_sidebar_panel(f: &mut Frame<'_>, app: &App, theme: Theme, modal_is_none: bool) {
+    let sidebar = App::workspace_sidebar_area(f.size());
+    let commander_area = commander_item_area(sidebar);
+    if commander_area.width < 3 || commander_area.height < 3 {
         return;
     }
 
-    let buf = f.buffer_mut();
-    let x0 = area.x;
-    let y0 = area.y;
-    let x1 = area.right().saturating_sub(1);
-    let y1 = area.bottom().saturating_sub(1);
-
-    buf.set_string(x0, y0, "╔", style);
-    buf.set_string(x1, y0, "╗", style);
-    buf.set_string(x0, y1, "╚", style);
-    buf.set_string(x1, y1, "╝", style);
-
-    for x in x0.saturating_add(1)..x1 {
-        buf.set_string(x, y0, "═", style);
-        buf.set_string(x, y1, "═", style);
+    let inner = Block::default().borders(Borders::ALL).inner(commander_area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
     }
 
-    for y in y0.saturating_add(1)..y1 {
-        buf.set_string(x0, y, "║", style);
-        buf.set_string(x1, y, "║", style);
+    let status = if app.commander_busy() {
+        "thinking..."
+    } else {
+        "ready"
+    };
+    let header = Paragraph::new(format!("Commander [{}]", status))
+        .style(Style::default().fg(theme.muted).bg(theme.background));
+    f.render_widget(
+        header,
+        Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: 1,
+        },
+    );
+
+    if inner.height <= 1 {
+        return;
+    }
+
+    let content_height = inner.height.saturating_sub(1);
+    let commander_input = app.commander_input();
+    let clamped_cursor = app.commander_cursor().min(commander_input.chars().count());
+    let full_input = format!("> {}", commander_input);
+    let cursor_char_index = 2 + clamped_cursor;
+    let (wrapped_lines, cursor_row, cursor_col) =
+        hard_wrap_with_cursor(&full_input, cursor_char_index, inner.width);
+    let total_input_lines = wrapped_lines.len() as u16;
+    let input_height = total_input_lines.clamp(1, content_height);
+    let input_top = inner.bottom().saturating_sub(input_height);
+    let visible_start = total_input_lines.saturating_sub(input_height);
+    let visible_input = wrapped_lines[visible_start as usize..].join("\n");
+
+    let logs_area = Rect {
+        x: inner.x,
+        y: inner.y + 1,
+        width: inner.width,
+        height: input_top.saturating_sub(inner.y + 1),
+    };
+    if logs_area.height > 0 {
+        let max_lines = logs_area.height as usize;
+        let history = app.commander_history();
+        let start = history.len().saturating_sub(max_lines);
+        let lines = history[start..].join("\n");
+        f.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .style(Style::default().fg(theme.foreground).bg(theme.background)),
+            logs_area,
+        );
+    }
+
+    let input_area = Rect {
+        x: inner.x,
+        y: input_top,
+        width: inner.width,
+        height: input_height,
+    };
+    f.render_widget(
+        Paragraph::new(visible_input).style(Style::default().fg(theme.accent).bg(theme.background)),
+        input_area,
+    );
+
+    if modal_is_none && app.commander_focused() {
+        let visible_cursor_row = cursor_row.saturating_sub(visible_start as usize) as u16;
+        let cursor_x = input_area
+            .x
+            .saturating_add((cursor_col as u16).min(input_area.width.saturating_sub(1)));
+        let cursor_y = input_area
+            .y
+            .saturating_add(visible_cursor_row.min(input_area.height.saturating_sub(1)));
+        f.set_cursor(cursor_x, cursor_y);
+    }
+}
+
+fn pane_view_for_render(view: Text<'static>, theme: Theme, focused: bool) -> Text<'static> {
+    if theme.passthrough {
+        return view;
+    }
+
+    if focused {
+        return theme_text(view, theme);
+    }
+
+    monochrome_text(view, theme)
+}
+
+fn theme_text(text: Text<'static>, theme: Theme) -> Text<'static> {
+    transform_text(text, |style| theme_style(style, theme))
+}
+
+fn monochrome_text(text: Text<'static>, theme: Theme) -> Text<'static> {
+    transform_text(text, |style| monochrome_style(style, theme))
+}
+
+fn transform_text(text: Text<'static>, mut map_style: impl FnMut(Style) -> Style) -> Text<'static> {
+    Text {
+        lines: text
+            .lines
+            .into_iter()
+            .map(|line| transform_line(line, &mut map_style))
+            .collect(),
+        style: map_style(text.style),
+        alignment: text.alignment,
+    }
+}
+
+fn transform_line(
+    line: Line<'static>,
+    map_style: &mut impl FnMut(Style) -> Style,
+) -> Line<'static> {
+    Line {
+        spans: line
+            .spans
+            .into_iter()
+            .map(|span| {
+                let style = map_style(span.style);
+                span.patch_style(style)
+            })
+            .collect(),
+        style: map_style(line.style),
+        alignment: line.alignment,
+    }
+}
+
+fn monochrome_style(style: Style, theme: Theme) -> Style {
+    recolor_style(style, theme, PaneColorMode::Monochrome)
+}
+
+fn theme_style(style: Style, theme: Theme) -> Style {
+    recolor_style(style, theme, PaneColorMode::Palette)
+}
+
+#[derive(Clone, Copy)]
+enum PaneColorMode {
+    Palette,
+    Monochrome,
+}
+
+fn recolor_style(style: Style, theme: Theme, mode: PaneColorMode) -> Style {
+    let fg = match style.fg {
+        Some(Color::Reset) | None => Some(default_foreground(theme, mode)),
+        Some(color) => Some(recolor_color(color, theme, mode, true)),
+    };
+    let bg = match style.bg {
+        Some(Color::Reset) | None => None,
+        Some(color) => Some(recolor_color(color, theme, mode, false)),
+    };
+
+    let mut out = Style::default();
+    if let Some(color) = fg {
+        out = out.fg(color);
+    }
+    if let Some(color) = bg {
+        out = out.bg(color);
+    }
+    out = out.add_modifier(style.add_modifier);
+    out = out.remove_modifier(style.sub_modifier);
+    out
+}
+
+fn default_foreground(theme: Theme, mode: PaneColorMode) -> Color {
+    match mode {
+        PaneColorMode::Palette => theme.foreground,
+        PaneColorMode::Monochrome => theme.muted,
+    }
+}
+
+fn recolor_color(color: Color, theme: Theme, mode: PaneColorMode, is_foreground: bool) -> Color {
+    match mode {
+        PaneColorMode::Monochrome => {
+            if is_foreground {
+                theme.muted
+            } else {
+                theme.background
+            }
+        }
+        PaneColorMode::Palette => match color {
+            Color::Black => theme.palette[0],
+            Color::Red => theme.palette[1],
+            Color::Green => theme.palette[2],
+            Color::Yellow => theme.palette[3],
+            Color::Blue => theme.palette[4],
+            Color::Magenta => theme.palette[5],
+            Color::Cyan => theme.palette[6],
+            Color::Gray => theme.palette[7],
+            Color::DarkGray => theme.palette[8],
+            Color::LightRed => theme.palette[9],
+            Color::LightGreen => theme.palette[10],
+            Color::LightYellow => theme.palette[11],
+            Color::LightBlue => theme.palette[12],
+            Color::LightMagenta => theme.palette[13],
+            Color::LightCyan => theme.palette[14],
+            Color::White => theme.palette[15],
+            Color::Indexed(index) if index < 16 => theme.palette[index as usize],
+            Color::Indexed(index) => nearest_theme_color(indexed_color_to_rgb(index), theme),
+            Color::Rgb(_, _, _) => nearest_theme_color(color_to_rgb(color), theme),
+            Color::Reset => default_foreground(theme, mode),
+        },
+    }
+}
+
+fn nearest_theme_color(color: (u8, u8, u8), theme: Theme) -> Color {
+    theme
+        .palette
+        .into_iter()
+        .min_by_key(|candidate| color_distance_sq(color, color_to_rgb(*candidate)))
+        .unwrap_or(theme.foreground)
+}
+
+fn color_to_rgb(color: Color) -> (u8, u8, u8) {
+    match color {
+        Color::Reset => (0, 0, 0),
+        Color::Black => (0, 0, 0),
+        Color::Red => (205, 49, 49),
+        Color::Green => (13, 188, 121),
+        Color::Yellow => (229, 229, 16),
+        Color::Blue => (36, 114, 200),
+        Color::Magenta => (188, 63, 188),
+        Color::Cyan => (17, 168, 205),
+        Color::Gray => (229, 229, 229),
+        Color::DarkGray => (102, 102, 102),
+        Color::LightRed => (241, 76, 76),
+        Color::LightGreen => (35, 209, 139),
+        Color::LightYellow => (245, 245, 67),
+        Color::LightBlue => (59, 142, 234),
+        Color::LightMagenta => (214, 112, 214),
+        Color::LightCyan => (41, 184, 219),
+        Color::White => (255, 255, 255),
+        Color::Rgb(r, g, b) => (r, g, b),
+        Color::Indexed(index) => indexed_color_to_rgb(index),
+    }
+}
+
+fn indexed_color_to_rgb(index: u8) -> (u8, u8, u8) {
+    const ANSI_16: [(u8, u8, u8); 16] = [
+        (0, 0, 0),
+        (205, 49, 49),
+        (13, 188, 121),
+        (229, 229, 16),
+        (36, 114, 200),
+        (188, 63, 188),
+        (17, 168, 205),
+        (229, 229, 229),
+        (102, 102, 102),
+        (241, 76, 76),
+        (35, 209, 139),
+        (245, 245, 67),
+        (59, 142, 234),
+        (214, 112, 214),
+        (41, 184, 219),
+        (255, 255, 255),
+    ];
+
+    match index {
+        0..=15 => ANSI_16[index as usize],
+        16..=231 => {
+            let idx = index - 16;
+            let r = idx / 36;
+            let g = (idx % 36) / 6;
+            let b = idx % 6;
+            (cube_component(r), cube_component(g), cube_component(b))
+        }
+        232..=255 => {
+            let level = 8 + (index - 232) * 10;
+            (level, level, level)
+        }
+    }
+}
+
+fn cube_component(component: u8) -> u8 {
+    match component {
+        0 => 0,
+        n => 55 + n * 40,
+    }
+}
+
+fn color_distance_sq(a: (u8, u8, u8), b: (u8, u8, u8)) -> u32 {
+    let dr = i32::from(a.0) - i32::from(b.0);
+    let dg = i32::from(a.1) - i32::from(b.1);
+    let db = i32::from(a.2) - i32::from(b.2);
+    (dr * dr + dg * dg + db * db) as u32
+}
+
+fn hard_wrap_with_cursor(
+    text: &str,
+    cursor_char_index: usize,
+    width: u16,
+) -> (Vec<String>, usize, usize) {
+    let wrap_width = width.max(1) as usize;
+    let mut lines = vec![String::new()];
+    let mut row = 0usize;
+    let mut col = 0usize;
+    let mut chars_seen = 0usize;
+    let mut cursor_row = 0usize;
+    let mut cursor_col = 0usize;
+
+    let mut set_cursor_if_match = |seen: usize, row: usize, col: usize| {
+        if seen == cursor_char_index {
+            cursor_row = row;
+            cursor_col = col;
+        }
+    };
+    set_cursor_if_match(0, row, col);
+
+    for ch in text.chars() {
+        if ch == '\n' {
+            lines.push(String::new());
+            row += 1;
+            col = 0;
+        } else {
+            if col >= wrap_width {
+                lines.push(String::new());
+                row += 1;
+                col = 0;
+            }
+            if let Some(line) = lines.last_mut() {
+                line.push(ch);
+            }
+            col += 1;
+        }
+
+        chars_seen += 1;
+        set_cursor_if_match(chars_seen, row, col);
+    }
+
+    if cursor_char_index > chars_seen {
+        cursor_row = row;
+        cursor_col = col;
+    }
+
+    (lines, cursor_row, cursor_col)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::style::Stylize;
+
+    fn test_theme() -> Theme {
+        Theme {
+            name: "Test",
+            background: Color::Rgb(20, 20, 24),
+            foreground: Color::Rgb(220, 220, 230),
+            muted: Color::Rgb(120, 120, 130),
+            accent: Color::Rgb(80, 140, 220),
+            title_bar: Color::Rgb(190, 160, 90),
+            passthrough: false,
+            palette: [
+                Color::Rgb(20, 20, 24),
+                Color::Rgb(220, 80, 90),
+                Color::Rgb(90, 200, 120),
+                Color::Rgb(230, 200, 120),
+                Color::Rgb(90, 160, 240),
+                Color::Rgb(220, 120, 220),
+                Color::Rgb(80, 200, 210),
+                Color::Rgb(220, 220, 230),
+                Color::Rgb(120, 120, 130),
+                Color::Rgb(255, 130, 150),
+                Color::Rgb(140, 220, 150),
+                Color::Rgb(255, 220, 120),
+                Color::Rgb(120, 180, 255),
+                Color::Rgb(240, 160, 240),
+                Color::Rgb(120, 230, 230),
+                Color::Rgb(255, 255, 255),
+            ],
+        }
+    }
+
+    #[test]
+    fn monochrome_text_overrides_span_colors_without_touching_modifiers() {
+        let theme = test_theme();
+
+        let text = Text {
+            lines: vec![Line {
+                spans: vec![
+                    "hello".fg(Color::Red).bg(Color::Blue).bold(),
+                    "world".fg(Color::Green).bg(Color::Magenta).italic(),
+                ],
+                style: Style::default().fg(Color::Yellow).bg(Color::Cyan),
+                alignment: None,
+            }],
+            style: Style::default().fg(Color::LightRed).bg(Color::LightBlue),
+            alignment: None,
+        };
+
+        let rendered = monochrome_text(text, theme);
+        assert_eq!(rendered.style.fg, Some(theme.muted));
+        assert_eq!(rendered.style.bg, Some(theme.background));
+        assert_eq!(rendered.lines[0].style.fg, Some(theme.muted));
+        assert_eq!(rendered.lines[0].style.bg, Some(theme.background));
+        assert_eq!(rendered.lines[0].spans[0].style.fg, Some(theme.muted));
+        assert_eq!(rendered.lines[0].spans[0].style.bg, Some(theme.background));
+        assert!(rendered.lines[0].spans[0]
+            .style
+            .add_modifier
+            .contains(Modifier::BOLD));
+        assert_eq!(rendered.lines[0].spans[1].style.fg, Some(theme.muted));
+        assert_eq!(rendered.lines[0].spans[1].style.bg, Some(theme.background));
+        assert!(rendered.lines[0].spans[1]
+            .style
+            .add_modifier
+            .contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn focused_text_remaps_colors_into_theme_palette() {
+        let theme = test_theme();
+
+        let text = Text {
+            lines: vec![Line {
+                spans: vec![
+                    "blue".fg(Color::Blue),
+                    "magenta".fg(Color::Magenta),
+                    "rgb".fg(Color::Rgb(250, 80, 250)),
+                ],
+                style: Style::default(),
+                alignment: None,
+            }],
+            style: Style::default(),
+            alignment: None,
+        };
+
+        let rendered = theme_text(text, theme);
+        assert_eq!(rendered.lines[0].spans[0].style.fg, Some(theme.palette[4]));
+        assert_eq!(rendered.lines[0].spans[1].style.fg, Some(theme.palette[5]));
+        assert!(matches!(
+            rendered.lines[0].spans[2].style.fg,
+            Some(color) if theme.palette.contains(&color)
+        ));
+        assert!(rendered.lines[0]
+            .spans
+            .iter()
+            .all(|span| span.style.bg.is_none()));
+    }
+
+    #[test]
+    fn passthrough_theme_keeps_original_colors() {
+        let theme = Theme {
+            name: "None",
+            background: Color::Reset,
+            foreground: Color::Reset,
+            muted: Color::Reset,
+            accent: Color::Reset,
+            title_bar: Color::Reset,
+            passthrough: true,
+            palette: [Color::Reset; 16],
+        };
+
+        let text = Text {
+            lines: vec![Line {
+                spans: vec!["blue".fg(Color::Blue).bg(Color::Magenta)],
+                style: Style::default().fg(Color::Yellow).bg(Color::Cyan),
+                alignment: None,
+            }],
+            style: Style::default().fg(Color::Red).bg(Color::Green),
+            alignment: None,
+        };
+
+        assert_eq!(pane_view_for_render(text.clone(), theme, true), text);
+        assert_eq!(pane_view_for_render(text.clone(), theme, false), text);
     }
 }

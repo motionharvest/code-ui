@@ -83,10 +83,7 @@ pub struct Screen {
 }
 
 impl Screen {
-    pub(crate) fn new(
-        size: crate::grid::Size,
-        scrollback_len: usize,
-    ) -> Self {
+    pub(crate) fn new(size: crate::grid::Size, scrollback_len: usize) -> Self {
         let mut grid = crate::grid::Grid::new(size, scrollback_len);
         grid.allocate_rows();
         Self {
@@ -160,11 +157,7 @@ impl Screen {
     /// text format.
     ///
     /// Newlines will not be included.
-    pub fn rows(
-        &self,
-        start: u16,
-        width: u16,
-    ) -> impl Iterator<Item = String> + '_ {
+    pub fn rows(&self, start: u16, width: u16) -> impl Iterator<Item = String> + '_ {
         self.grid().visible_rows().map(move |row| {
             let mut contents = String::new();
             row.write_contents(&mut contents, start, width, false);
@@ -198,12 +191,7 @@ impl Screen {
                     .take(usize::from(end_row) - usize::from(start_row) + 1)
                 {
                     if i == usize::from(start_row) {
-                        row.write_contents(
-                            &mut contents,
-                            start_col,
-                            cols - start_col,
-                            false,
-                        );
+                        row.write_contents(&mut contents, start_col, cols - start_col, false);
                         if !row.wrapped() {
                             contents.push('\n');
                         }
@@ -287,26 +275,14 @@ impl Screen {
     /// unspecified.
     // the unwraps in this method shouldn't be reachable
     #[allow(clippy::missing_panics_doc)]
-    pub fn rows_formatted(
-        &self,
-        start: u16,
-        width: u16,
-    ) -> impl Iterator<Item = Vec<u8>> + '_ {
+    pub fn rows_formatted(&self, start: u16, width: u16) -> impl Iterator<Item = Vec<u8>> + '_ {
         let mut wrapping = false;
         self.grid().visible_rows().enumerate().map(move |(i, row)| {
             // number of rows in a grid is stored in a u16 (see Size), so
             // visible_rows can never return enough rows to overflow here
             let i = i.try_into().unwrap();
             let mut contents = vec![];
-            row.write_contents_formatted(
-                &mut contents,
-                start,
-                width,
-                i,
-                wrapping,
-                None,
-                None,
-            );
+            row.write_contents_formatted(&mut contents, start, width, i, wrapping, None, None);
             if start == 0 && width == self.grid.size().cols {
                 wrapping = row.wrapped();
             }
@@ -333,14 +309,11 @@ impl Screen {
 
     fn write_contents_diff(&self, contents: &mut Vec<u8>, prev: &Self) {
         if self.hide_cursor() != prev.hide_cursor() {
-            crate::term::HideCursor::new(self.hide_cursor())
-                .write_buf(contents);
+            crate::term::HideCursor::new(self.hide_cursor()).write_buf(contents);
         }
-        let prev_attrs = self.grid().write_contents_diff(
-            contents,
-            prev.grid(),
-            prev.attrs,
-        );
+        let prev_attrs = self
+            .grid()
+            .write_contents_diff(contents, prev.grid(), prev.attrs);
         self.attrs.write_escape_code_diff(contents, &prev_attrs);
     }
 
@@ -400,21 +373,11 @@ impl Screen {
     }
 
     fn write_input_mode_formatted(&self, contents: &mut Vec<u8>) {
-        crate::term::ApplicationKeypad::new(
-            self.mode(MODE_APPLICATION_KEYPAD),
-        )
-        .write_buf(contents);
-        crate::term::ApplicationCursor::new(
-            self.mode(MODE_APPLICATION_CURSOR),
-        )
-        .write_buf(contents);
-        crate::term::BracketedPaste::new(self.mode(MODE_BRACKETED_PASTE))
+        crate::term::ApplicationKeypad::new(self.mode(MODE_APPLICATION_KEYPAD)).write_buf(contents);
+        crate::term::ApplicationCursor::new(self.mode(MODE_APPLICATION_CURSOR)).write_buf(contents);
+        crate::term::BracketedPaste::new(self.mode(MODE_BRACKETED_PASTE)).write_buf(contents);
+        crate::term::MouseProtocolMode::new(self.mouse_protocol_mode, MouseProtocolMode::None)
             .write_buf(contents);
-        crate::term::MouseProtocolMode::new(
-            self.mouse_protocol_mode,
-            MouseProtocolMode::None,
-        )
-        .write_buf(contents);
         crate::term::MouseProtocolEncoding::new(
             self.mouse_protocol_encoding,
             MouseProtocolEncoding::Default,
@@ -433,32 +396,19 @@ impl Screen {
     }
 
     fn write_input_mode_diff(&self, contents: &mut Vec<u8>, prev: &Self) {
-        if self.mode(MODE_APPLICATION_KEYPAD)
-            != prev.mode(MODE_APPLICATION_KEYPAD)
-        {
-            crate::term::ApplicationKeypad::new(
-                self.mode(MODE_APPLICATION_KEYPAD),
-            )
-            .write_buf(contents);
-        }
-        if self.mode(MODE_APPLICATION_CURSOR)
-            != prev.mode(MODE_APPLICATION_CURSOR)
-        {
-            crate::term::ApplicationCursor::new(
-                self.mode(MODE_APPLICATION_CURSOR),
-            )
-            .write_buf(contents);
-        }
-        if self.mode(MODE_BRACKETED_PASTE) != prev.mode(MODE_BRACKETED_PASTE)
-        {
-            crate::term::BracketedPaste::new(self.mode(MODE_BRACKETED_PASTE))
+        if self.mode(MODE_APPLICATION_KEYPAD) != prev.mode(MODE_APPLICATION_KEYPAD) {
+            crate::term::ApplicationKeypad::new(self.mode(MODE_APPLICATION_KEYPAD))
                 .write_buf(contents);
         }
-        crate::term::MouseProtocolMode::new(
-            self.mouse_protocol_mode,
-            prev.mouse_protocol_mode,
-        )
-        .write_buf(contents);
+        if self.mode(MODE_APPLICATION_CURSOR) != prev.mode(MODE_APPLICATION_CURSOR) {
+            crate::term::ApplicationCursor::new(self.mode(MODE_APPLICATION_CURSOR))
+                .write_buf(contents);
+        }
+        if self.mode(MODE_BRACKETED_PASTE) != prev.mode(MODE_BRACKETED_PASTE) {
+            crate::term::BracketedPaste::new(self.mode(MODE_BRACKETED_PASTE)).write_buf(contents);
+        }
+        crate::term::MouseProtocolMode::new(self.mouse_protocol_mode, prev.mouse_protocol_mode)
+            .write_buf(contents);
         crate::term::MouseProtocolEncoding::new(
             self.mouse_protocol_encoding,
             prev.mouse_protocol_encoding,
@@ -476,8 +426,7 @@ impl Screen {
     }
 
     fn write_title_formatted(&self, contents: &mut Vec<u8>) {
-        crate::term::ChangeTitle::new(&self.icon_name, &self.title, "", "")
-            .write_buf(contents);
+        crate::term::ChangeTitle::new(&self.icon_name, &self.title, "", "").write_buf(contents);
     }
 
     /// Returns terminal escape sequences sufficient to change the previous
@@ -491,13 +440,8 @@ impl Screen {
     }
 
     fn write_title_diff(&self, contents: &mut Vec<u8>, prev: &Self) {
-        crate::term::ChangeTitle::new(
-            &self.icon_name,
-            &self.title,
-            &prev.icon_name,
-            &prev.title,
-        )
-        .write_buf(contents);
+        crate::term::ChangeTitle::new(&self.icon_name, &self.title, &prev.icon_name, &prev.title)
+            .write_buf(contents);
     }
 
     /// Returns terminal escape sequences sufficient to cause audible and
@@ -544,10 +488,8 @@ impl Screen {
 
     fn write_attributes_formatted(&self, contents: &mut Vec<u8>) {
         crate::term::ClearAttrs::default().write_buf(contents);
-        self.attrs.write_escape_code_diff(
-            contents,
-            &crate::attrs::Attrs::default(),
-        );
+        self.attrs
+            .write_escape_code_diff(contents, &crate::attrs::Attrs::default());
     }
 
     /// Returns the current cursor position of the terminal.
@@ -1407,15 +1349,10 @@ impl Screen {
                 &[24] => self.attrs.set_underline(false),
                 &[27] => self.attrs.set_inverse(false),
                 &[n] if (30..=37).contains(&n) => {
-                    self.attrs.fgcolor =
-                        crate::attrs::Color::Idx(to_u8!(n) - 30);
+                    self.attrs.fgcolor = crate::attrs::Color::Idx(to_u8!(n) - 30);
                 }
                 &[38, 2, r, g, b] => {
-                    self.attrs.fgcolor = crate::attrs::Color::Rgb(
-                        to_u8!(r),
-                        to_u8!(g),
-                        to_u8!(b),
-                    );
+                    self.attrs.fgcolor = crate::attrs::Color::Rgb(to_u8!(r), to_u8!(g), to_u8!(b));
                 }
                 &[38, 5, i] => {
                     self.attrs.fgcolor = crate::attrs::Color::Idx(to_u8!(i));
@@ -1425,12 +1362,10 @@ impl Screen {
                         let r = next_param_u8!();
                         let g = next_param_u8!();
                         let b = next_param_u8!();
-                        self.attrs.fgcolor =
-                            crate::attrs::Color::Rgb(r, g, b);
+                        self.attrs.fgcolor = crate::attrs::Color::Rgb(r, g, b);
                     }
                     &[5] => {
-                        self.attrs.fgcolor =
-                            crate::attrs::Color::Idx(next_param_u8!());
+                        self.attrs.fgcolor = crate::attrs::Color::Idx(next_param_u8!());
                     }
                     ns => {
                         if log::log_enabled!(log::Level::Debug) {
@@ -1453,15 +1388,10 @@ impl Screen {
                     self.attrs.fgcolor = crate::attrs::Color::Default;
                 }
                 &[n] if (40..=47).contains(&n) => {
-                    self.attrs.bgcolor =
-                        crate::attrs::Color::Idx(to_u8!(n) - 40);
+                    self.attrs.bgcolor = crate::attrs::Color::Idx(to_u8!(n) - 40);
                 }
                 &[48, 2, r, g, b] => {
-                    self.attrs.bgcolor = crate::attrs::Color::Rgb(
-                        to_u8!(r),
-                        to_u8!(g),
-                        to_u8!(b),
-                    );
+                    self.attrs.bgcolor = crate::attrs::Color::Rgb(to_u8!(r), to_u8!(g), to_u8!(b));
                 }
                 &[48, 5, i] => {
                     self.attrs.bgcolor = crate::attrs::Color::Idx(to_u8!(i));
@@ -1471,12 +1401,10 @@ impl Screen {
                         let r = next_param_u8!();
                         let g = next_param_u8!();
                         let b = next_param_u8!();
-                        self.attrs.bgcolor =
-                            crate::attrs::Color::Rgb(r, g, b);
+                        self.attrs.bgcolor = crate::attrs::Color::Rgb(r, g, b);
                     }
                     &[5] => {
-                        self.attrs.bgcolor =
-                            crate::attrs::Color::Idx(next_param_u8!());
+                        self.attrs.bgcolor = crate::attrs::Color::Idx(next_param_u8!());
                     }
                     ns => {
                         if log::log_enabled!(log::Level::Debug) {
@@ -1499,12 +1427,10 @@ impl Screen {
                     self.attrs.bgcolor = crate::attrs::Color::Default;
                 }
                 &[n] if (90..=97).contains(&n) => {
-                    self.attrs.fgcolor =
-                        crate::attrs::Color::Idx(to_u8!(n) - 82);
+                    self.attrs.fgcolor = crate::attrs::Color::Idx(to_u8!(n) - 82);
                 }
                 &[n] if (100..=107).contains(&n) => {
-                    self.attrs.bgcolor =
-                        crate::attrs::Color::Idx(to_u8!(n) - 92);
+                    self.attrs.bgcolor = crate::attrs::Color::Idx(to_u8!(n) - 92);
                 }
                 ns => {
                     if log::log_enabled!(log::Level::Debug) {
@@ -1597,13 +1523,7 @@ impl vte::Perform for Screen {
         );
     }
 
-    fn csi_dispatch(
-        &mut self,
-        params: &vte::Params,
-        intermediates: &[u8],
-        _ignore: bool,
-        c: char,
-    ) {
+    fn csi_dispatch(&mut self, params: &vte::Params, intermediates: &[u8], _ignore: bool, c: char) {
         match intermediates.first() {
             None => match c {
                 '@' => self.ich(canonicalize_params_1(params, 1)),
@@ -1625,17 +1545,10 @@ impl vte::Perform for Screen {
                 'h' => self.sm(params),
                 'l' => self.rm(params),
                 'm' => self.sgr(params),
-                'r' => self.decstbm(canonicalize_params_decstbm(
-                    params,
-                    self.grid().size(),
-                )),
+                'r' => self.decstbm(canonicalize_params_decstbm(params, self.grid().size())),
                 _ => {
                     if log::log_enabled!(log::Level::Debug) {
-                        log::debug!(
-                            "unhandled csi sequence: CSI {} {}",
-                            param_str(params),
-                            c
-                        );
+                        log::debug!("unhandled csi sequence: CSI {} {}", param_str(params), c);
                     }
                 }
             },
@@ -1646,11 +1559,7 @@ impl vte::Perform for Screen {
                 'l' => self.decrst(params),
                 _ => {
                     if log::log_enabled!(log::Level::Debug) {
-                        log::debug!(
-                            "unhandled csi sequence: CSI ? {} {}",
-                            param_str(params),
-                            c
-                        );
+                        log::debug!("unhandled csi sequence: CSI ? {} {}", param_str(params), c);
                     }
                 }
             },
@@ -1674,22 +1583,13 @@ impl vte::Perform for Screen {
             (Some(&b"2"), Some(s)) => self.osc2(s),
             _ => {
                 if log::log_enabled!(log::Level::Debug) {
-                    log::debug!(
-                        "unhandled osc sequence: OSC {}",
-                        osc_param_str(params),
-                    );
+                    log::debug!("unhandled osc sequence: OSC {}", osc_param_str(params),);
                 }
             }
         }
     }
 
-    fn hook(
-        &mut self,
-        params: &vte::Params,
-        intermediates: &[u8],
-        _ignore: bool,
-        action: char,
-    ) {
+    fn hook(&mut self, params: &vte::Params, intermediates: &[u8], _ignore: bool, action: char) {
         if log::log_enabled!(log::Level::Debug) {
             intermediates.first().map_or_else(
                 || {
@@ -1721,11 +1621,7 @@ fn canonicalize_params_1(params: &vte::Params, default: u16) -> u16 {
     }
 }
 
-fn canonicalize_params_2(
-    params: &vte::Params,
-    default1: u16,
-    default2: u16,
-) -> (u16, u16) {
+fn canonicalize_params_2(params: &vte::Params, default1: u16, default2: u16) -> (u16, u16) {
     let mut iter = params.iter();
     let first = iter.next().map_or(0, |x| *x.first().unwrap_or(&0));
     let first = if first == 0 { default1 } else { first };
@@ -1736,10 +1632,7 @@ fn canonicalize_params_2(
     (first, second)
 }
 
-fn canonicalize_params_decstbm(
-    params: &vte::Params,
-    size: crate::grid::Size,
-) -> (u16, u16) {
+fn canonicalize_params_decstbm(params: &vte::Params, size: crate::grid::Size) -> (u16, u16) {
     let mut iter = params.iter();
     let top = iter.next().map_or(0, |x| *x.first().unwrap_or(&0));
     let top = if top == 0 { 1 } else { top };

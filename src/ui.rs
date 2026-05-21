@@ -1,11 +1,27 @@
 use ratatui::{
     layout::{Alignment, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
 };
 
-use crate::{theme::Theme, theme::THEMES, utils::LOGIN_SHELL_SENTINEL};
+use crate::{
+    theme::Theme,
+    theme::THEMES,
+    utils::{contains, LOGIN_SHELL_SENTINEL},
+};
+
+pub(crate) const COMMANDER_COMMAND: &str = "commander";
+pub(crate) const TOP_CHROME_ROWS: u16 = 3;
+pub(crate) const WORKSPACE_SIDEBAR_WIDTH: u16 = 24;
+const APP_NAME: &str = "Code UI";
+const APP_VERSION: &str = "0.0.2";
+const APP_HANDLE: &str = "@motionharvest";
+const WORKSPACE_ENTRY_MARGIN_X: u16 = 1;
+const WORKSPACE_ENTRY_MARGIN_TOP: u16 = 0;
+const WORKSPACE_ENTRY_HEIGHT: u16 = 3;
+const WORKSPACE_ENTRY_GAP: u16 = 0;
+const COMMANDER_HEIGHT_MULTIPLIER: u16 = 5;
 
 /// Truncate to a maximum number of terminal cells (counted as Unicode scalar
 /// values, matching ratatui's default monospace assumption).
@@ -62,6 +78,13 @@ pub(crate) const AGENT_PRESETS: [AgentPreset; 5] = [
     },
 ];
 
+pub(crate) fn default_agent_index() -> usize {
+    AGENT_PRESETS
+        .iter()
+        .position(|preset| preset.command == "pi")
+        .unwrap_or(0)
+}
+
 /// Returns the binary token associated with a stored agent command, or `None`
 /// for the plain login shell / unknown commands.
 pub(crate) fn agent_binary_for_command(command: &str) -> Option<&'static str> {
@@ -110,6 +133,7 @@ pub(crate) enum Modal {
         source_pane_id: usize,
         close_on_cancel: bool,
         name: String,
+        name_error: Option<String>,
         cursor: usize,
         name_selected: bool,
         agent_index: usize,
@@ -118,11 +142,16 @@ pub(crate) enum Modal {
     PanelSettings {
         pane_id: usize,
         name: String,
+        name_error: Option<String>,
         agent_index: usize,
         focus: PanelSettingsFocus,
     },
-    CloseConfirm {
-        pane_id: usize,
+    WorkspaceSettings {
+        workspace_index: usize,
+        name: String,
+        name_error: Option<String>,
+        cursor: usize,
+        action_index: usize,
     },
 }
 
@@ -166,21 +195,314 @@ pub(crate) fn help_debug_toggle_button_area(area: Rect) -> Rect {
     }
 }
 
-pub(crate) fn settings_button_area(size: Rect) -> Rect {
+pub(crate) fn workspace_item_area(sidebar_area: Rect, index: usize) -> Rect {
+    let first_workspace_y = commander_item_area(sidebar_area)
+        .bottom()
+        .saturating_add(WORKSPACE_ENTRY_GAP);
+    let y = first_workspace_y.saturating_add(
+        (index as u16).saturating_mul(WORKSPACE_ENTRY_HEIGHT.saturating_add(WORKSPACE_ENTRY_GAP)),
+    );
     Rect {
-        x: size.x,
-        y: size.y,
-        width: 10.min(size.width),
-        height: 1.min(size.height),
+        x: sidebar_area.x.saturating_add(WORKSPACE_ENTRY_MARGIN_X),
+        y,
+        width: sidebar_area
+            .width
+            .saturating_sub(WORKSPACE_ENTRY_MARGIN_X.saturating_mul(2)),
+        height: WORKSPACE_ENTRY_HEIGHT.min(
+            sidebar_area
+                .height
+                .saturating_sub(y.saturating_sub(sidebar_area.y)),
+        ),
     }
 }
 
-pub(crate) fn render_settings_button(f: &mut ratatui::Frame<'_>, size: Rect, theme: Theme) {
-    let area = settings_button_area(size);
-    let button = Paragraph::new("[Settings]")
-        .alignment(Alignment::Center)
-        .style(Style::default().fg(theme.accent).bg(theme.background));
-    f.render_widget(button, area);
+fn sidebar_slot_area(sidebar_area: Rect, slot_index: usize) -> Rect {
+    let y = sidebar_area
+        .y
+        .saturating_add(WORKSPACE_ENTRY_MARGIN_TOP)
+        .saturating_add(
+            (slot_index as u16)
+                .saturating_mul(WORKSPACE_ENTRY_HEIGHT.saturating_add(WORKSPACE_ENTRY_GAP)),
+        );
+    Rect {
+        x: sidebar_area.x.saturating_add(WORKSPACE_ENTRY_MARGIN_X),
+        y,
+        width: sidebar_area
+            .width
+            .saturating_sub(WORKSPACE_ENTRY_MARGIN_X.saturating_mul(2)),
+        height: WORKSPACE_ENTRY_HEIGHT.min(
+            sidebar_area
+                .height
+                .saturating_sub(y.saturating_sub(sidebar_area.y)),
+        ),
+    }
+}
+
+pub(crate) fn commander_item_area(sidebar_area: Rect) -> Rect {
+    let mut area = sidebar_slot_area(sidebar_area, 0);
+    let desired = WORKSPACE_ENTRY_HEIGHT.saturating_mul(COMMANDER_HEIGHT_MULTIPLIER);
+    area.height = desired.min(
+        sidebar_area
+            .height
+            .saturating_sub(WORKSPACE_ENTRY_MARGIN_TOP),
+    );
+    area
+}
+
+pub(crate) fn workspace_add_button_area(sidebar_area: Rect, workspace_count: usize) -> Rect {
+    workspace_item_area(sidebar_area, workspace_count)
+}
+
+pub(crate) fn workspace_menu_button_area(sidebar_area: Rect, index: usize) -> Rect {
+    let item = workspace_item_area(sidebar_area, index);
+    Rect {
+        x: item.right().saturating_sub(3),
+        y: item.y.saturating_add(1),
+        width: 1.min(item.width.saturating_sub(2)),
+        height: 1.min(item.height.saturating_sub(2)),
+    }
+}
+
+pub(crate) fn workspace_hit_index(
+    sidebar_area: Rect,
+    workspace_count: usize,
+    x: u16,
+    y: u16,
+) -> Option<usize> {
+    (0..workspace_count).find(|idx| contains(workspace_item_area(sidebar_area, *idx), x, y))
+}
+
+pub(crate) fn workspace_menu_hit_index(
+    sidebar_area: Rect,
+    workspace_count: usize,
+    x: u16,
+    y: u16,
+) -> Option<usize> {
+    (0..workspace_count).find(|idx| contains(workspace_menu_button_area(sidebar_area, *idx), x, y))
+}
+
+pub(crate) fn workspace_add_button_hit(
+    sidebar_area: Rect,
+    workspace_count: usize,
+    x: u16,
+    y: u16,
+) -> bool {
+    contains(
+        workspace_add_button_area(sidebar_area, workspace_count),
+        x,
+        y,
+    )
+}
+
+pub(crate) fn commander_button_hit(sidebar_area: Rect, x: u16, y: u16) -> bool {
+    contains(commander_item_area(sidebar_area), x, y)
+}
+
+pub(crate) fn render_workspace_sidebar(
+    f: &mut ratatui::Frame<'_>,
+    sidebar_area: Rect,
+    theme: Theme,
+    workspace_names: &[String],
+    active_workspace_index: usize,
+    commander_selected: bool,
+    sidebar_workspace_selected_index: Option<usize>,
+    sidebar_add_button_selected: bool,
+) {
+    if sidebar_area.width == 0 || sidebar_area.height == 0 {
+        return;
+    }
+
+    f.render_widget(
+        Block::default().style(Style::default().bg(theme.background)),
+        sidebar_area,
+    );
+
+    let commander_area = commander_item_area(sidebar_area);
+    if commander_area.width >= 3 && commander_area.height >= 3 {
+        let commander_style = if commander_selected {
+            Style::default()
+                .fg(theme.accent)
+                .bg(theme.background)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.muted).bg(theme.background)
+        };
+        f.render_widget(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(commander_style)
+                .style(Style::default().bg(theme.background)),
+            commander_area,
+        );
+        f.render_widget(
+            Paragraph::new("Commander")
+                .alignment(Alignment::Center)
+                .style(commander_style),
+            Rect {
+                x: commander_area.x.saturating_add(1),
+                y: commander_area.y.saturating_add(1),
+                width: commander_area.width.saturating_sub(2),
+                height: 1,
+            },
+        );
+    }
+
+    for (idx, name) in workspace_names.iter().enumerate() {
+        let item_area = workspace_item_area(sidebar_area, idx);
+        if item_area.width < 3 || item_area.height < 3 {
+            continue;
+        }
+        let active = idx == active_workspace_index;
+        let keyboard_selected = sidebar_workspace_selected_index == Some(idx);
+        let border_style = if active || keyboard_selected {
+            Style::default()
+                .fg(theme.accent)
+                .bg(theme.background)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.muted).bg(theme.background)
+        };
+        let border_type = if active && keyboard_selected {
+            BorderType::Double
+        } else if keyboard_selected {
+            BorderType::Thick
+        } else {
+            BorderType::Rounded
+        };
+        let label_width = item_area.width.saturating_sub(5) as usize;
+        let label = truncate_to_width(name, label_width);
+        let menu_area = workspace_menu_button_area(sidebar_area, idx);
+        let label_area = Rect {
+            x: item_area.x.saturating_add(1),
+            y: item_area.y.saturating_add(1),
+            width: item_area.width.saturating_sub(4),
+            height: 1,
+        };
+
+        f.render_widget(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(border_type)
+                .border_style(border_style)
+                .style(Style::default().bg(theme.background)),
+            item_area,
+        );
+        f.render_widget(
+            Paragraph::new(label)
+                .alignment(Alignment::Center)
+                .style(border_style),
+            label_area,
+        );
+
+        if menu_area.width > 0 && menu_area.height > 0 {
+            f.render_widget(
+                Paragraph::new("⋮")
+                    .alignment(Alignment::Center)
+                    .style(border_style),
+                menu_area,
+            );
+        }
+    }
+
+    let add_area = workspace_add_button_area(sidebar_area, workspace_names.len());
+    if add_area.width >= 3 && add_area.height >= 3 {
+        let style = if sidebar_add_button_selected {
+            Style::default()
+                .fg(theme.accent)
+                .bg(theme.background)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.muted).bg(theme.background)
+        };
+        let border_type = if sidebar_add_button_selected {
+            BorderType::Thick
+        } else {
+            BorderType::Rounded
+        };
+        f.render_widget(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(border_type)
+                .border_style(style)
+                .style(Style::default().bg(theme.background)),
+            add_area,
+        );
+        f.render_widget(
+            Paragraph::new("+")
+                .alignment(Alignment::Center)
+                .style(style),
+            Rect {
+                x: add_area.x.saturating_add(1),
+                y: add_area.y.saturating_add(1),
+                width: add_area.width.saturating_sub(2),
+                height: 1,
+            },
+        );
+    }
+}
+
+pub(crate) fn render_top_chrome(f: &mut ratatui::Frame<'_>, size: Rect, theme: Theme) {
+    if size.width == 0 || size.height < 2 {
+        return;
+    }
+
+    let header_row = Rect {
+        x: size.x,
+        y: size.y.saturating_add(1),
+        width: size.width,
+        height: 1,
+    };
+    if header_row.y >= size.bottom() {
+        return;
+    }
+
+    let handle_width = APP_HANDLE.chars().count() as u16;
+    let handle_area = Rect {
+        x: header_row
+            .x
+            .saturating_add(header_row.width.saturating_sub(handle_width)),
+        y: header_row.y,
+        width: handle_width.min(header_row.width),
+        height: 1,
+    };
+    f.render_widget(
+        Paragraph::new(APP_HANDLE)
+            .alignment(Alignment::Left)
+            .style(Style::default().fg(theme.muted).bg(theme.background)),
+        handle_area,
+    );
+
+    let left_width = header_row
+        .width
+        .saturating_sub(handle_area.width.saturating_add(1));
+    if left_width == 0 {
+        return;
+    }
+
+    let title = Paragraph::new(Line::from(vec![
+        Span::styled(
+            APP_NAME,
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(APP_VERSION, Style::default().fg(theme.muted)),
+    ]))
+    .alignment(Alignment::Left)
+    .style(Style::default().bg(theme.background));
+    f.render_widget(
+        title,
+        Rect {
+            x: header_row
+                .x
+                .saturating_add(WORKSPACE_ENTRY_MARGIN_X.saturating_add(1)),
+            y: header_row.y,
+            width: left_width.saturating_sub(WORKSPACE_ENTRY_MARGIN_X.saturating_add(1)),
+            height: 1,
+        },
+    );
 }
 
 pub(crate) fn render_help_modal(
@@ -241,11 +563,15 @@ Ctrl+Alt+Arrows: Split pane (pick agent)\n\
 Ctrl+Shift+A / B: Split right / down\n\
 Ctrl+PgUp/PgDn: Cycle pane focus\n\
 Ctrl+W: Close focused pane\n\
-Ctrl+Arrows: Move focus\n\
+Ctrl+Arrows: Move focus (panes/sidebar)\n\
 Ctrl+Shift+Arrows: Resize pane edges\n\
 Ctrl+Shift+K/J: Resize top/bottom (if Up/Down are captured by the OS)\n\
 Mouse drag: Resize pane dividers\n\
-Ctrl+Shift+M: Toggle mouse capture for terminal text selection\n\
+Drag pane title onto another pane: Swap pane positions\n\
+Drag pane contents: Select text\n\
+Shift+Left/Right: Adjust selection by character\n\
+Ctrl+C: Copy selection, or interrupt if nothing is selected\n\
+Ctrl+Shift+M: Toggle mouse capture\n\
 Shift+PageUp/PageDown: Scroll by page\n\
 Shift+Home/End: Scroll to top/bottom",
     )
@@ -422,16 +748,19 @@ pub(crate) fn render_new_pane_picker_modal(
     container: Rect,
     theme: Theme,
     name: &str,
+    name_error: Option<&str>,
     cursor: usize,
     name_selected: bool,
     agent_index: usize,
+    agent_available: &[bool],
 ) {
     let area = new_pane_picker_modal_area(container);
     f.render_widget(Clear, area);
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("New Pane")
+        .border_type(BorderType::Rounded)
+        .title("─ New Pane ─")
         .style(Style::default().fg(theme.foreground).bg(theme.background))
         .border_style(Style::default().fg(theme.accent));
     let inner = block.inner(area);
@@ -465,33 +794,58 @@ pub(crate) fn render_new_pane_picker_modal(
     let name_block = Block::default()
         .borders(Borders::ALL)
         .style(Style::default().fg(theme.foreground).bg(theme.background))
-        .border_style(Style::default().fg(theme.accent));
+        .border_style(if name_error.is_some() {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default().fg(theme.accent)
+        });
     let name_inner = name_block.inner(name_area);
     f.render_widget(name_block, name_area);
     f.render_widget(
-        Paragraph::new(name.to_string())
-            .style(if name_selected {
-                Style::default().fg(theme.background).bg(theme.accent)
-            } else {
-                Style::default().fg(theme.foreground).bg(theme.background)
-            }),
+        Paragraph::new(name.to_string()).style(if name_selected {
+            Style::default().fg(theme.background).bg(theme.accent)
+        } else {
+            Style::default().fg(theme.foreground).bg(theme.background)
+        }),
         name_inner,
     );
+    if let Some(error) = name_error {
+        let error_area = Rect {
+            x: inner.x,
+            y: name_area.bottom(),
+            width: inner.width,
+            height: 1,
+        };
+        f.render_widget(
+            Paragraph::new(error).style(Style::default().fg(Color::Red).bg(theme.background)),
+            error_area,
+        );
+    }
 
     let list_area = new_pane_picker_list_area(area);
     let mut lines: Vec<Line<'static>> = Vec::new();
     for (idx, preset) in AGENT_PRESETS.iter().enumerate() {
-        let selected = idx == agent_index;
-        let marker = if selected { "> " } else { "  " };
-        let style = if selected {
+        let available = agent_available.get(idx).copied().unwrap_or(true);
+        let selected = idx == agent_index && available;
+        let marker = if selected {
+            "> "
+        } else if available {
+            "  "
+        } else {
+            "x "
+        };
+        let style = if !available {
+            Style::default().fg(theme.muted)
+        } else if selected {
             Style::default()
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme.foreground)
         };
+        let suffix = if available { "" } else { " (in use)" };
         lines.push(Line::from(vec![Span::styled(
-            format!("{}{}", marker, preset.label),
+            format!("{}{}{}", marker, preset.label, suffix),
             style,
         )]));
     }
@@ -508,8 +862,9 @@ pub(crate) fn render_new_pane_picker_modal(
     } else {
         cursor.min(name.chars().count())
     };
-    let cursor_x =
-        name_inner.x.saturating_add(clamped_cursor.min(name_inner.width.saturating_sub(1) as usize) as u16);
+    let cursor_x = name_inner
+        .x
+        .saturating_add(clamped_cursor.min(name_inner.width.saturating_sub(1) as usize) as u16);
     f.set_cursor(cursor_x, name_inner.y);
 }
 
@@ -518,8 +873,10 @@ pub(crate) fn render_panel_settings_modal(
     size: Rect,
     theme: Theme,
     name: &str,
+    name_error: Option<&str>,
     agent_index: usize,
     focus: PanelSettingsFocus,
+    agent_available: &[bool],
 ) {
     let area = panel_settings_modal_area(size);
     f.render_widget(Clear, area);
@@ -566,7 +923,9 @@ pub(crate) fn render_panel_settings_modal(
     let name_block = Block::default()
         .borders(Borders::ALL)
         .style(Style::default().fg(theme.foreground).bg(theme.background))
-        .border_style(if focus == PanelSettingsFocus::Name {
+        .border_style(if name_error.is_some() {
+            Style::default().fg(Color::Red)
+        } else if focus == PanelSettingsFocus::Name {
             Style::default().fg(theme.accent)
         } else {
             Style::default().fg(theme.muted)
@@ -578,6 +937,17 @@ pub(crate) fn render_panel_settings_modal(
             .style(Style::default().fg(theme.foreground).bg(theme.background)),
         name_inner,
     );
+    if let Some(error) = name_error {
+        f.render_widget(
+            Paragraph::new(error).style(Style::default().fg(Color::Red).bg(theme.background)),
+            Rect {
+                x: inner.x,
+                y: name_area.bottom(),
+                width: inner.width,
+                height: 1,
+            },
+        );
+    }
 
     let agent_label =
         Paragraph::new("Agent").style(Style::default().fg(theme.foreground).bg(theme.background));
@@ -605,17 +975,27 @@ pub(crate) fn render_panel_settings_modal(
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     for (idx, preset) in AGENT_PRESETS.iter().enumerate() {
-        let selected = idx == agent_index;
-        let marker = if selected { "> " } else { "  " };
-        let style = if selected {
+        let available = agent_available.get(idx).copied().unwrap_or(true);
+        let selected = idx == agent_index && available;
+        let marker = if selected {
+            "> "
+        } else if available {
+            "  "
+        } else {
+            "x "
+        };
+        let style = if !available {
+            Style::default().fg(theme.muted)
+        } else if selected {
             Style::default()
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme.foreground)
         };
+        let suffix = if available { "" } else { " (in use)" };
         lines.push(Line::from(vec![Span::styled(
-            format!("{}{}", marker, preset.label),
+            format!("{}{}{}", marker, preset.label, suffix),
             style,
         )]));
     }
@@ -656,9 +1036,9 @@ pub(crate) fn render_panel_settings_modal(
     }
 }
 
-pub(crate) fn close_confirm_modal_area(size: Rect) -> Rect {
-    let width = 40.min(size.width);
-    let height = 7.min(size.height);
+pub(crate) fn workspace_settings_modal_area(size: Rect) -> Rect {
+    let width = 46.min(size.width);
+    let height = 11.min(size.height);
     Rect {
         x: size.x + (size.width.saturating_sub(width)) / 2,
         y: size.y + (size.height.saturating_sub(height)) / 2,
@@ -667,56 +1047,143 @@ pub(crate) fn close_confirm_modal_area(size: Rect) -> Rect {
     }
 }
 
-pub(crate) fn close_confirm_cancel_button_area(area: Rect) -> Rect {
+pub(crate) fn workspace_settings_name_input_area(area: Rect) -> Rect {
+    let inner = Block::default().borders(Borders::ALL).inner(area);
     Rect {
-        x: area.x + 5,
-        y: area.bottom().saturating_sub(2),
-        width: 10,
-        height: 1,
+        x: inner.x,
+        y: inner.y + 2,
+        width: inner.width,
+        height: 3,
     }
 }
 
-pub(crate) fn close_confirm_confirm_button_area(area: Rect) -> Rect {
+pub(crate) fn workspace_settings_action_list_area(area: Rect) -> Rect {
+    let inner = Block::default().borders(Borders::ALL).inner(area);
     Rect {
-        x: area.right().saturating_sub(15),
-        y: area.bottom().saturating_sub(2),
-        width: 10,
-        height: 1,
+        x: inner.x,
+        y: inner.y + 6,
+        width: inner.width,
+        height: 3,
     }
 }
 
-pub(crate) fn render_close_confirm_modal(f: &mut ratatui::Frame<'_>, size: Rect, theme: Theme) {
-    let area = close_confirm_modal_area(size);
+pub(crate) fn workspace_settings_action_hit_index(area: Rect, x: u16, y: u16) -> Option<usize> {
+    let action_area = workspace_settings_action_list_area(area);
+    if !contains(action_area, x, y) {
+        return None;
+    }
+    Some((y.saturating_sub(action_area.y) as usize).min(2))
+}
+
+fn workspace_settings_action_style(theme: Theme, action_index: usize, selected: bool) -> Style {
+    let mut style = if action_index == 2 {
+        Style::default().fg(Color::Red)
+    } else {
+        Style::default().fg(theme.foreground)
+    };
+    if selected {
+        style = style.add_modifier(Modifier::BOLD);
+        if action_index != 2 {
+            style = style.fg(theme.accent);
+        }
+    }
+    style
+}
+
+pub(crate) fn render_workspace_settings_modal(
+    f: &mut ratatui::Frame<'_>,
+    size: Rect,
+    theme: Theme,
+    name: &str,
+    name_error: Option<&str>,
+    cursor: usize,
+    action_index: usize,
+) {
+    let area = workspace_settings_modal_area(size);
     f.render_widget(Clear, area);
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("Close Pane")
+        .border_type(BorderType::Rounded)
+        .title("─ Workspace ─")
         .style(Style::default().fg(theme.foreground).bg(theme.background))
         .border_style(Style::default().fg(theme.accent));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let message = Paragraph::new("Are you sure you want to close this pane?")
-        .alignment(Alignment::Center)
-        .style(Style::default().fg(theme.foreground).bg(theme.background));
+    let hint = Paragraph::new("Type name, L/R cursor, U/D action")
+        .style(Style::default().fg(theme.muted).bg(theme.background));
     f.render_widget(
-        message,
+        hint,
         Rect {
             x: inner.x,
             y: inner.y,
             width: inner.width,
-            height: 2,
+            height: 1,
         },
     );
 
-    let cancel = Paragraph::new("[Cancel]")
-        .alignment(Alignment::Center)
-        .style(Style::default().fg(theme.muted).bg(theme.background));
-    f.render_widget(cancel, close_confirm_cancel_button_area(area));
+    let name_label =
+        Paragraph::new("Name").style(Style::default().fg(theme.foreground).bg(theme.background));
+    f.render_widget(
+        name_label,
+        Rect {
+            x: inner.x,
+            y: inner.y + 1,
+            width: inner.width,
+            height: 1,
+        },
+    );
 
-    let confirm = Paragraph::new("[Confirm]")
-        .alignment(Alignment::Center)
-        .style(Style::default().fg(theme.accent).bg(theme.background));
-    f.render_widget(confirm, close_confirm_confirm_button_area(area));
+    let name_area = workspace_settings_name_input_area(area);
+    let name_block = Block::default()
+        .borders(Borders::ALL)
+        .style(Style::default().fg(theme.foreground).bg(theme.background))
+        .border_style(if name_error.is_some() {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default().fg(theme.accent)
+        });
+    let name_inner = name_block.inner(name_area);
+    f.render_widget(name_block, name_area);
+    f.render_widget(
+        Paragraph::new(name.to_string())
+            .style(Style::default().fg(theme.foreground).bg(theme.background)),
+        name_inner,
+    );
+
+    if let Some(error) = name_error {
+        f.render_widget(
+            Paragraph::new(error).style(Style::default().fg(Color::Red).bg(theme.background)),
+            Rect {
+                x: inner.x,
+                y: name_area.bottom(),
+                width: inner.width,
+                height: 1,
+            },
+        );
+    }
+
+    let actions_area = workspace_settings_action_list_area(area);
+    let actions = ["Save", "Cancel", "Close Workspace"];
+    let mut action_lines = Vec::new();
+    for (idx, label) in actions.iter().enumerate() {
+        let selected = idx == action_index.min(2);
+        let marker = if selected { "> " } else { "  " };
+        action_lines.push(Line::from(vec![Span::styled(
+            format!("{}{}", marker, label),
+            workspace_settings_action_style(theme, idx, selected),
+        )]));
+    }
+    f.render_widget(
+        Paragraph::new(Text::from(action_lines))
+            .style(Style::default().fg(theme.foreground).bg(theme.background))
+            .wrap(Wrap { trim: false }),
+        actions_area,
+    );
+
+    let cursor_x = name_inner
+        .x
+        .saturating_add(cursor.min(name_inner.width.saturating_sub(1) as usize) as u16);
+    f.set_cursor(cursor_x, name_inner.y);
 }

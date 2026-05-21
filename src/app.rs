@@ -1,6 +1,10 @@
 use std::{
+    collections::{HashMap, HashSet},
+    io::{self, Write},
+    process::Command,
+    sync::mpsc::{self, Receiver, Sender, TryRecvError},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crossterm::event::{
@@ -11,26 +15,30 @@ use ratatui::layout::{Direction, Rect};
 use crate::{
     layout::{
         adjacent_overlap, load_persisted_layout, pane_inner_area, placement_is_adjacent,
-        save_persisted_layout, DebugContainer, DebugPlacement, ExposedSides, Node, Placement,
-        ResizeBoundary, SplitSide,
+        save_persisted_layout, DebugContainer, DebugPlacement, ExposedSides, Node,
+        PersistedWorkspace, Placement, ResizeBoundary, SplitSide,
     },
-    pane::Pane,
+    pane::{Pane, PaneMouseEventKind, PaneSelection},
     theme::{load_persisted_theme_index, save_persisted_theme, Theme, THEMES},
     ui::{
-        close_confirm_cancel_button_area, close_confirm_confirm_button_area,
-        close_confirm_modal_area, help_close_button_area, help_debug_toggle_button_area,
-        help_modal_area, new_pane_picker_list_area, new_pane_picker_modal_area,
-        new_pane_picker_name_input_area, panel_settings_agent_list_area,
-        panel_settings_cancel_button_area, panel_settings_close_button_area,
-        panel_settings_confirm_button_area, panel_settings_modal_area,
-        panel_settings_modal_inner, panel_settings_name_input_area, settings_button_area, Modal,
-        PanelSettingsFocus, AGENT_PRESETS,
+        commander_button_hit, default_agent_index, help_close_button_area,
+        help_debug_toggle_button_area, help_modal_area, new_pane_picker_list_area,
+        new_pane_picker_modal_area, new_pane_picker_name_input_area,
+        panel_settings_agent_list_area, panel_settings_cancel_button_area,
+        panel_settings_close_button_area, panel_settings_confirm_button_area,
+        panel_settings_modal_area, panel_settings_modal_inner, panel_settings_name_input_area,
+        workspace_add_button_hit, workspace_hit_index, workspace_menu_hit_index,
+        workspace_settings_action_hit_index, workspace_settings_modal_area,
+        workspace_settings_name_input_area, Modal, PanelSettingsFocus, AGENT_PRESETS,
+        COMMANDER_COMMAND, TOP_CHROME_ROWS, WORKSPACE_SIDEBAR_WIDTH,
     },
-    utils::{arrow_key_to_split_side, contains, key_to_bytes},
+    utils::{arrow_key_to_split_side, contains, key_to_bytes, LOGIN_SHELL_SENTINEL},
 };
 
 pub(crate) struct App {
     pub(crate) panes: Vec<Pane>,
+    workspaces: Vec<WorkspaceState>,
+    active_workspace: usize,
     pub(crate) layout: Node,
     pub(crate) focused: usize,
     maximized_pane: Option<usize>,
@@ -39,11 +47,28 @@ pub(crate) struct App {
     pub(crate) reload_requested: bool,
     pub(crate) modal: Option<Modal>,
     drag_resize: Option<DragResize>,
+    drag_swap: Option<DragPaneSwap>,
+    drag_pane_mouse: Option<DragPaneMouse>,
+    text_selection: Option<TextSelection>,
     theme_index: usize,
     pub(crate) default_agent_index: usize,
     pub(crate) theme_preview_index: usize,
     debug_container_boxes: bool,
     mouse_capture_enabled: bool,
+    commander_focused: bool,
+    sidebar_workspace_focused: Option<usize>,
+    sidebar_add_button_focused: bool,
+    commander: CommanderState,
+    tts: TtsState,
+    last_terminal_size: Rect,
+}
+
+#[derive(Clone)]
+struct WorkspaceState {
+    name: String,
+    layout: Node,
+    focused: usize,
+    maximized_pane: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -55,11 +80,146 @@ struct DragResize {
     pane_ids: Vec<usize>,
 }
 
+#[derive(Clone)]
+struct DragPaneSwap {
+    source_pane_id: usize,
+    hovered_pane_id: Option<usize>,
+    moved: bool,
+}
+
+#[derive(Clone, Copy)]
+struct DragPaneMouse {
+    pane_id: usize,
+    button: MouseButton,
+}
+
+#[derive(Clone, Copy)]
+struct TextSelection {
+    pane_id: usize,
+    start: (u16, u16),
+    end: (u16, u16),
+    active: bool,
+}
+
 struct ResizeTarget {
     pane_a: usize,
     pane_b: usize,
     direction: Direction,
     pane_ids: Vec<usize>,
+}
+
+struct CommanderState {
+    input: String,
+    cursor: usize,
+    busy: bool,
+    history: Vec<String>,
+    rx: Option<Receiver<CommanderWorkerResult>>,
+}
+
+struct CommanderWorkerResult {
+    steps: Vec<CommanderExecutionStep>,
+    reply_text: Option<String>,
+    speech_text: Option<String>,
+    target_name: Option<String>,
+    payload: Option<String>,
+    submit_payload: bool,
+    create_requests: Vec<(String, usize)>,
+    rename_requests: Vec<(String, String)>,
+    close_requests: Vec<String>,
+}
+
+#[derive(Clone, Default)]
+struct CommanderExecutionStep {
+    save_as: Option<String>,
+    reply_text: Option<String>,
+    speech_text: Option<String>,
+    target_name: Option<String>,
+    payload: Option<String>,
+    submit_payload: bool,
+    create_requests: Vec<(String, usize)>,
+    rename_requests: Vec<(String, String)>,
+    close_requests: Vec<String>,
+}
+
+#[derive(Default)]
+struct CommanderStepRefs {
+    named: HashMap<String, Vec<usize>>,
+    last_created_ids: Vec<usize>,
+}
+
+struct CommanderExecutionSummary {
+    history_note: String,
+}
+
+struct CommanderStepOutcome {
+    history_notes: Vec<String>,
+    speech_notes: Vec<String>,
+}
+
+enum CommanderSlashCommand {
+    OpenTheme,
+    OpenSettings,
+}
+
+impl CommanderWorkerResult {
+    fn empty() -> Self {
+        Self {
+            steps: Vec::new(),
+            reply_text: None,
+            speech_text: None,
+            target_name: None,
+            payload: None,
+            submit_payload: false,
+            create_requests: Vec::new(),
+            rename_requests: Vec::new(),
+            close_requests: Vec::new(),
+        }
+    }
+
+    fn into_steps(self) -> Vec<CommanderExecutionStep> {
+        if !self.steps.is_empty() {
+            return self.steps;
+        }
+        let has_legacy_fields = self.target_name.is_some()
+            || self.reply_text.is_some()
+            || self.speech_text.is_some()
+            || self.payload.is_some()
+            || !self.create_requests.is_empty()
+            || !self.rename_requests.is_empty()
+            || !self.close_requests.is_empty();
+        if !has_legacy_fields {
+            return Vec::new();
+        }
+        vec![CommanderExecutionStep {
+            save_as: None,
+            reply_text: self.reply_text,
+            speech_text: self.speech_text,
+            target_name: self.target_name,
+            payload: self.payload,
+            submit_payload: self.submit_payload,
+            create_requests: self.create_requests,
+            rename_requests: self.rename_requests,
+            close_requests: self.close_requests,
+        }]
+    }
+}
+
+struct CreateOutcome {
+    note: Option<String>,
+    created_ids: Vec<usize>,
+}
+
+struct TtsState {
+    tx: Option<Sender<String>>,
+}
+
+#[derive(Clone)]
+struct TtsConfig {
+    edge_voice: String,
+    edge_rate: String,
+    edge_volume: String,
+    edge_pitch: String,
+    timeout_secs: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,26 +231,76 @@ pub(crate) enum MousePointerShape {
 
 impl App {
     const NEW_PANE_PLACEHOLDER_COMMAND: &'static str = "cat";
+    const DUPLICATE_PANE_NAME_ERROR: &'static str = "Name already exists. Pick another.";
+
+    fn pane_name_exists_for_other(&self, pane_id: usize, candidate: &str) -> bool {
+        let normalized_candidate = candidate.trim().to_ascii_lowercase();
+        if normalized_candidate.is_empty() {
+            return false;
+        }
+        self.panes.iter().any(|pane| {
+            pane.id != pane_id && pane.title.trim().to_ascii_lowercase() == normalized_candidate
+        })
+    }
 
     pub(crate) fn new(rows: u16, cols: u16) -> anyhow::Result<Self> {
-        let content_rows = rows.saturating_sub(2).max(1);
-        let content_cols = cols.saturating_sub(3).max(1);
+        let content_area = Self::content_area(Rect {
+            x: 0,
+            y: 0,
+            width: cols,
+            height: rows,
+        });
+        let content_rows = content_area.height.saturating_sub(1).max(1);
+        let content_cols = content_area.width.saturating_sub(3).max(1);
         let persisted = load_persisted_layout();
-        let layout = persisted
+        let mut workspaces = persisted
             .as_ref()
-            .map(|state| state.layout.clone())
-            .unwrap_or(Node::Leaf { pane_id: 0 });
+            .map(|state| {
+                state
+                    .workspaces
+                    .iter()
+                    .map(|workspace| WorkspaceState {
+                        name: workspace.name.clone(),
+                        layout: workspace.layout.clone(),
+                        focused: workspace.focused,
+                        maximized_pane: None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if workspaces.is_empty() {
+            workspaces.push(WorkspaceState {
+                name: "Workspace 1".to_string(),
+                layout: Node::Leaf { pane_id: 0 },
+                focused: 0,
+                maximized_pane: None,
+            });
+        }
 
         let mut pane_ids = Vec::new();
-        layout.collect_leaf_ids(&mut pane_ids);
+        for workspace in &workspaces {
+            workspace.layout.collect_leaf_ids(&mut pane_ids);
+        }
+        pane_ids.sort_unstable();
+        pane_ids.dedup();
         if pane_ids.is_empty() {
             pane_ids.push(0);
+            if let Some(first_workspace) = workspaces.first_mut() {
+                first_workspace.layout = Node::Leaf { pane_id: 0 };
+                first_workspace.focused = 0;
+                first_workspace.maximized_pane = None;
+            }
+        }
+        for workspace in &mut workspaces {
+            if !workspace.layout.contains_pane_id(workspace.focused) {
+                workspace.focused = workspace.layout.first_leaf_id();
+            }
         }
 
         let default_agent_index = persisted
             .as_ref()
             .map(|state| state.default_agent_index)
-            .unwrap_or(1)
+            .unwrap_or(default_agent_index())
             .min(AGENT_PRESETS.len().saturating_sub(1));
         let panes = pane_ids
             .iter()
@@ -105,30 +315,52 @@ impl App {
                     .and_then(|state| state.commands.get(&id).cloned())
                     .unwrap_or_else(|| AGENT_PRESETS[default_agent_index].command.to_string());
                 let command = normalize_stored_agent_command(command);
+                let command = if command == COMMANDER_COMMAND {
+                    AGENT_PRESETS[default_agent_index].command.to_string()
+                } else {
+                    command
+                };
                 let resume_command = persisted
                     .as_ref()
                     .and_then(|state| state.resume_commands.get(&id).cloned());
+                let last_command = persisted
+                    .as_ref()
+                    .and_then(|state| state.last_commands.get(&id).cloned());
                 Pane::new(
                     id,
                     title,
                     command,
                     resume_command,
+                    last_command,
                     content_rows,
                     content_cols,
                 )
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
 
-        let focused = persisted
+        let active_workspace = persisted
             .as_ref()
-            .map(|state| state.focused)
-            .filter(|pane_id| layout.contains_pane_id(*pane_id))
-            .unwrap_or_else(|| layout.first_leaf_id());
-        let next_pane_id = layout.max_leaf_id().saturating_add(1);
-        let theme_index = load_persisted_theme_index().unwrap_or(0);
+            .map(|state| {
+                state
+                    .active_workspace
+                    .min(workspaces.len().saturating_sub(1))
+            })
+            .unwrap_or(0);
+        let layout = workspaces[active_workspace].layout.clone();
+        let focused = workspaces[active_workspace].focused;
+        let next_pane_id = workspaces
+            .iter()
+            .map(|workspace| workspace.layout.max_leaf_id())
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let theme_index =
+            load_persisted_theme_index().unwrap_or_else(crate::theme::default_theme_index);
 
         Ok(Self {
             panes,
+            workspaces,
+            active_workspace,
             layout,
             focused,
             maximized_pane: None,
@@ -137,24 +369,125 @@ impl App {
             reload_requested: false,
             modal: None,
             drag_resize: None,
+            drag_swap: None,
+            drag_pane_mouse: None,
+            text_selection: None,
             theme_index,
             default_agent_index,
             theme_preview_index: theme_index,
             debug_container_boxes: parse_debug_flag("SPLIT_TUI_DEBUG_CONTAINERS"),
             mouse_capture_enabled: true,
+            commander_focused: false,
+            sidebar_workspace_focused: None,
+            sidebar_add_button_focused: false,
+            commander: CommanderState {
+                input: String::new(),
+                cursor: 0,
+                busy: false,
+                history: vec![
+                    "Commander ready. Type a request and press Enter.".to_string(),
+                    "Example: \"Send hello to Pane 2\"".to_string(),
+                ],
+                rx: None,
+            },
+            tts: init_tts_state(),
+            last_terminal_size: Rect {
+                x: 0,
+                y: 0,
+                width: cols,
+                height: rows,
+            },
         })
     }
 
-    pub(crate) fn content_area(size: Rect) -> Rect {
+    pub(crate) fn body_area(size: Rect) -> Rect {
+        let top_chrome = TOP_CHROME_ROWS.min(size.height);
         Rect {
             x: size.x,
-            y: size.y.saturating_add(1),
+            y: size.y.saturating_add(top_chrome),
             width: size.width,
-            height: size.height.saturating_sub(1),
+            height: size.height.saturating_sub(top_chrome),
+        }
+    }
+
+    pub(crate) fn workspace_sidebar_area(size: Rect) -> Rect {
+        let body = Self::body_area(size);
+        let width = WORKSPACE_SIDEBAR_WIDTH.min(body.width.saturating_sub(1));
+        Rect {
+            x: body.x,
+            y: body.y,
+            width,
+            height: body.height,
+        }
+    }
+
+    pub(crate) fn content_area(size: Rect) -> Rect {
+        let body = Self::body_area(size);
+        let sidebar = Self::workspace_sidebar_area(size);
+        Rect {
+            x: sidebar.right(),
+            y: body.y,
+            width: body.width.saturating_sub(sidebar.width),
+            height: body.height,
+        }
+    }
+
+    pub(crate) fn workspace_names(&self) -> Vec<String> {
+        self.workspaces
+            .iter()
+            .map(|workspace| workspace.name.clone())
+            .collect()
+    }
+
+    pub(crate) fn active_workspace_index(&self) -> usize {
+        self.active_workspace
+    }
+
+    pub(crate) fn commander_focused(&self) -> bool {
+        self.commander_focused
+    }
+
+    pub(crate) fn sidebar_workspace_focused(&self) -> Option<usize> {
+        self.sidebar_workspace_focused
+    }
+
+    pub(crate) fn sidebar_add_button_focused(&self) -> bool {
+        self.sidebar_add_button_focused
+    }
+
+    fn sync_active_workspace_state(&mut self) {
+        if let Some(workspace) = self.workspaces.get_mut(self.active_workspace) {
+            workspace.layout = self.layout.clone();
+            workspace.focused = self.focused;
+            workspace.maximized_pane = self.maximized_pane;
+        }
+    }
+
+    fn load_active_workspace_state(&mut self) {
+        let Some(workspace) = self.workspaces.get(self.active_workspace) else {
+            return;
+        };
+        self.layout = workspace.layout.clone();
+        self.focused = workspace.focused;
+        self.maximized_pane = workspace.maximized_pane;
+        if !self.layout.contains_pane_id(self.focused) {
+            self.focused = self.layout.first_leaf_id();
+        }
+        if self
+            .maximized_pane
+            .is_some_and(|pane_id| !self.layout.contains_pane_id(pane_id))
+        {
+            self.maximized_pane = None;
         }
     }
 
     pub(crate) fn resize(&mut self, total_rows: u16, cols: u16) {
+        self.last_terminal_size = Rect {
+            x: 0,
+            y: 0,
+            width: cols,
+            height: total_rows,
+        };
         let placements = self.pane_placements(Self::content_area(Rect {
             x: 0,
             y: 0,
@@ -178,6 +511,9 @@ impl App {
     /// can keep using the slot instead of staring at a frozen view.
     pub(crate) fn tick(&mut self) -> bool {
         let mut any = false;
+        if self.poll_commander_result() {
+            any = true;
+        }
         for pane in &mut self.panes {
             if pane.pump() {
                 any = true;
@@ -237,18 +573,507 @@ impl App {
         }
     }
 
-    pub(crate) fn persist_layout(&self) {
+    pub(crate) fn persist_layout(&mut self) {
+        self.sync_active_workspace_state();
+        let persisted_workspaces = self
+            .workspaces
+            .iter()
+            .map(|workspace| PersistedWorkspace {
+                name: workspace.name.clone(),
+                layout: workspace.layout.clone(),
+                focused: workspace.focused,
+            })
+            .collect::<Vec<_>>();
         let _ = save_persisted_layout(
-            &self.layout,
-            self.focused,
+            &persisted_workspaces,
+            self.active_workspace,
             self.default_agent_index,
             &self.panes,
         );
     }
 
+    fn switch_workspace(&mut self, workspace_index: usize, size: Rect) {
+        if workspace_index >= self.workspaces.len() {
+            return;
+        }
+        if workspace_index == self.active_workspace {
+            self.commander_focused = false;
+            self.sidebar_workspace_focused = None;
+            self.sidebar_add_button_focused = false;
+            self.drag_resize = None;
+            self.drag_swap = None;
+            self.drag_pane_mouse = None;
+            self.resize(size.height, size.width);
+            self.persist_layout();
+            return;
+        }
+        self.sync_active_workspace_state();
+        self.active_workspace = workspace_index;
+        self.load_active_workspace_state();
+        self.drag_resize = None;
+        self.drag_swap = None;
+        self.drag_pane_mouse = None;
+        self.commander_focused = false;
+        self.sidebar_workspace_focused = None;
+        self.sidebar_add_button_focused = false;
+        self.resize(size.height, size.width);
+        self.persist_layout();
+    }
+
+    fn create_workspace(&mut self, size: Rect) -> anyhow::Result<()> {
+        self.sync_active_workspace_state();
+        let pane_id = self.next_pane_id;
+        self.next_pane_id = self.next_pane_id.saturating_add(1);
+
+        let title = format!("Pane {}", pane_id + 1);
+        let default_index = self.first_available_agent_for_pane(pane_id, self.default_agent_index);
+        self.panes.push(Pane::new(
+            pane_id,
+            title,
+            AGENT_PRESETS[default_index].command,
+            None,
+            None,
+            1,
+            1,
+        )?);
+
+        self.workspaces.push(WorkspaceState {
+            name: format!("Workspace {}", self.workspaces.len() + 1),
+            layout: Node::Leaf { pane_id },
+            focused: pane_id,
+            maximized_pane: None,
+        });
+        self.active_workspace = self.workspaces.len().saturating_sub(1);
+        self.load_active_workspace_state();
+        self.commander_focused = false;
+        self.sidebar_workspace_focused = None;
+        self.sidebar_add_button_focused = false;
+        self.drag_pane_mouse = None;
+        self.resize(size.height, size.width);
+        self.persist_layout();
+        Ok(())
+    }
+
+    fn open_workspace_settings_modal(&mut self, workspace_index: usize) {
+        let Some(workspace) = self.workspaces.get(workspace_index) else {
+            return;
+        };
+        self.modal = Some(Modal::WorkspaceSettings {
+            workspace_index,
+            name: workspace.name.clone(),
+            name_error: None,
+            cursor: workspace.name.chars().count(),
+            action_index: 0,
+        });
+    }
+
+    fn rename_workspace(
+        &mut self,
+        workspace_index: usize,
+        name: String,
+    ) -> Result<(), &'static str> {
+        if workspace_index >= self.workspaces.len() {
+            return Err("Workspace no longer exists.");
+        }
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err("Name cannot be empty.");
+        }
+        self.workspaces[workspace_index].name = trimmed.to_string();
+        self.persist_layout();
+        Ok(())
+    }
+
+    fn close_workspace(&mut self, workspace_index: usize, size: Rect) -> Result<(), &'static str> {
+        if self.workspaces.len() <= 1 {
+            return Err("At least one workspace is required.");
+        }
+        if workspace_index >= self.workspaces.len() {
+            return Err("Workspace no longer exists.");
+        }
+
+        self.sync_active_workspace_state();
+        self.workspaces.remove(workspace_index);
+
+        let mut referenced_pane_ids = HashSet::new();
+        for workspace in &self.workspaces {
+            let mut ids = Vec::new();
+            workspace.layout.collect_leaf_ids(&mut ids);
+            referenced_pane_ids.extend(ids);
+        }
+        self.panes.retain(|pane| {
+            let keep = referenced_pane_ids.contains(&pane.id);
+            if !keep {
+                pane.request_exit();
+            }
+            keep
+        });
+
+        if workspace_index < self.active_workspace {
+            self.active_workspace = self.active_workspace.saturating_sub(1);
+        } else if workspace_index == self.active_workspace
+            && self.active_workspace >= self.workspaces.len()
+        {
+            self.active_workspace = self.workspaces.len().saturating_sub(1);
+        }
+
+        self.load_active_workspace_state();
+        self.drag_resize = None;
+        self.drag_swap = None;
+        self.drag_pane_mouse = None;
+        self.commander_focused = false;
+        self.sidebar_workspace_focused = None;
+        self.sidebar_add_button_focused = false;
+        self.resize(size.height, size.width);
+        self.persist_layout();
+        Ok(())
+    }
+
+    fn handle_workspace_sidebar_click(
+        &mut self,
+        size: Rect,
+        x: u16,
+        y: u16,
+    ) -> anyhow::Result<bool> {
+        let sidebar = Self::workspace_sidebar_area(size);
+        if sidebar.width == 0 || sidebar.height == 0 || !contains(sidebar, x, y) {
+            return Ok(false);
+        }
+
+        if commander_button_hit(sidebar, x, y) {
+            self.focus_commander_from_sidebar(size);
+            return Ok(true);
+        }
+
+        if let Some(workspace_index) =
+            workspace_menu_hit_index(sidebar, self.workspaces.len(), x, y)
+        {
+            self.open_workspace_settings_modal(workspace_index);
+            return Ok(true);
+        }
+
+        if let Some(workspace_index) = workspace_hit_index(sidebar, self.workspaces.len(), x, y) {
+            self.switch_workspace(workspace_index, size);
+            return Ok(true);
+        }
+        if workspace_add_button_hit(sidebar, self.workspaces.len(), x, y) {
+            self.create_workspace(size)?;
+            return Ok(true);
+        }
+        Ok(true)
+    }
+
+    fn focus_commander_from_sidebar(&mut self, size: Rect) {
+        self.commander_focused = true;
+        self.sidebar_workspace_focused = None;
+        self.sidebar_add_button_focused = false;
+        self.drag_resize = None;
+        self.drag_swap = None;
+        self.drag_pane_mouse = None;
+        self.resize(size.height, size.width);
+        self.persist_layout();
+    }
+
+    fn focus_workspace_tab_from_sidebar(&mut self, workspace_index: usize) {
+        if workspace_index >= self.workspaces.len() {
+            return;
+        }
+        self.commander_focused = false;
+        self.sidebar_workspace_focused = Some(workspace_index);
+        self.sidebar_add_button_focused = false;
+    }
+
+    fn focus_workspace_add_button_from_sidebar(&mut self) {
+        self.commander_focused = false;
+        self.sidebar_workspace_focused = None;
+        self.sidebar_add_button_focused = true;
+    }
+
+    fn activate_sidebar_workspace(&mut self, size: Rect) {
+        let Some(workspace_index) = self.sidebar_workspace_focused else {
+            return;
+        };
+        self.switch_workspace(workspace_index, size);
+        self.commander_focused = false;
+        self.sidebar_workspace_focused = Some(workspace_index);
+        self.sidebar_add_button_focused = false;
+    }
+
+    fn activate_sidebar_add_button(&mut self, size: Rect) -> anyhow::Result<()> {
+        if !self.sidebar_add_button_focused {
+            return Ok(());
+        }
+        self.create_workspace(size)
+    }
+
+    fn sidebar_item_count(&self) -> usize {
+        2 + self.workspaces.len()
+    }
+
+    fn sidebar_add_button_index(&self) -> usize {
+        self.workspaces.len().saturating_add(1)
+    }
+
+    fn sidebar_item_index(&self) -> Option<usize> {
+        if self.commander_focused {
+            Some(0)
+        } else if self.sidebar_add_button_focused {
+            Some(self.sidebar_add_button_index())
+        } else {
+            self.sidebar_workspace_focused
+                .map(|workspace_index| workspace_index.saturating_add(1))
+        }
+    }
+
+    fn focus_sidebar_item(&mut self, size: Rect, item_index: usize) {
+        if item_index == 0 {
+            self.focus_commander_from_sidebar(size);
+            return;
+        }
+        if item_index == self.sidebar_add_button_index() {
+            self.focus_workspace_add_button_from_sidebar();
+            return;
+        }
+        self.focus_workspace_tab_from_sidebar(item_index.saturating_sub(1));
+    }
+
+    fn move_sidebar_focus(&mut self, size: Rect, step: isize) {
+        let total = self.sidebar_item_count();
+        let Some(current) = self.sidebar_item_index() else {
+            return;
+        };
+        let next = shift_sidebar_item_index(current, total, step);
+        if next != current {
+            self.focus_sidebar_item(size, next);
+        }
+    }
+
+    fn sidebar_is_visible(size: Rect) -> bool {
+        let sidebar = Self::workspace_sidebar_area(size);
+        sidebar.width > 0 && sidebar.height > 0
+    }
+
+    fn handle_ctrl_arrow_focus(&mut self, size: Rect, side: SplitSide) {
+        if self.commander_focused
+            || self.sidebar_workspace_focused.is_some()
+            || self.sidebar_add_button_focused
+        {
+            match side {
+                SplitSide::Top => self.move_sidebar_focus(size, -1),
+                SplitSide::Bottom => self.move_sidebar_focus(size, 1),
+                SplitSide::Right => self.focus_pane(self.focused),
+                SplitSide::Left => {}
+            }
+            return;
+        }
+
+        let moved = self.focus_adjacent(size, side);
+        if !moved && side == SplitSide::Left && Self::sidebar_is_visible(size) {
+            self.focus_workspace_tab_from_sidebar(self.active_workspace);
+        }
+    }
+
+    fn pane_inner_rect(&self, size: Rect, pane_id: usize) -> Option<Rect> {
+        self.pane_placements(Self::content_area(size))
+            .into_iter()
+            .find(|placement| placement.pane_id == pane_id)
+            .map(|placement| pane_inner_area(placement.area, placement.exposed))
+    }
+
+    fn pane_mouse_cell(inner: Rect, mouse_column: u16, mouse_row: u16) -> Option<(u16, u16)> {
+        if inner.width == 0 || inner.height == 0 {
+            return None;
+        }
+        let x = mouse_column
+            .saturating_sub(inner.x)
+            .min(inner.width.saturating_sub(1));
+        let y = mouse_row
+            .saturating_sub(inner.y)
+            .min(inner.height.saturating_sub(1));
+        Some((x, y))
+    }
+
+    fn send_mouse_button_to_pane(
+        &mut self,
+        pane_id: usize,
+        inner: Rect,
+        event_kind: PaneMouseEventKind,
+        button: MouseButton,
+        modifiers: KeyModifiers,
+        mouse_column: u16,
+        mouse_row: u16,
+    ) -> anyhow::Result<bool> {
+        let Some((x, y)) = Self::pane_mouse_cell(inner, mouse_column, mouse_row) else {
+            return Ok(false);
+        };
+        let Some(pane) = self.pane_mut(pane_id) else {
+            return Ok(false);
+        };
+        pane.send_mouse_button(button, event_kind, modifiers, x, y)
+    }
+
+    fn start_text_selection(&mut self, pane_id: usize, cell: (u16, u16)) {
+        self.text_selection = Some(TextSelection {
+            pane_id,
+            start: cell,
+            end: cell,
+            active: true,
+        });
+        self.drag_pane_mouse = None;
+    }
+
+    fn update_text_selection(&mut self, size: Rect, mouse: &MouseEvent) -> bool {
+        let Some(mut selection) = self.text_selection else {
+            return false;
+        };
+        if !selection.active {
+            return false;
+        }
+
+        match mouse.kind {
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let Some(inner) = self.pane_inner_rect(size, selection.pane_id) else {
+                    self.text_selection = None;
+                    return false;
+                };
+                if let Some(cell) = Self::pane_mouse_cell(inner, mouse.column, mouse.row) {
+                    selection.end = cell;
+                    self.text_selection = Some(selection);
+                    return true;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if selection.start == selection.end {
+                    self.text_selection = None;
+                    return true;
+                }
+                selection.active = false;
+                self.text_selection = Some(selection);
+                return true;
+            }
+            _ => {}
+        }
+
+        false
+    }
+
+    fn copy_text_selection(&mut self) -> anyhow::Result<bool> {
+        let Some(selection) = self.text_selection else {
+            return Ok(false);
+        };
+        if selection.start == selection.end {
+            return Ok(false);
+        }
+        let Some(pane) = self.pane(selection.pane_id) else {
+            return Ok(false);
+        };
+        let text = pane.selected_text(PaneSelection {
+            start: selection.start,
+            end: selection.end,
+        });
+        if text.is_empty() {
+            return Ok(false);
+        }
+        write_osc52_clipboard(&text)?;
+        Ok(true)
+    }
+
+    fn move_keyboard_selection(&mut self, delta: i16) -> bool {
+        let pane_id = self.focused;
+        let Some(pane) = self.pane(pane_id) else {
+            return false;
+        };
+        let Some(cursor) = pane.cursor_cell() else {
+            return false;
+        };
+        let cols = pane.cols;
+        let rows = pane.rows;
+        if cols == 0 || rows == 0 {
+            return false;
+        }
+
+        let mut selection = if let Some(selection) = self
+            .text_selection
+            .filter(|selection| selection.pane_id == pane_id)
+        {
+            let mut selection = selection;
+            selection.end = move_cell(selection.end, delta, cols, rows);
+            selection
+        } else {
+            let selected = if delta.is_negative() {
+                move_cell(cursor, delta, cols, rows)
+            } else {
+                cursor
+            };
+            TextSelection {
+                pane_id,
+                start: selected,
+                end: selected,
+                active: false,
+            }
+        };
+        selection.active = false;
+        self.text_selection = Some(selection);
+        true
+    }
+
+    pub(crate) fn pane_selection(&self, pane_id: usize) -> Option<PaneSelection> {
+        self.text_selection
+            .filter(|selection| selection.pane_id == pane_id)
+            .map(|selection| PaneSelection {
+                start: selection.start,
+                end: selection.end,
+            })
+    }
+
+    fn forward_active_pane_mouse_drag(
+        &mut self,
+        size: Rect,
+        mouse: &MouseEvent,
+    ) -> anyhow::Result<bool> {
+        let Some(active_drag) = self.drag_pane_mouse else {
+            return Ok(false);
+        };
+
+        let Some(inner) = self.pane_inner_rect(size, active_drag.pane_id) else {
+            self.drag_pane_mouse = None;
+            return Ok(false);
+        };
+
+        match mouse.kind {
+            MouseEventKind::Drag(_) => {
+                let _ = self.send_mouse_button_to_pane(
+                    active_drag.pane_id,
+                    inner,
+                    PaneMouseEventKind::Drag,
+                    active_drag.button,
+                    mouse.modifiers,
+                    mouse.column,
+                    mouse.row,
+                )?;
+                Ok(true)
+            }
+            MouseEventKind::Up(_) => {
+                let _ = self.send_mouse_button_to_pane(
+                    active_drag.pane_id,
+                    inner,
+                    PaneMouseEventKind::Up,
+                    active_drag.button,
+                    mouse.modifiers,
+                    mouse.column,
+                    mouse.row,
+                )?;
+                self.drag_pane_mouse = None;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     pub(crate) fn close_pane(&mut self) {
-        if self.panes.len() <= 1 {
-            self.running = false;
+        let mut current_workspace_panes = Vec::new();
+        self.layout.collect_leaf_ids(&mut current_workspace_panes);
+        if current_workspace_panes.len() <= 1 {
             return;
         }
 
@@ -263,7 +1088,38 @@ impl App {
 
         self.panes.remove(pos);
         self.focus_pane(next_focus);
+        for (workspace_index, workspace) in self.workspaces.iter_mut().enumerate() {
+            if workspace_index == self.active_workspace
+                || !workspace.layout.contains_pane_id(focused)
+            {
+                continue;
+            }
+
+            let mut pane_ids = Vec::new();
+            workspace.layout.collect_leaf_ids(&mut pane_ids);
+            if pane_ids.len() <= 1 {
+                workspace.layout = Node::Leaf {
+                    pane_id: next_focus,
+                };
+                workspace.focused = next_focus;
+                workspace.maximized_pane = None;
+                continue;
+            }
+
+            if let Some(other_focus) = workspace.layout.delete_leaf(focused) {
+                if workspace.focused == focused {
+                    workspace.focused = other_focus;
+                }
+            }
+            if workspace.maximized_pane == Some(focused) {
+                workspace.maximized_pane = None;
+            }
+        }
         self.persist_layout();
+        self.resize(
+            self.last_terminal_size.height,
+            self.last_terminal_size.width,
+        );
     }
 
     pub(crate) fn apply_panel_settings(
@@ -275,12 +1131,18 @@ impl App {
         let Some(pos) = self.panes.iter().position(|pane| pane.id == pane_id) else {
             return Ok(());
         };
+        if self.pane_name_exists_for_other(pane_id, &name) {
+            return Ok(());
+        }
 
         let command = AGENT_PRESETS
             .get(agent_index)
             .map(|p| p.command)
             .unwrap_or(AGENT_PRESETS[0].command)
             .to_string();
+        if !self.command_available_for_pane(pane_id, &command) {
+            return Ok(());
+        }
 
         let (rows, cols, command_changed, title_changed) = {
             let pane = &self.panes[pos];
@@ -304,7 +1166,7 @@ impl App {
         }
 
         // Changing the agent of a pane discards any prior resume hint.
-        self.panes[pos] = Pane::new(pane_id, name, command, None, rows, cols)?;
+        self.panes[pos] = Pane::new(pane_id, name, command, None, None, rows, cols)?;
         self.focus_pane(pane_id);
         self.persist_layout();
         Ok(())
@@ -321,14 +1183,21 @@ impl App {
         {
             self.mouse_capture_enabled = !self.mouse_capture_enabled;
             self.drag_resize = None;
+            self.drag_swap = None;
             return Ok(());
         }
 
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
         {
-            if let Some(pane) = self.focused_pane_mut() {
-                pane.send(&[0x03])?;
+            if self.copy_text_selection()? {
+                return Ok(());
+            }
+            if !self.focused_pane_is_commander() {
+                if let Some(pane) = self.focused_pane_mut() {
+                    pane.send(&[0x03])?;
+                    pane.clear_pending_input();
+                }
             }
             return Ok(());
         }
@@ -336,9 +1205,7 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('w') | KeyCode::Char('W'))
         {
-            self.modal = Some(Modal::CloseConfirm {
-                pane_id: self.focused,
-            });
+            self.close_pane();
             return Ok(());
         }
 
@@ -408,6 +1275,7 @@ impl App {
                     source_pane_id,
                     close_on_cancel,
                     mut name,
+                    mut name_error,
                     mut cursor,
                     mut name_selected,
                     mut agent_index,
@@ -424,11 +1292,8 @@ impl App {
                         }
                         KeyCode::Up | KeyCode::Left => {
                             if key.code == KeyCode::Up {
-                                agent_index = if agent_index == 0 {
-                                    AGENT_PRESETS.len() - 1
-                                } else {
-                                    agent_index - 1
-                                };
+                                agent_index =
+                                    self.cycle_available_agent_for_pane(pane_id, agent_index, -1);
                             } else {
                                 if name_selected {
                                     cursor = 0;
@@ -440,7 +1305,8 @@ impl App {
                         }
                         KeyCode::Down | KeyCode::Right => {
                             if key.code == KeyCode::Down {
-                                agent_index = (agent_index + 1) % AGENT_PRESETS.len();
+                                agent_index =
+                                    self.cycle_available_agent_for_pane(pane_id, agent_index, 1);
                             } else {
                                 if name_selected {
                                     cursor = name.chars().count();
@@ -458,6 +1324,7 @@ impl App {
                             } else {
                                 remove_char_before_cursor(&mut name, &mut cursor);
                             }
+                            name_error = None;
                         }
                         KeyCode::Delete => {
                             if name_selected {
@@ -467,6 +1334,7 @@ impl App {
                             } else {
                                 remove_char_at_cursor(&mut name, cursor);
                             }
+                            name_error = None;
                         }
                         KeyCode::Char(c)
                             if !key.modifiers.contains(KeyModifiers::CONTROL)
@@ -478,8 +1346,35 @@ impl App {
                                 name_selected = false;
                             }
                             insert_char_at_cursor(&mut name, &mut cursor, c);
+                            name_error = None;
                         }
                         KeyCode::Enter => {
+                            if !self.agent_available_for_pane(pane_id, agent_index) {
+                                self.modal = Some(Modal::NewPanePicker {
+                                    pane_id,
+                                    source_pane_id,
+                                    close_on_cancel,
+                                    name,
+                                    name_error,
+                                    cursor,
+                                    name_selected,
+                                    agent_index,
+                                });
+                                return Ok(());
+                            }
+                            if self.pane_name_exists_for_other(pane_id, &name) {
+                                self.modal = Some(Modal::NewPanePicker {
+                                    pane_id,
+                                    source_pane_id,
+                                    close_on_cancel,
+                                    name,
+                                    name_error: Some(Self::DUPLICATE_PANE_NAME_ERROR.to_string()),
+                                    cursor,
+                                    name_selected,
+                                    agent_index,
+                                });
+                                return Ok(());
+                            }
                             self.default_agent_index = agent_index;
                             self.apply_panel_settings(pane_id, name, agent_index)?;
                             self.modal = None;
@@ -493,6 +1388,7 @@ impl App {
                         source_pane_id,
                         close_on_cancel,
                         name,
+                        name_error,
                         cursor,
                         name_selected,
                         agent_index,
@@ -502,6 +1398,7 @@ impl App {
                 Modal::PanelSettings {
                     pane_id,
                     mut name,
+                    mut name_error,
                     mut agent_index,
                     mut focus,
                 } => {
@@ -517,12 +1414,33 @@ impl App {
                             focus = focus.prev();
                         }
                         KeyCode::Enter => {
+                            if !self.agent_available_for_pane(pane_id, agent_index) {
+                                self.modal = Some(Modal::PanelSettings {
+                                    pane_id,
+                                    name,
+                                    name_error,
+                                    agent_index,
+                                    focus,
+                                });
+                                return Ok(());
+                            }
+                            if self.pane_name_exists_for_other(pane_id, &name) {
+                                self.modal = Some(Modal::PanelSettings {
+                                    pane_id,
+                                    name,
+                                    name_error: Some(Self::DUPLICATE_PANE_NAME_ERROR.to_string()),
+                                    agent_index,
+                                    focus,
+                                });
+                                return Ok(());
+                            }
                             self.apply_panel_settings(pane_id, name, agent_index)?;
                             self.modal = None;
                             return Ok(());
                         }
                         KeyCode::Backspace if focus == PanelSettingsFocus::Name => {
                             name.pop();
+                            name_error = None;
                         }
                         KeyCode::Char(c)
                             if focus == PanelSettingsFocus::Name
@@ -530,16 +1448,15 @@ impl App {
                                 && !key.modifiers.contains(KeyModifiers::ALT) =>
                         {
                             name.push(c);
+                            name_error = None;
                         }
                         KeyCode::Left | KeyCode::Up if focus == PanelSettingsFocus::Agent => {
-                            agent_index = if agent_index == 0 {
-                                AGENT_PRESETS.len() - 1
-                            } else {
-                                agent_index - 1
-                            };
+                            agent_index =
+                                self.cycle_available_agent_for_pane(pane_id, agent_index, -1);
                         }
                         KeyCode::Right | KeyCode::Down if focus == PanelSettingsFocus::Agent => {
-                            agent_index = (agent_index + 1) % AGENT_PRESETS.len();
+                            agent_index =
+                                self.cycle_available_agent_for_pane(pane_id, agent_index, 1);
                         }
                         _ => {}
                     }
@@ -547,25 +1464,90 @@ impl App {
                     self.modal = Some(Modal::PanelSettings {
                         pane_id,
                         name,
+                        name_error,
                         agent_index,
                         focus,
                     });
                     return Ok(());
                 }
-                Modal::CloseConfirm { pane_id } => {
+                Modal::WorkspaceSettings {
+                    workspace_index,
+                    mut name,
+                    mut name_error,
+                    mut cursor,
+                    mut action_index,
+                } => {
                     match key.code {
                         KeyCode::Esc => {
                             self.modal = None;
+                            return Ok(());
                         }
-                        KeyCode::Enter => {
-                            self.modal = None;
-                            self.focus_pane(pane_id);
-                            self.close_pane();
+                        KeyCode::Up => {
+                            action_index = (action_index + 2) % 3;
                         }
-                        _ => {
-                            self.modal = Some(Modal::CloseConfirm { pane_id });
+                        KeyCode::Down => {
+                            action_index = (action_index + 1) % 3;
                         }
+                        KeyCode::Left => {
+                            cursor = cursor.saturating_sub(1);
+                        }
+                        KeyCode::Right => {
+                            cursor = (cursor + 1).min(name.chars().count());
+                        }
+                        KeyCode::Home => {
+                            cursor = 0;
+                        }
+                        KeyCode::End => {
+                            cursor = name.chars().count();
+                        }
+                        KeyCode::Backspace => {
+                            remove_char_before_cursor(&mut name, &mut cursor);
+                            name_error = None;
+                        }
+                        KeyCode::Delete => {
+                            remove_char_at_cursor(&mut name, cursor);
+                            name_error = None;
+                        }
+                        KeyCode::Char(c)
+                            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                                && !key.modifiers.contains(KeyModifiers::ALT) =>
+                        {
+                            insert_char_at_cursor(&mut name, &mut cursor, c);
+                            name_error = None;
+                        }
+                        KeyCode::Enter => match action_index.min(2) {
+                            0 => match self.rename_workspace(workspace_index, name.clone()) {
+                                Ok(()) => {
+                                    self.modal = None;
+                                    return Ok(());
+                                }
+                                Err(error) => {
+                                    name_error = Some(error.to_string());
+                                }
+                            },
+                            1 => {
+                                self.modal = None;
+                                return Ok(());
+                            }
+                            _ => match self.close_workspace(workspace_index, size) {
+                                Ok(()) => {
+                                    self.modal = None;
+                                    return Ok(());
+                                }
+                                Err(error) => {
+                                    name_error = Some(error.to_string());
+                                }
+                            },
+                        },
+                        _ => {}
                     }
+                    self.modal = Some(Modal::WorkspaceSettings {
+                        workspace_index,
+                        name,
+                        name_error,
+                        cursor,
+                        action_index,
+                    });
                     return Ok(());
                 }
             }
@@ -638,6 +1620,8 @@ impl App {
                     .find(|pane| pane.id == pane_id)
                     .map(|pane| pane.title.clone())
                     .unwrap_or_else(|| format!("Pane {}", pane_id + 1));
+                let agent_index =
+                    self.first_available_agent_for_pane(pane_id, self.default_agent_index);
                 self.modal = Some(Modal::NewPanePicker {
                     pane_id,
                     source_pane_id,
@@ -645,7 +1629,8 @@ impl App {
                     cursor: pane_name.chars().count(),
                     name_selected: true,
                     name: pane_name,
-                    agent_index: self.default_agent_index,
+                    name_error: None,
+                    agent_index,
                 });
                 return Ok(());
             }
@@ -666,7 +1651,7 @@ impl App {
 
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             if let Some(side) = arrow_key_to_split_side(key.code) {
-                self.focus_adjacent(size, side);
+                self.handle_ctrl_arrow_focus(size, side);
                 return Ok(());
             }
         }
@@ -677,33 +1662,102 @@ impl App {
         }
 
         if key.modifiers.contains(KeyModifiers::SHIFT) {
-            if let Some(pane) = self.focused_pane_mut() {
+            if !self.focused_pane_is_commander() {
                 match key.code {
-                    KeyCode::PageUp => {
-                        pane.page_up();
-                        return Ok(());
+                    KeyCode::Left => {
+                        if self.move_keyboard_selection(-1) {
+                            return Ok(());
+                        }
                     }
-                    KeyCode::PageDown => {
-                        pane.page_down();
-                        return Ok(());
-                    }
-                    KeyCode::Home => {
-                        pane.scroll_top();
-                        return Ok(());
-                    }
-                    KeyCode::End => {
-                        pane.scroll_bottom();
-                        return Ok(());
+                    KeyCode::Right => {
+                        if self.move_keyboard_selection(1) {
+                            return Ok(());
+                        }
                     }
                     _ => {}
+                }
+
+                if let Some(pane) = self.focused_pane_mut() {
+                    match key.code {
+                        KeyCode::PageUp => {
+                            pane.page_up();
+                            return Ok(());
+                        }
+                        KeyCode::PageDown => {
+                            pane.page_down();
+                            return Ok(());
+                        }
+                        KeyCode::Home => {
+                            pane.scroll_top();
+                            return Ok(());
+                        }
+                        KeyCode::End => {
+                            pane.scroll_bottom();
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
 
-        let bytes = key_to_bytes(key);
+        if self.focused_pane_is_commander() {
+            match key.code {
+                KeyCode::Enter => {
+                    self.commander_submit_current_input();
+                }
+                KeyCode::Left => {
+                    self.commander.cursor = self.commander.cursor.saturating_sub(1);
+                }
+                KeyCode::Right => {
+                    self.commander.cursor =
+                        (self.commander.cursor + 1).min(self.commander.input.chars().count());
+                }
+                KeyCode::Home => {
+                    self.commander.cursor = 0;
+                }
+                KeyCode::End => {
+                    self.commander.cursor = self.commander.input.chars().count();
+                }
+                KeyCode::Backspace => {
+                    remove_char_before_cursor(
+                        &mut self.commander.input,
+                        &mut self.commander.cursor,
+                    );
+                }
+                KeyCode::Delete => {
+                    remove_char_at_cursor(&mut self.commander.input, self.commander.cursor);
+                }
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    insert_char_at_cursor(&mut self.commander.input, &mut self.commander.cursor, c);
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        if self.sidebar_workspace_focused.is_some() {
+            if key.code == KeyCode::Enter {
+                self.activate_sidebar_workspace(size);
+            }
+            return Ok(());
+        }
+
+        if self.sidebar_add_button_focused {
+            if key.code == KeyCode::Enter {
+                self.activate_sidebar_add_button(size)?;
+            }
+            return Ok(());
+        }
+
+        let bytes = key_to_bytes(key.clone());
         if !bytes.is_empty() {
             if let Some(pane) = self.focused_pane_mut() {
                 pane.send(&bytes)?;
+                pane.track_key_event(key);
             }
         }
 
@@ -716,6 +1770,7 @@ impl App {
                 Modal::PanelSettings {
                     pane_id,
                     mut name,
+                    name_error: _,
                     agent_index,
                     focus,
                 } if focus == PanelSettingsFocus::Name => {
@@ -723,6 +1778,7 @@ impl App {
                     self.modal = Some(Modal::PanelSettings {
                         pane_id,
                         name,
+                        name_error: None,
                         agent_index,
                         focus,
                     });
@@ -732,6 +1788,7 @@ impl App {
                     source_pane_id,
                     close_on_cancel,
                     mut name,
+                    name_error: _,
                     mut cursor,
                     mut name_selected,
                     agent_index,
@@ -749,9 +1806,28 @@ impl App {
                         source_pane_id,
                         close_on_cancel,
                         name,
+                        name_error: None,
                         cursor,
                         name_selected,
                         agent_index,
+                    });
+                }
+                Modal::WorkspaceSettings {
+                    workspace_index,
+                    mut name,
+                    name_error: _,
+                    mut cursor,
+                    action_index,
+                } => {
+                    for ch in text.chars() {
+                        insert_char_at_cursor(&mut name, &mut cursor, ch);
+                    }
+                    self.modal = Some(Modal::WorkspaceSettings {
+                        workspace_index,
+                        name,
+                        name_error: None,
+                        cursor,
+                        action_index,
                     });
                 }
                 other => {
@@ -761,14 +1837,26 @@ impl App {
             return Ok(());
         }
 
-        if let Some(pane) = self.focused_pane_mut() {
+        if self.focused_pane_is_commander() {
+            for ch in text.chars() {
+                insert_char_at_cursor(&mut self.commander.input, &mut self.commander.cursor, ch);
+            }
+            self.commander_submit_current_input();
+        } else if self.sidebar_workspace_focused.is_some() || self.sidebar_add_button_focused {
+            return Ok(());
+        } else if let Some(pane) = self.focused_pane_mut() {
             pane.send_paste(&text)?;
+            pane.track_paste(&text);
         }
 
         Ok(())
     }
 
     pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent, size: Rect) -> anyhow::Result<()> {
+        if self.update_text_selection(size, &mouse) {
+            return Ok(());
+        }
+
         if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
             self.drag_resize = None;
         }
@@ -806,6 +1894,25 @@ impl App {
             }
         }
 
+        if let Some(mut drag) = self.drag_swap.take() {
+            match mouse.kind {
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    drag.moved = true;
+                    drag.hovered_pane_id =
+                        self.update_pane_swap_hover_target(size, drag.source_pane_id, &mouse);
+                    self.drag_swap = Some(drag);
+                    return Ok(());
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.finish_pane_swap_drag(drag, size)?;
+                    return Ok(());
+                }
+                _ => {
+                    self.drag_swap = Some(drag);
+                }
+            }
+        }
+
         if let Some(modal) = self.modal.take() {
             match modal {
                 Modal::Help => {
@@ -835,6 +1942,7 @@ impl App {
                     source_pane_id,
                     close_on_cancel,
                     name,
+                    name_error,
                     mut cursor,
                     mut name_selected,
                     mut agent_index,
@@ -851,11 +1959,12 @@ impl App {
                         .borders(ratatui::widgets::Borders::ALL)
                         .inner(name_area);
                     let list_area = new_pane_picker_list_area(area);
-                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-                    {
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                         if contains(list_area, mouse.column, mouse.row) {
                             let selected = mouse.row.saturating_sub(list_area.y) as usize;
-                            if selected < AGENT_PRESETS.len() {
+                            if selected < AGENT_PRESETS.len()
+                                && self.agent_available_for_pane(pane_id, selected)
+                            {
                                 agent_index = selected;
                             }
                         } else if contains(name_inner, mouse.column, mouse.row) {
@@ -869,6 +1978,7 @@ impl App {
                         source_pane_id,
                         close_on_cancel,
                         name,
+                        name_error,
                         cursor,
                         name_selected,
                         agent_index,
@@ -878,6 +1988,7 @@ impl App {
                 Modal::PanelSettings {
                     pane_id,
                     name,
+                    name_error,
                     mut agent_index,
                     mut focus,
                 } => {
@@ -902,6 +2013,26 @@ impl App {
                             mouse.column,
                             mouse.row,
                         ) {
+                            if !self.agent_available_for_pane(pane_id, agent_index) {
+                                self.modal = Some(Modal::PanelSettings {
+                                    pane_id,
+                                    name,
+                                    name_error,
+                                    agent_index,
+                                    focus,
+                                });
+                                return Ok(());
+                            }
+                            if self.pane_name_exists_for_other(pane_id, &name) {
+                                self.modal = Some(Modal::PanelSettings {
+                                    pane_id,
+                                    name,
+                                    name_error: Some(Self::DUPLICATE_PANE_NAME_ERROR.to_string()),
+                                    agent_index,
+                                    focus,
+                                });
+                                return Ok(());
+                            }
                             self.apply_panel_settings(pane_id, name, agent_index)?;
                             self.modal = None;
                             return Ok(());
@@ -915,7 +2046,9 @@ impl App {
                         let agent_area = panel_settings_agent_list_area(inner);
                         if contains(agent_area, mouse.column, mouse.row) {
                             let selected = mouse.row.saturating_sub(agent_area.y + 1) as usize;
-                            if selected < AGENT_PRESETS.len() {
+                            if selected < AGENT_PRESETS.len()
+                                && self.agent_available_for_pane(pane_id, selected)
+                            {
                                 agent_index = selected;
                                 focus = PanelSettingsFocus::Agent;
                             }
@@ -925,47 +2058,63 @@ impl App {
                     self.modal = Some(Modal::PanelSettings {
                         pane_id,
                         name,
+                        name_error,
                         agent_index,
                         focus,
                     });
                     return Ok(());
                 }
-                Modal::CloseConfirm { pane_id } => {
-                    let area = close_confirm_modal_area(size);
+                Modal::WorkspaceSettings {
+                    workspace_index,
+                    name,
+                    name_error,
+                    mut cursor,
+                    mut action_index,
+                } => {
+                    let area = workspace_settings_modal_area(size);
+                    let name_area = workspace_settings_name_input_area(area);
+                    let name_inner = ratatui::widgets::Block::default()
+                        .borders(ratatui::widgets::Borders::ALL)
+                        .inner(name_area);
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                        if contains(
-                            close_confirm_cancel_button_area(area),
-                            mouse.column,
-                            mouse.row,
-                        ) {
-                            self.modal = None;
-                        } else if contains(
-                            close_confirm_confirm_button_area(area),
-                            mouse.column,
-                            mouse.row,
-                        ) {
-                            self.modal = None;
-                            self.focus_pane(pane_id);
-                            self.close_pane();
-                        } else {
-                            self.modal = Some(Modal::CloseConfirm { pane_id });
+                        if let Some(selected) =
+                            workspace_settings_action_hit_index(area, mouse.column, mouse.row)
+                        {
+                            action_index = selected;
+                        } else if contains(name_inner, mouse.column, mouse.row) {
+                            let click_col = mouse.column.saturating_sub(name_inner.x) as usize;
+                            cursor = click_col.min(name.chars().count());
                         }
-                    } else {
-                        self.modal = Some(Modal::CloseConfirm { pane_id });
                     }
+
+                    self.modal = Some(Modal::WorkspaceSettings {
+                        workspace_index,
+                        name,
+                        name_error,
+                        cursor,
+                        action_index,
+                    });
                     return Ok(());
                 }
             }
         }
 
-        if contains(settings_button_area(size), mouse.column, mouse.row)
-            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        if self.forward_active_pane_mouse_drag(size, &mouse)? {
+            return Ok(());
+        }
+
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && self.handle_workspace_sidebar_click(size, mouse.column, mouse.row)?
         {
-            self.modal = Some(Modal::Help);
+            self.text_selection = None;
             return Ok(());
         }
 
         let clicked = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
+        let down_button = match mouse.kind {
+            MouseEventKind::Down(button) => Some(button),
+            _ => None,
+        };
         let Some(placement) = self.placement_at(size, mouse.column, mouse.row) else {
             return Ok(());
         };
@@ -981,15 +2130,41 @@ impl App {
 
         let was_focused = self.focused == placement.pane_id;
 
-        if clicked {
-            // The common case is a plain click in terminal content. Focus it now
-            // and skip the expensive divider/boundary walk entirely.
-            let inner = pane_inner_area(placement.area, placement.exposed);
+        // The common case is a plain click in terminal content. Focus it now
+        // and skip the expensive divider/boundary walk entirely.
+        let inner = pane_inner_area(placement.area, placement.exposed);
+        if let Some(button) = down_button {
             if contains(inner, mouse.column, mouse.row) {
                 self.focus_pane(placement.pane_id);
+                if button == MouseButton::Left && !mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                    let Some(cell) = Self::pane_mouse_cell(inner, mouse.column, mouse.row) else {
+                        return Ok(());
+                    };
+                    self.start_text_selection(placement.pane_id, cell);
+                } else if !mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                    if self.send_mouse_button_to_pane(
+                        placement.pane_id,
+                        inner,
+                        PaneMouseEventKind::Down,
+                        button,
+                        mouse.modifiers,
+                        mouse.column,
+                        mouse.row,
+                    )? {
+                        self.drag_pane_mouse = Some(DragPaneMouse {
+                            pane_id: placement.pane_id,
+                            button,
+                        });
+                    }
+                } else {
+                    self.drag_pane_mouse = None;
+                }
                 return Ok(());
             }
+        }
 
+        if clicked {
+            self.text_selection = None;
             let chrome_hit = placement.title_hit(&pane_title, was_focused, mouse.column, mouse.row)
                 || placement.maximize_hit(mouse.column, mouse.row)
                 || placement.close_hit(mouse.column, mouse.row);
@@ -1019,48 +2194,48 @@ impl App {
 
         if clicked && placement.close_hit(mouse.column, mouse.row) {
             self.focus_pane(placement.pane_id);
-            self.modal = Some(Modal::CloseConfirm {
-                pane_id: placement.pane_id,
-            });
+            self.close_pane();
             return Ok(());
         }
 
         if clicked && placement.title_hit(&pane_title, was_focused, mouse.column, mouse.row) {
             self.focus_pane(placement.pane_id);
-            let agent_index = self
-                .panes
-                .iter()
-                .find(|pane| pane.id == placement.pane_id)
-                .map(|pane| agent_index_for_command(&pane.command))
-                .unwrap_or(0);
-            self.modal = Some(Modal::NewPanePicker {
-                pane_id: placement.pane_id,
-                source_pane_id: placement.pane_id,
-                close_on_cancel: false,
-                name: pane_title.clone(),
-                cursor: pane_title.chars().count(),
-                name_selected: true,
-                agent_index,
-            });
+            if self.panes.len() > 1 {
+                self.drag_swap = Some(DragPaneSwap {
+                    source_pane_id: placement.pane_id,
+                    hovered_pane_id: None,
+                    moved: false,
+                });
+            } else {
+                self.open_new_pane_picker(placement.pane_id);
+            }
             return Ok(());
         }
 
         match mouse.kind {
             MouseEventKind::ScrollUp => {
+                if self.pane_is_commander(placement.pane_id) {
+                    return Ok(());
+                }
                 if let Some(pane) = self.pane_mut(placement.pane_id) {
                     let inner = pane_inner_area(placement.area, placement.exposed);
-                    let x = mouse.column.saturating_sub(inner.x);
-                    let y = mouse.row.saturating_sub(inner.y);
+                    let Some((x, y)) = Self::pane_mouse_cell(inner, mouse.column, mouse.row) else {
+                        return Ok(());
+                    };
                     if pane.scrollback_max > 0 || !pane.send_mouse_wheel(true, x, y)? {
                         pane.scroll_up();
                     }
                 }
             }
             MouseEventKind::ScrollDown => {
+                if self.pane_is_commander(placement.pane_id) {
+                    return Ok(());
+                }
                 if let Some(pane) = self.pane_mut(placement.pane_id) {
                     let inner = pane_inner_area(placement.area, placement.exposed);
-                    let x = mouse.column.saturating_sub(inner.x);
-                    let y = mouse.row.saturating_sub(inner.y);
+                    let Some((x, y)) = Self::pane_mouse_cell(inner, mouse.column, mouse.row) else {
+                        return Ok(());
+                    };
                     if pane.scrollback_max > 0 || !pane.send_mouse_wheel(false, x, y)? {
                         pane.scroll_down();
                     }
@@ -1090,6 +2265,7 @@ impl App {
         agent_index: usize,
         terminal_size: Rect,
     ) -> anyhow::Result<usize> {
+        let agent_index = self.first_available_agent_for_pane(self.next_pane_id, agent_index);
         let command = AGENT_PRESETS
             .get(agent_index)
             .map(|preset| preset.command)
@@ -1105,20 +2281,18 @@ impl App {
         terminal_size: Rect,
     ) -> anyhow::Result<usize> {
         let new_id = self.next_pane_id;
+        if !self.command_available_for_pane(new_id, command) {
+            anyhow::bail!("selected type is unavailable")
+        }
         self.next_pane_id = self.next_pane_id.saturating_add(1);
 
         let title = format!("Pane {}", new_id + 1);
-        self.panes.push(Pane::new(
-            new_id,
-            title,
-            command,
-            None,
-            1,
-            1,
-        )?);
+        self.panes
+            .push(Pane::new(new_id, title, command, None, None, 1, 1)?);
 
         if self.layout.split_leaf(pane_id, side, new_id) {
             self.resize(terminal_size.height, terminal_size.width);
+            self.persist_layout();
             Ok(new_id)
         } else {
             self.next_pane_id = self.next_pane_id.saturating_sub(1);
@@ -1127,14 +2301,14 @@ impl App {
         }
     }
 
-    pub(crate) fn focus_adjacent(&mut self, size: Rect, side: SplitSide) {
+    pub(crate) fn focus_adjacent(&mut self, size: Rect, side: SplitSide) -> bool {
         let placements = self.pane_placements(Self::content_area(size));
         let Some(current_area) = placements
             .iter()
             .find(|placement| placement.pane_id == self.focused)
             .map(|placement| placement.area)
         else {
-            return;
+            return false;
         };
 
         let mut candidates: Vec<_> = placements
@@ -1151,7 +2325,9 @@ impl App {
 
         if let Some(next) = candidates.first() {
             self.focus_pane(next.pane_id);
+            return true;
         }
+        false
     }
 
     fn focus_next_pane(&mut self) {
@@ -1219,10 +2395,12 @@ impl App {
         let new_id = self.next_pane_id;
         self.next_pane_id = self.next_pane_id.saturating_add(1);
         let title = format!("Pane {}", new_id + 1);
+        let default_index = self.first_available_agent_for_pane(new_id, self.default_agent_index);
         self.panes.push(Pane::new(
             new_id,
             title,
-            AGENT_PRESETS[self.default_agent_index].command,
+            AGENT_PRESETS[default_index].command,
+            None,
             None,
             1,
             1,
@@ -1372,6 +2550,13 @@ impl App {
             .map(|drag| drag.pane_ids.as_slice())
     }
 
+    pub(crate) fn pane_swap_preview_target(&self) -> Option<usize> {
+        self.drag_swap
+            .as_ref()
+            .filter(|drag| drag.moved)
+            .and_then(|drag| drag.hovered_pane_id)
+    }
+
     pub(crate) fn theme(&self) -> Theme {
         THEMES[self.theme_index]
     }
@@ -1384,11 +2569,1068 @@ impl App {
         self.pane_mut(self.focused)
     }
 
+    pub(crate) fn focused_pane_is_commander(&self) -> bool {
+        self.commander_focused
+    }
+
+    pub(crate) fn pane_is_commander(&self, pane_id: usize) -> bool {
+        self.panes
+            .iter()
+            .find(|pane| pane.id == pane_id)
+            .map(|pane| pane.command == COMMANDER_COMMAND)
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn commander_input(&self) -> &str {
+        &self.commander.input
+    }
+
+    pub(crate) fn commander_cursor(&self) -> usize {
+        self.commander.cursor
+    }
+
+    pub(crate) fn commander_busy(&self) -> bool {
+        self.commander.busy
+    }
+
+    pub(crate) fn commander_history(&self) -> &[String] {
+        &self.commander.history
+    }
+
+    fn commander_submit_current_input(&mut self) {
+        let user_input = self.commander.input.trim().to_string();
+        if user_input.is_empty() || self.commander.busy {
+            return;
+        }
+
+        if self.handle_commander_slash_command(&user_input) {
+            self.commander.input.clear();
+            self.commander.cursor = 0;
+            return;
+        }
+
+        self.commander.history.clear();
+        self.commander
+            .history
+            .push(format!("You: {}", user_input.clone()));
+        self.commander
+            .history
+            .push("Commander: thinking...".to_string());
+
+        self.commander.input.clear();
+        self.commander.cursor = 0;
+        self.commander.busy = true;
+
+        let pane_names = self
+            .panes
+            .iter()
+            .filter(|pane| pane.command != COMMANDER_COMMAND)
+            .map(|pane| pane.title.clone())
+            .collect::<Vec<_>>();
+        let pane_roster = self
+            .panes
+            .iter()
+            .map(|pane| {
+                let mut status = Vec::new();
+                if pane.id == self.focused {
+                    status.push("focused");
+                }
+                if pane.command == COMMANDER_COMMAND {
+                    status.push("commander");
+                } else {
+                    status.push("worker");
+                }
+                if pane.exited {
+                    status.push("exited");
+                } else {
+                    status.push("running");
+                }
+                if pane.relaunch_failed {
+                    status.push("relaunch_failed");
+                }
+                format!(
+                    "- id:{} | name:{} | type:{} | status:{}",
+                    pane.id,
+                    pane.title,
+                    pane.command,
+                    status.join(",")
+                )
+            })
+            .collect::<Vec<_>>();
+        let agent_types = AGENT_PRESETS
+            .iter()
+            .filter(|preset| preset.command != COMMANDER_COMMAND)
+            .map(|preset| preset.command.to_string())
+            .collect::<Vec<_>>();
+        let (tx, rx) = mpsc::channel();
+        self.commander.rx = Some(rx);
+
+        thread::spawn(move || {
+            let result = run_commander_llm(user_input, pane_names, pane_roster, agent_types);
+            let _ = tx.send(result);
+        });
+    }
+
+    fn handle_commander_slash_command(&mut self, input: &str) -> bool {
+        let Some(command) = parse_commander_slash_command(input) else {
+            return false;
+        };
+
+        self.commander.history.clear();
+        self.commander
+            .history
+            .push(format!("You: {}", input.trim()));
+
+        match command {
+            CommanderSlashCommand::OpenTheme => {
+                self.modal = Some(Modal::Theme);
+                self.commander
+                    .history
+                    .push("Commander: opening the theme picker.".to_string());
+                self.queue_tts("Opening the theme picker.");
+            }
+            CommanderSlashCommand::OpenSettings => {
+                self.modal = Some(Modal::Help);
+                self.commander
+                    .history
+                    .push("Commander: opening settings.".to_string());
+                self.queue_tts("Opening settings.");
+            }
+        }
+
+        true
+    }
+
+    fn poll_commander_result(&mut self) -> bool {
+        let Some(rx) = self.commander.rx.as_ref() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.commander.rx = None;
+                self.commander.busy = false;
+                let (_executed_notes, speech_notes) =
+                    self.execute_commander_steps(result.into_steps());
+                let commander_reply = if speech_notes.is_empty() {
+                    "Done.".to_string()
+                } else {
+                    format_commander_execution_reply(&speech_notes)
+                };
+                self.queue_tts(&commander_reply);
+                if let Some(last) = self.commander.history.last_mut() {
+                    if last == "Commander: thinking..." {
+                        *last = format!("Commander: {}", commander_reply);
+                    } else {
+                        self.commander
+                            .history
+                            .push(format!("Commander: {}", commander_reply));
+                    }
+                } else {
+                    self.commander
+                        .history
+                        .push(format!("Commander: {}", commander_reply));
+                }
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                self.commander.rx = None;
+                self.commander.busy = false;
+                let error_line = "failed to read LLM response (worker disconnected).";
+                self.commander
+                    .history
+                    .push(format!("Commander: {}", error_line));
+                self.queue_tts(error_line);
+                true
+            }
+        }
+    }
+
+    fn execute_commander_steps(
+        &mut self,
+        steps: Vec<CommanderExecutionStep>,
+    ) -> (Vec<String>, Vec<String>) {
+        let mut history_notes = Vec::new();
+        let mut speech_notes = Vec::new();
+        let mut refs = CommanderStepRefs::default();
+
+        for step in steps {
+            let step_result = self.execute_commander_step(step, &mut refs);
+            history_notes.extend(step_result.history_notes);
+            speech_notes.extend(step_result.speech_notes);
+        }
+
+        (history_notes, speech_notes)
+    }
+
+    fn execute_commander_step(
+        &mut self,
+        step: CommanderExecutionStep,
+        refs: &mut CommanderStepRefs,
+    ) -> CommanderStepOutcome {
+        let should_refocus_commander = !step.create_requests.is_empty()
+            || !step.rename_requests.is_empty()
+            || !step.close_requests.is_empty();
+        let mut history_notes = Vec::new();
+        let mut speech_notes = Vec::new();
+        let reply_note = step
+            .reply_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty() && !text.eq_ignore_ascii_case("none"));
+        let creation = self.create_panes_from_requests(&step.create_requests);
+        if !creation.created_ids.is_empty() {
+            refs.last_created_ids = creation.created_ids.clone();
+        }
+
+        if let Some(save_as) = step
+            .save_as
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty() && !name.eq_ignore_ascii_case("none"))
+        {
+            refs.named
+                .insert(save_as.to_ascii_lowercase(), creation.created_ids.clone());
+        }
+
+        let rename_requests = step
+            .rename_requests
+            .iter()
+            .flat_map(|(selector, name)| {
+                self.expand_selector_for_requests(selector, refs, true)
+                    .into_iter()
+                    .map(move |expanded| (expanded, name.clone()))
+            })
+            .collect::<Vec<_>>();
+        let rename_note = self.rename_panes_from_requests(&rename_requests, &creation.created_ids);
+
+        let delivery_note = if let (Some(target_name), Some(payload)) =
+            (step.target_name.as_deref(), step.payload.as_deref())
+        {
+            match self.dispatch_to_target_selector(
+                target_name,
+                payload,
+                step.submit_payload,
+                &creation.created_ids,
+                refs,
+            ) {
+                Ok(summary) => Some(summary),
+                Err(err) => Some(CommanderExecutionSummary { history_note: err }),
+            }
+        } else {
+            None
+        };
+
+        let close_requests = step
+            .close_requests
+            .iter()
+            .flat_map(|selector| self.expand_selector_for_requests(selector, refs, false))
+            .collect::<Vec<_>>();
+        let close_note = self.close_panes_from_requests(&close_requests);
+
+        if should_refocus_commander {
+            self.focus_commander_pane();
+        }
+
+        for note in [
+            reply_note,
+            creation.note.as_deref(),
+            rename_note.as_deref(),
+            close_note.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let note = note.to_string();
+            history_notes.push(note.clone());
+        }
+
+        if let Some(summary) = delivery_note {
+            history_notes.push(summary.history_note);
+        }
+
+        if let Some(speech_text) = step
+            .speech_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty() && !text.eq_ignore_ascii_case("none"))
+        {
+            speech_notes.push(speech_text.to_string());
+        } else if !history_notes.is_empty() {
+            speech_notes.push(format_commander_execution_reply(&history_notes));
+        }
+
+        CommanderStepOutcome {
+            history_notes,
+            speech_notes,
+        }
+    }
+
+    fn expand_selector_for_requests(
+        &self,
+        selector: &str,
+        refs: &CommanderStepRefs,
+        filter_non_commander: bool,
+    ) -> Vec<String> {
+        if let Some(ids) = resolve_reference_selector(selector, refs) {
+            let filtered = ids
+                .into_iter()
+                .filter(|id| {
+                    self.panes.iter().any(|pane| {
+                        pane.id == *id
+                            && (!filter_non_commander || pane.command != COMMANDER_COMMAND)
+                    })
+                })
+                .collect::<Vec<_>>();
+            if filtered.is_empty() {
+                return vec![selector.to_string()];
+            }
+            return filtered
+                .into_iter()
+                .map(|id| format!("id:{id}"))
+                .collect::<Vec<_>>();
+        }
+        vec![selector.to_string()]
+    }
+
+    fn dispatch_to_target_selector(
+        &mut self,
+        target_selector: &str,
+        payload: &str,
+        submit_payload: bool,
+        newly_created_ids: &[usize],
+        refs: &CommanderStepRefs,
+    ) -> Result<CommanderExecutionSummary, String> {
+        let selectors = target_selector
+            .split(',')
+            .map(str::trim)
+            .filter(|selector| !selector.is_empty())
+            .collect::<Vec<_>>();
+
+        let mut pane_ids = if selectors.is_empty() {
+            Vec::new()
+        } else {
+            selectors
+                .into_iter()
+                .flat_map(|selector| {
+                    self.resolve_send_selector_with_refs(selector, newly_created_ids, refs)
+                })
+                .collect::<Vec<_>>()
+        };
+        pane_ids.sort_unstable();
+        pane_ids.dedup();
+        if pane_ids.is_empty() {
+            return Err(format!(
+                "Couldn't find a pane matching {}.",
+                target_selector
+            ));
+        }
+
+        let press_enter = true;
+
+        // Give newly created panes time to initialize before delivery.
+        let targets_new_panes = pane_ids.iter().any(|id| newly_created_ids.contains(id));
+        if targets_new_panes {
+            let startup_wait = if submit_payload || press_enter {
+                Duration::from_millis(2800)
+            } else {
+                Duration::from_millis(1600)
+            };
+            thread::sleep(startup_wait);
+        }
+
+        let pane_count = pane_ids.len();
+        let mut sent = 0usize;
+        let mut failed = 0usize;
+
+        for (idx, pane_id) in pane_ids.iter().copied().enumerate() {
+            if self.panes.iter().all(|pane| pane.id != pane_id) {
+                failed += 1;
+                continue;
+            }
+
+            let Some((pane_title, pane_command)) = self
+                .panes
+                .iter()
+                .find(|pane| pane.id == pane_id)
+                .map(|pane| (pane.title.clone(), pane.command.clone()))
+            else {
+                failed += 1;
+                continue;
+            };
+
+            let outgoing = build_outgoing_payload(
+                payload,
+                submit_payload,
+                pane_count,
+                idx + 1,
+                &pane_title,
+                &pane_command,
+            );
+
+            let delivered = self.deliver_payload_with_retries(
+                pane_id,
+                &outgoing,
+                press_enter,
+                newly_created_ids.contains(&pane_id),
+            );
+            if !delivered {
+                failed += 1;
+                continue;
+            }
+            sent += 1;
+        }
+
+        if sent == 0 {
+            return Err(if submit_payload {
+                "Couldn't send or start that task.".to_string()
+            } else {
+                "Couldn't send that.".to_string()
+            });
+        }
+
+        let sent_phrase = count_phrase(sent, "pane", "panes");
+        let failed_note = if failed > 0 {
+            format!(
+                " Couldn't deliver to {}.",
+                count_phrase(failed, "pane", "panes")
+            )
+        } else {
+            String::new()
+        };
+
+        let history_note = if submit_payload && pane_count > 1 {
+            format!("Started this task in {}.{}", sent_phrase, failed_note)
+        } else if submit_payload {
+            format!("Started this task in {}.{}", sent_phrase, failed_note)
+        } else {
+            format!("Sent that to {}.{}", sent_phrase, failed_note)
+        };
+
+        Ok(CommanderExecutionSummary { history_note })
+    }
+
+    fn deliver_payload_with_retries(
+        &mut self,
+        pane_id: usize,
+        outgoing: &str,
+        press_enter: bool,
+        newly_created: bool,
+    ) -> bool {
+        let attempts = if newly_created { 8 } else { 3 };
+        let retry_delay = if newly_created {
+            Duration::from_millis(350)
+        } else {
+            Duration::from_millis(120)
+        };
+
+        let mut paste_sent = false;
+        for attempt in 0..attempts {
+            let Some(pane) = self.pane_mut(pane_id) else {
+                return false;
+            };
+
+            if !paste_sent {
+                if pane.send_paste(outgoing).is_ok() {
+                    paste_sent = true;
+                } else {
+                    if attempt + 1 < attempts {
+                        thread::sleep(retry_delay);
+                    }
+                    continue;
+                }
+            }
+
+            if !press_enter {
+                return true;
+            }
+
+            // Some terminal apps debounce input right after large pastes.
+            thread::sleep(Duration::from_millis(180));
+            if pane.send(&[b'\r']).is_ok() {
+                return true;
+            }
+
+            if attempt + 1 < attempts {
+                thread::sleep(retry_delay);
+            }
+        }
+
+        false
+    }
+
+    fn resolve_send_selector(&self, selector: &str, newly_created_ids: &[usize]) -> Vec<usize> {
+        let raw = selector.trim();
+        if raw.is_empty() || raw.eq_ignore_ascii_case("none") {
+            return Vec::new();
+        }
+        let normalized = raw.to_ascii_lowercase();
+
+        if matches!(normalized.as_str(), "new" | "newest" | "last_created") {
+            return newly_created_ids.to_vec();
+        }
+        if normalized == "all" {
+            return self
+                .panes
+                .iter()
+                .filter(|pane| pane.command != COMMANDER_COMMAND)
+                .map(|pane| pane.id)
+                .collect();
+        }
+        if normalized == "focused" {
+            return self
+                .panes
+                .iter()
+                .filter(|pane| pane.id == self.focused && pane.command != COMMANDER_COMMAND)
+                .map(|pane| pane.id)
+                .collect();
+        }
+        if let Some(id_str) = normalized.strip_prefix("id:") {
+            if let Ok(id) = id_str.trim().parse::<usize>() {
+                return self
+                    .panes
+                    .iter()
+                    .filter(|pane| pane.id == id && pane.command != COMMANDER_COMMAND)
+                    .map(|pane| pane.id)
+                    .collect();
+            }
+        }
+        if let Some(status) = normalized.strip_prefix("status:") {
+            if status.trim() == "new" {
+                return newly_created_ids.to_vec();
+            }
+            return self
+                .panes
+                .iter()
+                .filter(|pane| {
+                    pane.command != COMMANDER_COMMAND
+                        && pane_matches_status(pane, status.trim(), self.focused)
+                })
+                .map(|pane| pane.id)
+                .collect();
+        }
+        if let Some(command) = normalized.strip_prefix("type:") {
+            let command = command.trim();
+            return self
+                .panes
+                .iter()
+                .filter(|pane| {
+                    pane.command != COMMANDER_COMMAND && pane.command.eq_ignore_ascii_case(command)
+                })
+                .map(|pane| pane.id)
+                .collect();
+        }
+        if let Some(name) = normalized.strip_prefix("name:") {
+            let name = name.trim();
+            return self
+                .panes
+                .iter()
+                .filter(|pane| {
+                    pane.command != COMMANDER_COMMAND && pane.title.to_ascii_lowercase() == name
+                })
+                .map(|pane| pane.id)
+                .collect();
+        }
+        if let Some(n) = normalized
+            .strip_prefix("pane ")
+            .and_then(|n| n.trim().parse::<usize>().ok())
+        {
+            let pane_title = format!("pane {}", n);
+            let mut matches = self
+                .panes
+                .iter()
+                .filter(|pane| {
+                    pane.command != COMMANDER_COMMAND
+                        && pane.title.to_ascii_lowercase() == pane_title
+                })
+                .map(|pane| pane.id)
+                .collect::<Vec<_>>();
+            if matches.is_empty() {
+                matches = self
+                    .panes
+                    .iter()
+                    .filter(|pane| {
+                        pane.command != COMMANDER_COMMAND && pane.id == n.saturating_sub(1)
+                    })
+                    .map(|pane| pane.id)
+                    .collect();
+            }
+            return matches;
+        }
+
+        let status_matches = self
+            .panes
+            .iter()
+            .filter(|pane| {
+                pane.command != COMMANDER_COMMAND
+                    && pane_matches_status(pane, &normalized, self.focused)
+            })
+            .map(|pane| pane.id)
+            .collect::<Vec<_>>();
+        if !status_matches.is_empty() {
+            return status_matches;
+        }
+
+        let exact_name_matches = self
+            .panes
+            .iter()
+            .filter(|pane| {
+                pane.command != COMMANDER_COMMAND && pane.title.to_ascii_lowercase() == normalized
+            })
+            .map(|pane| pane.id)
+            .collect::<Vec<_>>();
+        if !exact_name_matches.is_empty() {
+            return exact_name_matches;
+        }
+
+        self.panes
+            .iter()
+            .filter(|pane| {
+                pane.command != COMMANDER_COMMAND
+                    && (pane.title.to_ascii_lowercase().contains(&normalized)
+                        || pane.command.to_ascii_lowercase().contains(&normalized))
+            })
+            .map(|pane| pane.id)
+            .collect()
+    }
+
+    fn resolve_send_selector_with_refs(
+        &self,
+        selector: &str,
+        newly_created_ids: &[usize],
+        refs: &CommanderStepRefs,
+    ) -> Vec<usize> {
+        if let Some(ids) = resolve_reference_selector(selector, refs) {
+            return ids
+                .into_iter()
+                .filter(|id| {
+                    self.panes
+                        .iter()
+                        .any(|pane| pane.id == *id && pane.command != COMMANDER_COMMAND)
+                })
+                .collect();
+        }
+        self.resolve_send_selector(selector, newly_created_ids)
+    }
+
+    fn create_panes_from_requests(&mut self, requests: &[(String, usize)]) -> CreateOutcome {
+        if requests.is_empty() {
+            return CreateOutcome {
+                note: None,
+                created_ids: Vec::new(),
+            };
+        }
+
+        let mut created = Vec::new();
+        let mut created_ids = Vec::new();
+        let mut failures = Vec::new();
+
+        for (agent, count) in requests {
+            let Some(agent_index) = agent_index_for_alias(agent) else {
+                let _ = agent;
+                failures
+                    .push("Couldn't create a pane because that type isn't available.".to_string());
+                continue;
+            };
+            let command = AGENT_PRESETS[agent_index].command;
+            for _ in 0..*count {
+                let Some((target_pane, side)) = self.largest_split_target() else {
+                    failures
+                        .push("Couldn't create a pane because nothing could be split.".to_string());
+                    break;
+                };
+                match self.split_pane_with_command(
+                    target_pane,
+                    side,
+                    command,
+                    self.last_terminal_size,
+                ) {
+                    Ok(new_id) => {
+                        self.focus_pane(new_id);
+                        created.push(command.to_string());
+                        created_ids.push(new_id);
+                    }
+                    Err(_) => {
+                        failures.push("Couldn't create a pane because split failed.".to_string());
+                        break;
+                    }
+                }
+            }
+        }
+
+        if !created.is_empty() {
+            self.persist_layout();
+            self.resize(
+                self.last_terminal_size.height,
+                self.last_terminal_size.width,
+            );
+        }
+
+        let mut notes = Vec::new();
+        if !created.is_empty() {
+            notes.push(format!("Created {}.", summarize_created_panes(&created)));
+        }
+        if !failures.is_empty() {
+            notes.push(failures.join(" "));
+        }
+        CreateOutcome {
+            note: Some(notes.join(" ")),
+            created_ids,
+        }
+    }
+
+    fn rename_panes_from_requests(
+        &mut self,
+        requests: &[(String, String)],
+        newly_created_ids: &[usize],
+    ) -> Option<String> {
+        if requests.is_empty() {
+            return None;
+        }
+
+        let mut renamed = HashSet::new();
+        let mut unchanged = HashSet::new();
+        let mut unmatched = 0usize;
+        let mut invalid = 0usize;
+        let mut duplicate_name = 0usize;
+
+        for (selector, new_name_raw) in requests {
+            let new_name = new_name_raw.trim();
+            if new_name.is_empty() {
+                invalid += 1;
+                continue;
+            }
+
+            let mut matches = self.resolve_send_selector(selector, newly_created_ids);
+            matches.sort_unstable();
+            matches.dedup();
+            if matches.is_empty() {
+                unmatched += 1;
+                continue;
+            }
+
+            for pane_id in matches {
+                let Some(current_title) = self
+                    .panes
+                    .iter()
+                    .find(|pane| pane.id == pane_id)
+                    .map(|pane| pane.title.clone())
+                else {
+                    continue;
+                };
+                if current_title == new_name {
+                    if !renamed.contains(&pane_id) {
+                        unchanged.insert(pane_id);
+                    }
+                    continue;
+                }
+                if self.pane_name_exists_for_other(pane_id, new_name) {
+                    duplicate_name += 1;
+                    continue;
+                }
+                let Some(pane) = self.pane_mut(pane_id) else {
+                    continue;
+                };
+                pane.title = new_name.to_string();
+                unchanged.remove(&pane_id);
+                renamed.insert(pane_id);
+            }
+        }
+
+        if !renamed.is_empty() {
+            self.persist_layout();
+        }
+
+        let mut notes = Vec::new();
+        if !renamed.is_empty() {
+            notes.push(format!(
+                "Renamed {}.",
+                count_phrase(renamed.len(), "pane", "panes")
+            ));
+        }
+        if !unchanged.is_empty() {
+            notes.push(format!(
+                "{} already had that name.",
+                count_phrase(unchanged.len(), "pane", "panes")
+            ));
+        }
+        if unmatched > 0 {
+            notes.push("Couldn't rename some panes because nothing matched.".to_string());
+        }
+        if invalid > 0 {
+            notes.push("Skipped some rename requests because the new name was empty.".to_string());
+        }
+        if duplicate_name > 0 {
+            notes.push("Skipped some rename requests because the name already exists.".to_string());
+        }
+        if notes.is_empty() {
+            notes.push("No panes renamed.".to_string());
+        }
+        Some(notes.join(" "))
+    }
+
+    fn queue_tts(&self, text: &str) {
+        if let Some(tx) = self.tts.tx.as_ref() {
+            let _ = tx.send(text.trim().to_string());
+        }
+    }
+
+    fn close_panes_from_requests(&mut self, requests: &[String]) -> Option<String> {
+        if requests.is_empty() {
+            return None;
+        }
+
+        let mut targets = Vec::new();
+        let mut seen = HashSet::new();
+        let mut unmatched = Vec::new();
+
+        for selector in requests {
+            let matches = self.resolve_close_selector(selector);
+            if matches.is_empty() {
+                unmatched.push(selector.clone());
+                continue;
+            }
+            for pane_id in matches {
+                if seen.insert(pane_id) {
+                    targets.push(pane_id);
+                }
+            }
+        }
+
+        let mut closed = Vec::new();
+        let mut skipped = Vec::new();
+
+        for pane_id in targets {
+            if self.panes.len() <= 1 {
+                skipped.push("Skipped one close request to keep the last pane open.".to_string());
+                break;
+            }
+            let Some(_pane) = self.panes.iter().find(|pane| pane.id == pane_id) else {
+                skipped.push("Skipped one close request because that pane is gone.".to_string());
+                continue;
+            };
+            self.focus_pane(pane_id);
+            self.close_pane();
+            closed.push(pane_id);
+        }
+
+        let mut notes = Vec::new();
+        if !closed.is_empty() {
+            notes.push(format!(
+                "Closed {}.",
+                count_phrase(closed.len(), "pane", "panes")
+            ));
+        }
+        if !unmatched.is_empty() {
+            notes.push("Couldn't close some panes because nothing matched.".to_string());
+        }
+        if !skipped.is_empty() {
+            notes.push(skipped.join(" "));
+        }
+        if notes.is_empty() {
+            notes.push("No panes closed.".to_string());
+        }
+        Some(notes.join(" "))
+    }
+
+    fn resolve_close_selector(&self, selector: &str) -> Vec<usize> {
+        let raw = selector.trim();
+        if raw.is_empty() || raw.eq_ignore_ascii_case("none") {
+            return Vec::new();
+        }
+
+        let normalized = raw.to_ascii_lowercase();
+        if normalized == "all" {
+            return self.panes.iter().map(|pane| pane.id).collect();
+        }
+        if normalized == "focused" {
+            return self
+                .panes
+                .iter()
+                .filter(|pane| pane.id == self.focused)
+                .map(|pane| pane.id)
+                .collect();
+        }
+
+        if let Some(id_str) = normalized.strip_prefix("id:") {
+            if let Ok(id) = id_str.trim().parse::<usize>() {
+                return self
+                    .panes
+                    .iter()
+                    .filter(|pane| pane.id == id)
+                    .map(|pane| pane.id)
+                    .collect();
+            }
+        }
+
+        if let Some(status) = normalized.strip_prefix("status:") {
+            return self
+                .panes
+                .iter()
+                .filter(|pane| pane_matches_status(pane, status.trim(), self.focused))
+                .map(|pane| pane.id)
+                .collect();
+        }
+
+        if let Some(command) = normalized.strip_prefix("type:") {
+            let command = command.trim();
+            return self
+                .panes
+                .iter()
+                .filter(|pane| pane.command.eq_ignore_ascii_case(command))
+                .map(|pane| pane.id)
+                .collect();
+        }
+
+        if let Some(name) = normalized.strip_prefix("name:") {
+            let name = name.trim();
+            return self
+                .panes
+                .iter()
+                .filter(|pane| pane.title.to_ascii_lowercase() == name)
+                .map(|pane| pane.id)
+                .collect();
+        }
+
+        if let Some(n) = normalized
+            .strip_prefix("pane ")
+            .and_then(|n| n.trim().parse::<usize>().ok())
+        {
+            let pane_title = format!("pane {}", n);
+            let mut matches = self
+                .panes
+                .iter()
+                .filter(|pane| pane.title.to_ascii_lowercase() == pane_title)
+                .map(|pane| pane.id)
+                .collect::<Vec<_>>();
+            if matches.is_empty() {
+                matches = self
+                    .panes
+                    .iter()
+                    .filter(|pane| pane.id == n.saturating_sub(1))
+                    .map(|pane| pane.id)
+                    .collect();
+            }
+            return matches;
+        }
+
+        let status_matches = self
+            .panes
+            .iter()
+            .filter(|pane| pane_matches_status(pane, &normalized, self.focused))
+            .map(|pane| pane.id)
+            .collect::<Vec<_>>();
+        if !status_matches.is_empty() {
+            return status_matches;
+        }
+
+        let exact_name_matches = self
+            .panes
+            .iter()
+            .filter(|pane| pane.title.to_ascii_lowercase() == normalized)
+            .map(|pane| pane.id)
+            .collect::<Vec<_>>();
+        if !exact_name_matches.is_empty() {
+            return exact_name_matches;
+        }
+
+        self.panes
+            .iter()
+            .filter(|pane| {
+                pane.title.to_ascii_lowercase().contains(&normalized)
+                    || pane.command.to_ascii_lowercase().contains(&normalized)
+            })
+            .map(|pane| pane.id)
+            .collect()
+    }
+
+    fn largest_split_target(&self) -> Option<(usize, SplitSide)> {
+        let placements = self.pane_placements(Self::content_area(self.last_terminal_size));
+        let best = placements
+            .iter()
+            .filter(|placement| !self.pane_is_commander(placement.pane_id))
+            .max_by_key(|placement| {
+                u32::from(placement.area.width) * u32::from(placement.area.height)
+            })
+            .or_else(|| {
+                placements.iter().max_by_key(|placement| {
+                    u32::from(placement.area.width) * u32::from(placement.area.height)
+                })
+            })?;
+        let side = if best.area.width >= best.area.height {
+            SplitSide::Right
+        } else {
+            SplitSide::Bottom
+        };
+        Some((best.pane_id, side))
+    }
+
+    pub(crate) fn agent_available_for_pane(&self, pane_id: usize, agent_index: usize) -> bool {
+        let command = AGENT_PRESETS
+            .get(agent_index)
+            .map(|preset| preset.command)
+            .unwrap_or(AGENT_PRESETS[0].command);
+        self.command_available_for_pane(pane_id, command)
+    }
+
+    pub(crate) fn agent_availability_for_pane(&self, pane_id: usize) -> Vec<bool> {
+        (0..AGENT_PRESETS.len())
+            .map(|idx| self.agent_available_for_pane(pane_id, idx))
+            .collect()
+    }
+
+    fn command_available_for_pane(&self, pane_id: usize, command: &str) -> bool {
+        if command != COMMANDER_COMMAND {
+            return true;
+        }
+        !self
+            .panes
+            .iter()
+            .any(|pane| pane.id != pane_id && pane.command == COMMANDER_COMMAND)
+    }
+
+    fn first_available_agent_for_pane(&self, pane_id: usize, preferred: usize) -> usize {
+        let preferred = preferred.min(AGENT_PRESETS.len().saturating_sub(1));
+        if self.agent_available_for_pane(pane_id, preferred) {
+            return preferred;
+        }
+        (0..AGENT_PRESETS.len())
+            .find(|idx| self.agent_available_for_pane(pane_id, *idx))
+            .unwrap_or(0)
+    }
+
+    fn cycle_available_agent_for_pane(&self, pane_id: usize, current: usize, step: isize) -> usize {
+        if AGENT_PRESETS.is_empty() {
+            return 0;
+        }
+        let len = AGENT_PRESETS.len() as isize;
+        let mut idx = current.min(AGENT_PRESETS.len().saturating_sub(1)) as isize;
+        for _ in 0..AGENT_PRESETS.len() {
+            idx = (idx + step).rem_euclid(len);
+            let next = idx as usize;
+            if self.agent_available_for_pane(pane_id, next) {
+                return next;
+            }
+        }
+        current.min(AGENT_PRESETS.len().saturating_sub(1))
+    }
+
     fn focus_pane(&mut self, pane_id: usize) {
+        self.commander_focused = false;
+        self.sidebar_workspace_focused = None;
+        self.sidebar_add_button_focused = false;
+        self.drag_pane_mouse = None;
         self.focused = pane_id;
         if self.maximized_pane.is_some() {
             self.maximized_pane = Some(pane_id);
         }
+    }
+
+    fn focus_commander_pane(&mut self) {
+        self.commander_focused = true;
+        self.sidebar_workspace_focused = None;
+        self.sidebar_add_button_focused = false;
+        self.drag_pane_mouse = None;
     }
 
     pub(crate) fn toggle_maximize(&mut self) {
@@ -1399,8 +3641,16 @@ impl App {
         }
     }
 
+    pub(crate) fn is_maximized(&self) -> bool {
+        self.maximized_pane.is_some()
+    }
+
     pub(crate) fn pane_mut(&mut self, pane_id: usize) -> Option<&mut Pane> {
         self.panes.iter_mut().find(|pane| pane.id == pane_id)
+    }
+
+    pub(crate) fn pane(&self, pane_id: usize) -> Option<&Pane> {
+        self.panes.iter().find(|pane| pane.id == pane_id)
     }
 
     fn resize_target_at(&self, size: Rect, x: u16, y: u16) -> Option<ResizeTarget> {
@@ -1461,6 +3711,748 @@ impl App {
         }
         Ok(())
     }
+
+    fn update_pane_swap_hover_target(
+        &self,
+        size: Rect,
+        source_pane_id: usize,
+        mouse: &MouseEvent,
+    ) -> Option<usize> {
+        self.placement_at(size, mouse.column, mouse.row)
+            .map(|placement| placement.pane_id)
+            .filter(|pane_id| *pane_id != source_pane_id)
+    }
+
+    fn finish_pane_swap_drag(&mut self, drag: DragPaneSwap, size: Rect) -> anyhow::Result<()> {
+        self.drag_swap = None;
+
+        if drag.moved {
+            if let Some(target_pane_id) = drag.hovered_pane_id {
+                if self
+                    .layout
+                    .swap_leaf_ids(drag.source_pane_id, target_pane_id)
+                {
+                    self.focus_pane(drag.source_pane_id);
+                    self.persist_layout();
+                    self.resize(size.height, size.width);
+                }
+            }
+            return Ok(());
+        }
+
+        self.focus_pane(drag.source_pane_id);
+        self.open_new_pane_picker(drag.source_pane_id);
+        Ok(())
+    }
+
+    fn open_new_pane_picker(&mut self, pane_id: usize) {
+        let Some((name, agent_index)) = self
+            .panes
+            .iter()
+            .find(|pane| pane.id == pane_id)
+            .map(|pane| (pane.title.clone(), agent_index_for_command(&pane.command)))
+        else {
+            return;
+        };
+
+        let agent_index = self.first_available_agent_for_pane(pane_id, agent_index);
+        self.modal = Some(Modal::NewPanePicker {
+            pane_id,
+            source_pane_id: pane_id,
+            close_on_cancel: false,
+            cursor: name.chars().count(),
+            name_selected: true,
+            name,
+            name_error: None,
+            agent_index,
+        });
+    }
+}
+
+fn run_commander_llm(
+    user_input: String,
+    pane_names: Vec<String>,
+    pane_roster: Vec<String>,
+    agent_types: Vec<String>,
+) -> CommanderWorkerResult {
+    let pane_list = pane_names
+        .iter()
+        .map(|name| format!("- {}", name))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let pane_status_list = pane_roster.join("\n");
+    let agent_list = agent_types
+        .iter()
+        .map(|name| format!("- {}", name))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let prompt = format!(
+        "You are a command router for a terminal multiplexer.\n\
+         Available pane names (match one exactly):\n{pane_list}\n\
+         Current pane roster with status metadata:\n{pane_status_list}\n\
+         Available pane types for creation (canonical command tokens):\n{agent_list}\n\
+         Speech aliases: codecs/code-ex/codacs => codex, open code/open-code => opencode.\n\n\
+         User request:\n{user_input}\n\n\
+         If the request has multiple parts, dependencies, or sequencing (for example \"do X, then Y\"), decompose it into ordered steps.\n\
+         Return either:\n\
+         1) EXACTLY these 7 lines and nothing else (single-step mode):\n\
+         ACTION=<SEND|TASK|CREATE|CREATE_AND_SEND|CREATE_AND_TASK|RENAME|RENAME_AND_SEND|RENAME_AND_TASK|CLOSE|CLOSE_AND_SEND|CLOSE_AND_TASK|CREATE_AND_RENAME|CREATE_RENAME_AND_SEND|CREATE_RENAME_AND_TASK|CREATE_AND_CLOSE|CREATE_CLOSE_AND_SEND|CREATE_CLOSE_AND_TASK|RENAME_AND_CLOSE|RENAME_CLOSE_AND_SEND|RENAME_CLOSE_AND_TASK|CREATE_RENAME_AND_CLOSE|CREATE_RENAME_CLOSE_AND_SEND|CREATE_RENAME_CLOSE_AND_TASK|REPLY>\n\
+         TARGET=<pane selector or NONE; selectors may be exact pane names, new, all, focused, id:<pane-id>, status:<focused|running|exited|relaunch_failed|worker|new>, or type:<command>>\n\
+         MESSAGE=<text to send to target pane or NONE; it must be the exact text for that target>\n\
+         SPEECH=<short spoken summary for TTS or NONE; summarize the actual result in natural language and avoid task labels/system wording>\n\
+         CREATE=<comma-separated agent:count pairs using canonical type names (e.g. codex:2,opencode:1) or NONE>\n\
+         RENAME=<comma-separated selector=>new name pairs (e.g. focused=>Plan,id:2=>Backend) or NONE>\n\
+         CLOSE=<comma-separated selectors or NONE; selectors may be exact pane names, id:<pane-id>, status:<focused|running|exited|relaunch_failed|commander|worker>, or type:<command>>\n\n\
+         2) OR one or more ordered step blocks (multi-step mode), each block with EXACTLY these 9 lines:\n\
+         STEP=<short id>\n\
+         ACTION=<SEND|TASK|CREATE|CREATE_AND_SEND|CREATE_AND_TASK|RENAME|RENAME_AND_SEND|RENAME_AND_TASK|CLOSE|CLOSE_AND_SEND|CLOSE_AND_TASK|CREATE_AND_RENAME|CREATE_RENAME_AND_SEND|CREATE_RENAME_AND_TASK|CREATE_AND_CLOSE|CREATE_CLOSE_AND_SEND|CREATE_CLOSE_AND_TASK|RENAME_AND_CLOSE|RENAME_CLOSE_AND_SEND|RENAME_CLOSE_AND_TASK|CREATE_RENAME_AND_CLOSE|CREATE_RENAME_CLOSE_AND_SEND|CREATE_RENAME_CLOSE_AND_TASK|REPLY>\n\
+         TARGET=<pane selector or NONE; supports ref:<name> and ref:last in addition to normal selectors>\n\
+         MESSAGE=<text or NONE>\n\
+         SPEECH=<short spoken summary for TTS or NONE; summarize the actual result in natural language and avoid task labels/system wording>\n\
+         CREATE=<agent:count list or NONE>\n\
+         RENAME=<selector=>new name list or NONE; selectors can include ref:<name> and ref:last>\n\
+         CLOSE=<selector list or NONE; selectors can include ref:<name> and ref:last>\n\
+         SAVE=<reference name for panes created by this step, or NONE>\n\
+         In multi-step mode, put steps in execution order and do not include any text outside the step blocks.\n\
+         If the user asks to rename a pane, put the rename request in RENAME and keep MESSAGE as NONE unless they also asked to send text.\n\
+         Use ACTION=REPLY when no pane operations are needed and you should answer directly.\n\
+         For ACTION=REPLY, set TARGET=NONE and put the spoken reply in MESSAGE using this style: warm and natural, contractions only, 1-3 words for simple confirmations, one short sentence for status/questions, no formal filler.\n\
+         Use MESSAGE as the exact text for the target pane. Do not wrap it in task instructions, labels, or metadata.\n\
+         If the target is a terminal or shell pane, MESSAGE must be the exact shell command only.\n\
+         Use SPEECH as a concise spoken summary of the actual result. For example, if a terminal was cleared, SPEECH should be \"Terminal cleared.\"; if files were listed, SPEECH should sound like \"Listed the files.\" Keep it general and do not hardcode commands.\n\
+         When ACTION includes CREATE and RENAME together, do not guess future pane names. Use RENAME selector new (single-step mode) or ref:last (multi-step mode) to rename panes created in that same action/step.\n\
+         When ACTION includes CREATE and TASK/SEND together, use TARGET=new unless the user explicitly specifies another target."
+    );
+
+    let output = Command::new("agent")
+        .arg("-p")
+        .arg("--output-format")
+        .arg("text")
+        .arg("--mode")
+        .arg("ask")
+        .arg(prompt)
+        .output();
+
+    let Ok(output) = output else {
+        return CommanderWorkerResult::empty();
+    };
+
+    if !output.status.success() {
+        return CommanderWorkerResult::empty();
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout).to_string();
+    parse_commander_router_output(&text).unwrap_or_else(CommanderWorkerResult::empty)
+}
+
+fn parse_commander_router_output(text: &str) -> Option<CommanderWorkerResult> {
+    let steps = parse_commander_step_blocks(text);
+    if !steps.is_empty() {
+        return Some(CommanderWorkerResult {
+            steps,
+            ..CommanderWorkerResult::empty()
+        });
+    }
+
+    let mut action = None::<String>;
+    let mut target = None::<String>;
+    let mut message = None::<String>;
+    let mut speech = None::<String>;
+    let mut create = None::<String>;
+    let mut rename = None::<String>;
+    let mut close = None::<String>;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(value) = trimmed.strip_prefix("ACTION=") {
+            action = Some(value.trim().to_string());
+        } else if let Some(value) = trimmed.strip_prefix("TARGET=") {
+            target = Some(value.trim().to_string());
+        } else if let Some(value) = trimmed.strip_prefix("MESSAGE=") {
+            message = Some(value.to_string());
+        } else if let Some(value) = trimmed.strip_prefix("SPEECH=") {
+            speech = Some(value.to_string());
+        } else if let Some(value) = trimmed.strip_prefix("CREATE=") {
+            create = Some(value.trim().to_string());
+        } else if let Some(value) = trimmed.strip_prefix("RENAME=") {
+            rename = Some(value.to_string());
+        } else if let Some(value) = trimmed.strip_prefix("CLOSE=") {
+            close = Some(value.trim().to_string());
+        }
+    }
+
+    if action.is_none() {
+        return None;
+    }
+    let create_requests = create
+        .as_deref()
+        .map(parse_create_requests)
+        .unwrap_or_default();
+    let rename_requests = rename
+        .as_deref()
+        .map(parse_rename_requests)
+        .unwrap_or_default();
+    let close_requests = close
+        .as_deref()
+        .map(parse_close_requests)
+        .unwrap_or_default();
+    let action = action.unwrap_or_default().to_ascii_uppercase();
+    let target = target.unwrap_or_default();
+    let message = message.unwrap_or_default();
+    let reply_text = if action == "REPLY" {
+        normalize_commander_reply_text(&message)
+    } else {
+        None
+    };
+    let speech_text = speech.as_deref().and_then(normalize_commander_reply_text);
+    let submit_payload = action.contains("TASK");
+    let can_send = !target.is_empty()
+        && !target.eq_ignore_ascii_case("NONE")
+        && !message.is_empty()
+        && action != "CREATE"
+        && action != "CLOSE"
+        && action != "REPLY";
+
+    Some(CommanderWorkerResult {
+        steps: Vec::new(),
+        reply_text,
+        speech_text,
+        target_name: can_send.then_some(target),
+        payload: can_send.then_some(message),
+        submit_payload: can_send && submit_payload,
+        create_requests,
+        rename_requests,
+        close_requests,
+    })
+}
+
+fn parse_commander_step_blocks(text: &str) -> Vec<CommanderExecutionStep> {
+    let mut steps = Vec::new();
+    let mut fields = HashMap::<String, String>::new();
+    let mut saw_step_marker = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if trimmed.starts_with("STEP=") {
+            saw_step_marker = true;
+            if !fields.is_empty() {
+                if let Some(step) = build_commander_step_from_fields(&fields) {
+                    steps.push(step);
+                }
+                fields.clear();
+            }
+            continue;
+        }
+
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().to_ascii_uppercase();
+        if matches!(
+            key.as_str(),
+            "ACTION" | "TARGET" | "MESSAGE" | "SPEECH" | "CREATE" | "RENAME" | "CLOSE" | "SAVE"
+        ) {
+            fields.insert(key, value.trim().to_string());
+        }
+    }
+
+    if !fields.is_empty() {
+        if let Some(step) = build_commander_step_from_fields(&fields) {
+            steps.push(step);
+        }
+    }
+
+    if saw_step_marker {
+        steps
+    } else {
+        Vec::new()
+    }
+}
+
+fn build_commander_step_from_fields(
+    fields: &HashMap<String, String>,
+) -> Option<CommanderExecutionStep> {
+    let action = fields
+        .get("ACTION")
+        .map(|value| value.trim().to_ascii_uppercase())
+        .unwrap_or_default();
+    if action.is_empty() {
+        return None;
+    }
+
+    let target = fields.get("TARGET").cloned().unwrap_or_default();
+    let message = fields.get("MESSAGE").cloned().unwrap_or_default();
+    let speech_text = fields
+        .get("SPEECH")
+        .and_then(|value| normalize_commander_reply_text(value));
+    let reply_text = if action == "REPLY" {
+        normalize_commander_reply_text(&message)
+    } else {
+        None
+    };
+    let submit_payload = action.contains("TASK");
+    let can_send = !target.is_empty()
+        && !target.eq_ignore_ascii_case("NONE")
+        && !message.is_empty()
+        && action != "CREATE"
+        && action != "CLOSE"
+        && action != "REPLY";
+
+    let create_requests = fields
+        .get("CREATE")
+        .map(|value| parse_create_requests(value))
+        .unwrap_or_default();
+    let rename_requests = fields
+        .get("RENAME")
+        .map(|value| parse_rename_requests(value))
+        .unwrap_or_default();
+    let close_requests = fields
+        .get("CLOSE")
+        .map(|value| parse_close_requests(value))
+        .unwrap_or_default();
+    let save_as = fields.get("SAVE").and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
+
+    Some(CommanderExecutionStep {
+        save_as,
+        reply_text,
+        speech_text,
+        target_name: can_send.then_some(target),
+        payload: can_send.then_some(message),
+        submit_payload: can_send && submit_payload,
+        create_requests,
+        rename_requests,
+        close_requests,
+    })
+}
+
+fn format_commander_execution_reply(notes: &[String]) -> String {
+    let recap = notes
+        .iter()
+        .map(|note| note.trim())
+        .filter(|note| !note.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if recap.is_empty() {
+        "Done.".to_string()
+    } else {
+        recap
+    }
+}
+
+fn normalize_commander_reply_text(message: &str) -> Option<String> {
+    let trimmed = message.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn build_outgoing_payload(
+    payload: &str,
+    submit_payload: bool,
+    pane_count: usize,
+    shard_index: usize,
+    pane_name: &str,
+    pane_command: &str,
+) -> String {
+    if !submit_payload {
+        return payload.to_string();
+    }
+
+    if pane_command == LOGIN_SHELL_SENTINEL || pane_count <= 1 {
+        return payload.to_string();
+    }
+
+    build_sharded_task_prompt(payload, shard_index, pane_count, pane_name, pane_command)
+}
+
+fn build_sharded_task_prompt(
+    task_text: &str,
+    shard_index: usize,
+    shard_total: usize,
+    pane_name: &str,
+    pane_type: &str,
+) -> String {
+    let task = task_text.trim();
+    let task = if task.is_empty() {
+        "Complete the requested task."
+    } else {
+        task
+    };
+
+    let role = shard_role_for_index(shard_index, shard_total);
+
+    format!(
+        "Task: {task}\n\
+Shard: {shard_index}/{shard_total}\n\
+Role: {role}\n\
+Pane: {pane_name}\n\
+Agent: {pane_type}\n\
+Work only on your distinct slice and avoid overlap with the other shards.\n\
+Complete your slice end-to-end and keep the final reply concise."
+    )
+}
+
+fn shard_role_for_index(shard_index: usize, shard_total: usize) -> &'static str {
+    if shard_total <= 1 {
+        return "complete the task";
+    }
+
+    if shard_index == 1 {
+        "gather context and identify the right slice"
+    } else if shard_index == shard_total {
+        "verify the result and close gaps"
+    } else {
+        "implement a distinct slice of the task"
+    }
+}
+
+fn parse_commander_slash_command(input: &str) -> Option<CommanderSlashCommand> {
+    let trimmed = input.trim();
+    let command = trimmed.strip_prefix('/')?.trim();
+    let normalized = command.to_ascii_lowercase();
+
+    match normalized.as_str() {
+        "theme" => Some(CommanderSlashCommand::OpenTheme),
+        "settings" => Some(CommanderSlashCommand::OpenSettings),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outgoing_payload_is_forwarded_verbatim() {
+        let outgoing = build_outgoing_payload("df -h", true, 1, 1, "terminal", "codex");
+
+        assert_eq!(outgoing, "df -h");
+    }
+
+    #[test]
+    fn commander_step_accepts_speech_field() {
+        let mut fields = HashMap::new();
+        fields.insert("ACTION".to_string(), "SEND".to_string());
+        fields.insert("TARGET".to_string(), "terminal".to_string());
+        fields.insert("MESSAGE".to_string(), "clear".to_string());
+        fields.insert("SPEECH".to_string(), "Terminal cleared.".to_string());
+
+        let step = build_commander_step_from_fields(&fields).expect("expected step");
+        assert_eq!(step.speech_text.as_deref(), Some("Terminal cleared."));
+    }
+
+    #[test]
+    fn sharded_agent_payload_gets_distinct_role_prompt() {
+        let outgoing = build_outgoing_payload("Refactor the parser.", true, 3, 2, "beta", "codex");
+
+        assert!(outgoing.contains("Shard: 2/3"));
+        assert!(outgoing.contains("Role: implement a distinct slice of the task"));
+        assert!(outgoing.contains("Work only on your distinct slice"));
+    }
+
+    #[test]
+    fn commander_slash_commands_parse() {
+        assert!(matches!(
+            parse_commander_slash_command("/theme"),
+            Some(CommanderSlashCommand::OpenTheme)
+        ));
+        assert!(matches!(
+            parse_commander_slash_command("/settings"),
+            Some(CommanderSlashCommand::OpenSettings)
+        ));
+        assert!(parse_commander_slash_command("theme").is_none());
+    }
+
+    #[test]
+    fn sidebar_index_shift_clamps_at_bounds() {
+        assert_eq!(shift_sidebar_item_index(0, 4, -1), 0);
+        assert_eq!(shift_sidebar_item_index(3, 4, 1), 3);
+        assert_eq!(shift_sidebar_item_index(1, 4, -9), 0);
+        assert_eq!(shift_sidebar_item_index(2, 4, 9), 3);
+    }
+
+    #[test]
+    fn sidebar_index_shift_moves_one_step_when_in_range() {
+        assert_eq!(shift_sidebar_item_index(0, 4, 1), 1);
+        assert_eq!(shift_sidebar_item_index(2, 4, -1), 1);
+    }
+}
+
+fn init_tts_state() -> TtsState {
+    if !parse_bool_env_with_default("CODEUI_TTS", true) {
+        return TtsState { tx: None };
+    }
+    let (tx, rx) = mpsc::channel::<String>();
+    let config = tts_config_from_env();
+    thread::spawn(move || run_tts_worker(rx, config));
+    TtsState { tx: Some(tx) }
+}
+
+fn tts_config_from_env() -> TtsConfig {
+    let timeout_secs = std::env::var("CODEUI_TTS_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(12)
+        .clamp(3, 60);
+    TtsConfig {
+        edge_voice: std::env::var("CODEUI_TTS_VOICE")
+            .unwrap_or_else(|_| "en-US-JennyNeural".to_string()),
+        edge_rate: std::env::var("CODEUI_TTS_RATE").unwrap_or_else(|_| "+0%".to_string()),
+        edge_volume: std::env::var("CODEUI_TTS_VOLUME").unwrap_or_else(|_| "+0%".to_string()),
+        edge_pitch: std::env::var("CODEUI_TTS_PITCH").unwrap_or_else(|_| "+0Hz".to_string()),
+        timeout_secs,
+    }
+}
+
+fn run_tts_worker(rx: Receiver<String>, config: TtsConfig) {
+    for text in rx {
+        if text.trim().is_empty() {
+            continue;
+        }
+        if speak_with_edge_tts(&text, &config) {
+            continue;
+        }
+        let _ = Command::new("espeak").arg(&text).status();
+    }
+}
+
+fn speak_with_edge_tts(text: &str, config: &TtsConfig) -> bool {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    let media_path = format!("/tmp/codeui-tts-{}-{}.mp3", std::process::id(), stamp);
+
+    let generated = run_command_with_timeout(
+        "edge-tts",
+        &[
+            "--voice",
+            config.edge_voice.as_str(),
+            "--rate",
+            config.edge_rate.as_str(),
+            "--volume",
+            config.edge_volume.as_str(),
+            "--pitch",
+            config.edge_pitch.as_str(),
+            "--text",
+            text,
+            "--write-media",
+            media_path.as_str(),
+        ],
+        config.timeout_secs,
+    );
+    if !generated {
+        let _ = std::fs::remove_file(&media_path);
+        return false;
+    }
+
+    let played = run_command_with_timeout(
+        "ffplay",
+        &[
+            "-nodisp",
+            "-autoexit",
+            "-loglevel",
+            "quiet",
+            media_path.as_str(),
+        ],
+        config.timeout_secs,
+    );
+    let _ = std::fs::remove_file(&media_path);
+    played
+}
+
+fn run_command_with_timeout(program: &str, args: &[&str], timeout_secs: u64) -> bool {
+    let duration = format!("{}s", timeout_secs);
+    let timeout_status = Command::new("timeout")
+        .arg(duration)
+        .arg(program)
+        .args(args)
+        .status();
+    match timeout_status {
+        Ok(status) => status.success(),
+        Err(_) => Command::new(program)
+            .args(args)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false),
+    }
+}
+
+fn count_phrase(count: usize, singular_noun: &str, plural_noun: &str) -> String {
+    if count == 1 {
+        format!("one {}", singular_noun)
+    } else {
+        format!("{} {}", count, plural_noun)
+    }
+}
+
+fn summarize_created_panes(created: &[String]) -> String {
+    if created.is_empty() {
+        return "no panes".to_string();
+    }
+
+    let mut order = Vec::<String>::new();
+    let mut counts = std::collections::HashMap::<String, usize>::new();
+    for command in created {
+        let key = command.trim().to_ascii_lowercase();
+        if key.is_empty() {
+            continue;
+        }
+        if !counts.contains_key(&key) {
+            order.push(key.clone());
+        }
+        *counts.entry(key).or_insert(0) += 1;
+    }
+
+    let mut parts = Vec::<String>::new();
+    for pane_type in order {
+        let count = counts.get(&pane_type).copied().unwrap_or(0);
+        if count == 0 {
+            continue;
+        }
+        let singular = format!("{} pane", pane_type);
+        let plural = format!("{} panes", pane_type);
+        parts.push(count_phrase(count, &singular, &plural));
+    }
+
+    join_sentence_list(&parts)
+}
+
+fn join_sentence_list(parts: &[String]) -> String {
+    match parts.len() {
+        0 => String::new(),
+        1 => parts[0].clone(),
+        2 => format!("{} and {}", parts[0], parts[1]),
+        _ => {
+            let head = &parts[..parts.len().saturating_sub(1)];
+            let last = &parts[parts.len() - 1];
+            format!("{}, and {}", head.join(", "), last)
+        }
+    }
+}
+
+fn parse_create_requests(text: &str) -> Vec<(String, usize)> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    for part in trimmed.split(',') {
+        let token = part.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let (name, count_str) = token
+            .split_once(':')
+            .or_else(|| token.split_once('='))
+            .unwrap_or((token, "1"));
+        let count = count_str.trim().parse::<usize>().unwrap_or(1).max(1);
+        let normalized_name = name.trim().to_ascii_lowercase();
+        if !normalized_name.is_empty() {
+            out.push((normalized_name, count));
+        }
+    }
+    out
+}
+
+fn parse_close_requests(text: &str) -> Vec<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+        return Vec::new();
+    }
+
+    trimmed
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn parse_rename_requests(text: &str) -> Vec<(String, String)> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+        return Vec::new();
+    }
+
+    trimmed
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .filter_map(|token| {
+            token
+                .split_once("=>")
+                .or_else(|| token.split_once("->"))
+                .or_else(|| token.split_once('='))
+                .map(|(selector, name)| (selector.trim().to_string(), name.trim().to_string()))
+        })
+        .filter(|(selector, name)| !selector.is_empty() && !name.is_empty())
+        .collect()
+}
+
+fn resolve_reference_selector(selector: &str, refs: &CommanderStepRefs) -> Option<Vec<usize>> {
+    let normalized = selector.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+    if matches!(
+        normalized.as_str(),
+        "ref:last" | "last_created" | "newest_created"
+    ) {
+        return Some(refs.last_created_ids.clone());
+    }
+    if let Some(name) = normalized.strip_prefix("ref:") {
+        let key = name.trim();
+        if key.is_empty() {
+            return Some(Vec::new());
+        }
+        return Some(refs.named.get(key).cloned().unwrap_or_default());
+    }
+    None
+}
+
+fn pane_matches_status(pane: &Pane, status: &str, focused_pane_id: usize) -> bool {
+    let status = status.trim();
+    match status {
+        "focused" | "active" | "selected" => pane.id == focused_pane_id,
+        "running" | "alive" | "open" => !pane.exited,
+        "exited" | "dead" | "closed" | "finished" => pane.exited,
+        "relaunch_failed" | "failed" | "error" | "broken" | "stuck" => pane.relaunch_failed,
+        "commander" => pane.command == COMMANDER_COMMAND,
+        "worker" | "agent" | "non_commander" => pane.command != COMMANDER_COMMAND,
+        other if other.starts_with("type:") => {
+            let command = other.trim_start_matches("type:").trim();
+            pane.command.eq_ignore_ascii_case(command)
+        }
+        _ => false,
+    }
+}
+
+fn shift_sidebar_item_index(current: usize, total_items: usize, step: isize) -> usize {
+    if total_items == 0 {
+        return current;
+    }
+    let max_index = total_items.saturating_sub(1);
+    if step < 0 {
+        let amount = step.saturating_abs() as usize;
+        return current.saturating_sub(amount).min(max_index);
+    }
+    current.saturating_add(step as usize).min(max_index)
 }
 
 fn parse_debug_flag(name: &str) -> bool {
@@ -1471,6 +4463,16 @@ fn parse_debug_flag(name: &str) -> bool {
             matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
         })
         .unwrap_or(false)
+}
+
+fn parse_bool_env_with_default(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(default)
 }
 
 fn resize_boundary_hit(boundary: &ResizeBoundary, x: u16, y: u16) -> bool {
@@ -1557,7 +4559,27 @@ fn agent_index_for_command(command: &str) -> usize {
     AGENT_PRESETS
         .iter()
         .position(|preset| preset.command == normalized)
-        .unwrap_or(1)
+        .unwrap_or(default_agent_index())
+}
+
+fn agent_index_for_alias(token: &str) -> Option<usize> {
+    let normalized = token
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', '_'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let canonical = match normalized.as_str() {
+        "codecs" | "codacs" | "code ex" => "codex",
+        "open code" => "opencode",
+        "cursor agent" => "agent",
+        "terminal" | "shell" => "__SHELL__",
+        other => other,
+    };
+    AGENT_PRESETS
+        .iter()
+        .position(|preset| preset.command.eq_ignore_ascii_case(canonical))
 }
 
 fn char_to_byte_idx(text: &str, char_idx: usize) -> usize {
@@ -1591,4 +4613,56 @@ fn remove_char_at_cursor(text: &mut String, cursor: usize) {
     let start = char_to_byte_idx(text, cursor);
     let end = char_to_byte_idx(text, cursor + 1);
     text.replace_range(start..end, "");
+}
+
+fn move_cell((col, row): (u16, u16), delta: i16, cols: u16, rows: u16) -> (u16, u16) {
+    let max_index = u32::from(cols)
+        .saturating_mul(u32::from(rows))
+        .saturating_sub(1);
+    let index = u32::from(row)
+        .saturating_mul(u32::from(cols))
+        .saturating_add(u32::from(col));
+    let next = if delta.is_negative() {
+        index.saturating_sub(u32::from(delta.unsigned_abs()))
+    } else {
+        index.saturating_add(delta as u32).min(max_index)
+    };
+    (
+        (next % u32::from(cols)) as u16,
+        (next / u32::from(cols)) as u16,
+    )
+}
+
+fn write_osc52_clipboard(text: &str) -> anyhow::Result<()> {
+    let encoded = base64_encode(text.as_bytes());
+    let mut stdout = io::stdout();
+    write!(stdout, "\x1b]52;c;{}\x07", encoded)?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(b2 & 0b0011_1111) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+
+    out
 }
