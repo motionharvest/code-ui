@@ -99,6 +99,27 @@ pub(crate) fn agent_binary_for_command(command: &str) -> Option<&'static str> {
         .and_then(|preset| preset.binary)
 }
 
+pub(crate) fn agent_command_for_input(input: &str) -> Option<&'static str> {
+    let normalized = input
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', '_'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let canonical = match normalized.as_str() {
+        "codecs" | "codacs" | "code ex" => "codex",
+        "open code" => "opencode",
+        "cursor agent" => "agent",
+        "terminal" | "shell" => LOGIN_SHELL_SENTINEL,
+        other => other,
+    };
+    AGENT_PRESETS
+        .iter()
+        .find(|preset| preset.command.eq_ignore_ascii_case(canonical))
+        .map(|preset| preset.command)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PanelSettingsFocus {
     Name,
@@ -320,10 +341,7 @@ pub(crate) fn render_workspace_sidebar(
     let commander_area = commander_item_area(sidebar_area);
     if commander_area.width >= 3 && commander_area.height >= 3 {
         let commander_style = if commander_selected {
-            Style::default()
-                .fg(theme.accent)
-                .bg(theme.background)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(theme.accent).bg(theme.background)
         } else {
             Style::default().fg(theme.muted).bg(theme.background)
         };
@@ -334,17 +352,6 @@ pub(crate) fn render_workspace_sidebar(
                 .border_style(commander_style)
                 .style(Style::default().bg(theme.background)),
             commander_area,
-        );
-        f.render_widget(
-            Paragraph::new("Commander")
-                .alignment(Alignment::Center)
-                .style(commander_style),
-            Rect {
-                x: commander_area.x.saturating_add(1),
-                y: commander_area.y.saturating_add(1),
-                width: commander_area.width.saturating_sub(2),
-                height: 1,
-            },
         );
     }
 

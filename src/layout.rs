@@ -255,56 +255,6 @@ impl Node {
         }
     }
 
-    pub(crate) fn placement_at(
-        &self,
-        area: Rect,
-        exposed: ExposedSides,
-        x: u16,
-        y: u16,
-    ) -> Option<Placement> {
-        if !contains(area, x, y) {
-            return None;
-        }
-
-        match self {
-            Self::Leaf { pane_id } => Some(Placement {
-                pane_id: *pane_id,
-                area,
-                exposed,
-            }),
-            Self::Split {
-                direction,
-                ratio,
-                first,
-                second,
-            } => {
-                let first_ratio = ratio_basis_points(*ratio);
-                let chunks = split_area_by_ratio(area, *direction, first_ratio);
-
-                let mut first_exposed = exposed;
-                let mut second_exposed = exposed;
-                match direction {
-                    Direction::Vertical => {
-                        first_exposed.bottom = false;
-                        second_exposed.top = false;
-                    }
-                    Direction::Horizontal => {
-                        first_exposed.right = false;
-                        second_exposed.left = false;
-                    }
-                }
-
-                if contains(chunks.first, x, y) {
-                    first.placement_at(chunks.first, first_exposed, x, y)
-                } else if contains(chunks.second, x, y) {
-                    second.placement_at(chunks.second, second_exposed, x, y)
-                } else {
-                    None
-                }
-            }
-        }
-    }
-
     pub(crate) fn collect_debug_areas(
         &self,
         area: Rect,

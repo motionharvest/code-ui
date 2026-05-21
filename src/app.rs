@@ -1,7 +1,8 @@
 use std::{
     collections::{HashMap, HashSet},
-    io::{self, Write},
-    process::Command,
+    io::{self, Read, Write},
+    path::Path,
+    process::{Child, Command, Stdio},
     sync::mpsc::{self, Receiver, Sender, TryRecvError},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -59,8 +60,11 @@ pub(crate) struct App {
     sidebar_workspace_focused: Option<usize>,
     sidebar_add_button_focused: bool,
     commander: CommanderState,
+    agent_handoffs: HashMap<usize, AgentHandoff>,
+    commander_palette_video: CommanderPaletteVideoState,
     tts: TtsState,
     last_terminal_size: Rect,
+    hit_test_cache: Option<HitTestCache>,
 }
 
 #[derive(Clone)]
@@ -108,6 +112,13 @@ struct ResizeTarget {
     pane_ids: Vec<usize>,
 }
 
+struct HitTestCache {
+    content: Rect,
+    placements: Vec<Placement>,
+    row_candidates: Vec<Vec<usize>>,
+    resize_boundaries: Vec<ResizeBoundary>,
+}
+
 struct CommanderState {
     input: String,
     cursor: usize,
@@ -126,6 +137,8 @@ struct CommanderWorkerResult {
     create_requests: Vec<(String, usize)>,
     rename_requests: Vec<(String, String)>,
     close_requests: Vec<String>,
+    workspace_switch: Option<String>,
+    workspace_create: Option<Option<String>>,
 }
 
 #[derive(Clone, Default)]
@@ -139,6 +152,8 @@ struct CommanderExecutionStep {
     create_requests: Vec<(String, usize)>,
     rename_requests: Vec<(String, String)>,
     close_requests: Vec<String>,
+    workspace_switch: Option<String>,
+    workspace_create: Option<Option<String>>,
 }
 
 #[derive(Default)]
@@ -156,9 +171,30 @@ struct CommanderStepOutcome {
     speech_notes: Vec<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AgentHandoff {
+    status: HandoffStatus,
+    summary: String,
+    changed_files: Vec<String>,
+    tests: String,
+    risks: String,
+    next: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HandoffStatus {
+    Success,
+    Questionable,
+    Failed,
+    NeedsTests,
+    Blocked,
+}
+
 enum CommanderSlashCommand {
     OpenTheme,
     OpenSettings,
+    CreateWorkspace(Option<String>),
+    SwitchWorkspace(String),
 }
 
 impl CommanderWorkerResult {
@@ -173,6 +209,8 @@ impl CommanderWorkerResult {
             create_requests: Vec::new(),
             rename_requests: Vec::new(),
             close_requests: Vec::new(),
+            workspace_switch: None,
+            workspace_create: None,
         }
     }
 
@@ -186,7 +224,9 @@ impl CommanderWorkerResult {
             || self.payload.is_some()
             || !self.create_requests.is_empty()
             || !self.rename_requests.is_empty()
-            || !self.close_requests.is_empty();
+            || !self.close_requests.is_empty()
+            || self.workspace_switch.is_some()
+            || self.workspace_create.is_some();
         if !has_legacy_fields {
             return Vec::new();
         }
@@ -200,6 +240,8 @@ impl CommanderWorkerResult {
             create_requests: self.create_requests,
             rename_requests: self.rename_requests,
             close_requests: self.close_requests,
+            workspace_switch: self.workspace_switch,
+            workspace_create: self.workspace_create,
         }]
     }
 }
@@ -211,6 +253,21 @@ struct CreateOutcome {
 
 struct TtsState {
     tx: Option<Sender<String>>,
+    event_rx: Option<Receiver<TtsEvent>>,
+}
+
+struct CommanderPaletteVideoState {
+    child: Option<Child>,
+    rx: Option<Receiver<Vec<u8>>>,
+    parser: vt100::Parser,
+    frame_text: String,
+    rows: u16,
+    cols: u16,
+}
+
+enum TtsEvent {
+    SpeakStarted,
+    SpeakFinished,
 }
 
 #[derive(Clone)]
@@ -357,7 +414,7 @@ impl App {
         let theme_index =
             load_persisted_theme_index().unwrap_or_else(crate::theme::default_theme_index);
 
-        Ok(Self {
+        let mut app = Self {
             panes,
             workspaces,
             active_workspace,
@@ -390,6 +447,15 @@ impl App {
                 ],
                 rx: None,
             },
+            agent_handoffs: HashMap::new(),
+            commander_palette_video: CommanderPaletteVideoState {
+                child: None,
+                rx: None,
+                parser: vt100::Parser::new(14, 32, 0),
+                frame_text: String::new(),
+                rows: 14,
+                cols: 32,
+            },
             tts: init_tts_state(),
             last_terminal_size: Rect {
                 x: 0,
@@ -397,7 +463,10 @@ impl App {
                 width: cols,
                 height: rows,
             },
-        })
+            hit_test_cache: None,
+        };
+        app.rebuild_hit_test_cache();
+        Ok(app)
     }
 
     pub(crate) fn body_area(size: Rect) -> Rect {
@@ -503,6 +572,7 @@ impl App {
                 pane.resize(content_rows, content_cols);
             }
         }
+        self.rebuild_hit_test_cache();
     }
 
     /// Drain PTY output for all panes. Returns true if any pane processed new
@@ -511,11 +581,24 @@ impl App {
     /// can keep using the slot instead of staring at a frozen view.
     pub(crate) fn tick(&mut self) -> bool {
         let mut any = false;
+        if self.poll_tts_events() {
+            any = true;
+        }
         if self.poll_commander_result() {
             any = true;
         }
+        if self.poll_commander_palette_video() {
+            any = true;
+        }
+        let mut handoff_updates = Vec::new();
         for pane in &mut self.panes {
             if pane.pump() {
+                if pane.command != COMMANDER_COMMAND {
+                    let text = pane.recent_plain_text();
+                    if let Some(handoff) = parse_agent_handoff(&text) {
+                        handoff_updates.push((pane.id, handoff));
+                    }
+                }
                 any = true;
             }
             if pane.exited && !pane.relaunch_failed {
@@ -525,47 +608,29 @@ impl App {
                 }
             }
         }
+        for (pane_id, handoff) in handoff_updates {
+            self.agent_handoffs.insert(pane_id, handoff);
+        }
         any
     }
 
-    /// Graceful shutdown: ask every running agent to exit (SIGTERM), drain
-    /// their output for up to `max_wait` so resume hints printed during exit
-    /// land in the parser, then take a final best-effort snapshot. Called
-    /// from the run loop after the user requests quit / reload so the
-    /// next launch can resume each pane where it left off.
+    /// Graceful detach: drain output briefly and take a final best-effort
+    /// snapshot. Pane processes live in persistent tmux sessions, so quitting
+    /// or reloading the app must not signal the program running inside them.
     pub(crate) fn shutdown_panes(&mut self, max_wait: Duration) {
-        // 1. Politely ask each not-yet-exited child to exit. Most agents have
-        //    a SIGTERM handler that flushes session state and prints a
-        //    resume hint before terminating.
-        for pane in &self.panes {
-            if !pane.exited {
-                pane.request_exit();
-            }
-        }
-
-        // 2. Drain output until every pane has reported exit or we run out
-        //    of patience. We poll rather than block because each pane's PTY
-        //    reader runs on its own thread and may produce output at any
-        //    time during the shutdown window.
+        self.stop_commander_palette_video();
         let deadline = Instant::now() + max_wait;
         loop {
-            let mut all_done = true;
+            let mut any = false;
             for pane in &mut self.panes {
-                pane.pump();
-                if !pane.exited {
-                    all_done = false;
-                }
+                any |= pane.pump();
             }
-            if all_done || Instant::now() >= deadline {
+            if !any || Instant::now() >= deadline {
                 break;
             }
             thread::sleep(Duration::from_millis(20));
         }
 
-        // 3. Final sweep: some agents print their resume line and then hang
-        //    (or take longer than `max_wait` to actually close fds). Scrape
-        //    the on-screen contents one more time so we still capture the
-        //    hint even if the child hasn't fully disconnected yet.
         for pane in &mut self.panes {
             if pane.resume_command.is_none() {
                 pane.try_capture_resume_command();
@@ -618,6 +683,107 @@ impl App {
         self.sidebar_add_button_focused = false;
         self.resize(size.height, size.width);
         self.persist_layout();
+    }
+
+    fn switch_workspace_from_request(&mut self, selector: &str) -> Result<String, String> {
+        let Some(workspace_index) = self.resolve_workspace_selector(selector) else {
+            return Err(format!("Couldn't find workspace {}.", selector.trim()));
+        };
+        let name = self
+            .workspaces
+            .get(workspace_index)
+            .map(|workspace| workspace.name.clone())
+            .unwrap_or_else(|| format!("Workspace {}", workspace_index + 1));
+        self.switch_workspace(workspace_index, self.last_terminal_size);
+        Ok(format!("Switched to {}.", name))
+    }
+
+    fn create_workspace_from_request(&mut self, name: Option<&str>) -> Result<String, String> {
+        self.create_workspace(self.last_terminal_size)
+            .map_err(|_| "Couldn't create a new workspace.".to_string())?;
+
+        let workspace_index = self.active_workspace;
+        let mut workspace_name = self
+            .workspaces
+            .get(workspace_index)
+            .map(|workspace| workspace.name.clone())
+            .unwrap_or_else(|| format!("Workspace {}", workspace_index + 1));
+
+        if let Some(name) = name.map(str::trim).filter(|name| {
+            !name.is_empty()
+                && !name.eq_ignore_ascii_case("none")
+                && !name.eq_ignore_ascii_case("new")
+        }) {
+            if self.workspaces.iter().enumerate().any(|(idx, workspace)| {
+                idx != workspace_index && workspace.name.trim().eq_ignore_ascii_case(name)
+            }) {
+                return Ok(format!(
+                    "Created {}, but kept the default name because {} already exists.",
+                    workspace_name, name
+                ));
+            }
+
+            match self.rename_workspace(workspace_index, name.to_string()) {
+                Ok(()) => workspace_name = name.to_string(),
+                Err(_) => {
+                    return Ok(format!(
+                        "Created {}, but couldn't apply that workspace name.",
+                        workspace_name
+                    ));
+                }
+            }
+        }
+
+        Ok(format!("Created workspace {}.", workspace_name))
+    }
+
+    fn resolve_workspace_selector(&self, selector: &str) -> Option<usize> {
+        let raw = selector.trim();
+        if raw.is_empty() || raw.eq_ignore_ascii_case("none") {
+            return None;
+        }
+        let normalized = raw.to_ascii_lowercase();
+        match normalized.as_str() {
+            "current" | "active" => return Some(self.active_workspace),
+            "next" => {
+                return (!self.workspaces.is_empty())
+                    .then_some((self.active_workspace + 1) % self.workspaces.len());
+            }
+            "previous" | "prev" | "last" => {
+                return (!self.workspaces.is_empty()).then_some(
+                    (self.active_workspace + self.workspaces.len().saturating_sub(1))
+                        % self.workspaces.len(),
+                );
+            }
+            _ => {}
+        }
+
+        let numeric = normalized
+            .strip_prefix("workspace ")
+            .or_else(|| normalized.strip_prefix("workspace:"))
+            .or_else(|| normalized.strip_prefix("id:"))
+            .unwrap_or(&normalized)
+            .trim();
+        if let Ok(one_based) = numeric.parse::<usize>() {
+            if (1..=self.workspaces.len()).contains(&one_based) {
+                return Some(one_based - 1);
+            }
+            if one_based < self.workspaces.len() {
+                return Some(one_based);
+            }
+        }
+
+        self.workspaces
+            .iter()
+            .position(|workspace| workspace.name.trim().eq_ignore_ascii_case(raw))
+            .or_else(|| {
+                self.workspaces.iter().position(|workspace| {
+                    workspace
+                        .name
+                        .to_ascii_lowercase()
+                        .contains(normalized.as_str())
+                })
+            })
     }
 
     fn create_workspace(&mut self, size: Rect) -> anyhow::Result<()> {
@@ -704,7 +870,7 @@ impl App {
         self.panes.retain(|pane| {
             let keep = referenced_pane_ids.contains(&pane.id);
             if !keep {
-                pane.request_exit();
+                pane.terminate_session();
             }
             keep
         });
@@ -1086,6 +1252,7 @@ impl App {
             return;
         };
 
+        self.panes[pos].terminate_session();
         self.panes.remove(pos);
         self.focus_pane(next_focus);
         for (workspace_index, workspace) in self.workspaces.iter_mut().enumerate() {
@@ -1165,7 +1332,8 @@ impl App {
             return Ok(());
         }
 
-        // Changing the agent of a pane discards any prior resume hint.
+        // Changing the agent of a pane discards any prior session state.
+        self.panes[pos].terminate_session();
         self.panes[pos] = Pane::new(pane_id, name, command, None, None, rows, cols)?;
         self.focus_pane(pane_id);
         self.persist_layout();
@@ -1222,6 +1390,7 @@ impl App {
 
                     if matches!(key.code, KeyCode::Char('d') | KeyCode::Char('D')) {
                         self.debug_container_boxes = !self.debug_container_boxes;
+                        self.rebuild_hit_test_cache();
                         self.modal = Some(Modal::Help);
                     } else if matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T')) {
                         self.theme_preview_index = self.theme_index;
@@ -1853,6 +2022,17 @@ impl App {
     }
 
     pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent, size: Rect) -> anyhow::Result<()> {
+        // Plain mouse move events can flood the queue and create visible click
+        // latency. Ignore them unless an active drag/selection needs updates.
+        if matches!(mouse.kind, MouseEventKind::Moved)
+            && self.drag_resize.is_none()
+            && self.drag_swap.is_none()
+            && self.drag_pane_mouse.is_none()
+            && !self.text_selection.is_some_and(|selection| selection.active)
+        {
+            return Ok(());
+        }
+
         if self.update_text_selection(size, &mouse) {
             return Ok(());
         }
@@ -1928,6 +2108,7 @@ impl App {
                             mouse.row,
                         ) {
                             self.debug_container_boxes = !self.debug_container_boxes;
+                            self.rebuild_hit_test_cache();
                         }
                     }
                     self.modal = Some(Modal::Help);
@@ -2448,47 +2629,26 @@ impl App {
 
     fn placement_at(&self, size: Rect, x: u16, y: u16) -> Option<Placement> {
         let content = Self::content_area(size);
-        if let Some(pane_id) = self.maximized_pane {
-            return contains(content, x, y).then_some(Placement {
-                pane_id,
-                area: content,
-                exposed: ExposedSides {
-                    top: true,
-                    bottom: true,
-                    left: true,
-                    right: true,
-                },
-            });
+        let cache = self.hit_test_cache.as_ref()?;
+        if cache.content != content || !contains(content, x, y) {
+            return None;
         }
 
-        if self.debug_container_boxes {
-            let (_, placements) = self.debug_layout_areas(content);
-            return placements
-                .into_iter()
-                .find(|placement| contains(placement.pane_area, x, y))
-                .map(|placement| Placement {
+        let row = y.saturating_sub(content.y) as usize;
+        let candidates = cache.row_candidates.get(row)?;
+        for &idx in candidates {
+            let Some(placement) = cache.placements.get(idx) else {
+                continue;
+            };
+            if contains(placement.area, x, y) {
+                return Some(Placement {
                     pane_id: placement.pane_id,
-                    area: placement.pane_area,
-                    exposed: ExposedSides {
-                        top: true,
-                        bottom: true,
-                        left: true,
-                        right: true,
-                    },
+                    area: placement.area,
+                    exposed: placement.exposed,
                 });
+            }
         }
-
-        self.layout.placement_at(
-            content,
-            ExposedSides {
-                top: true,
-                bottom: true,
-                left: true,
-                right: true,
-            },
-            x,
-            y,
-        )
+        None
     }
 
     pub(crate) fn debug_layout_areas(
@@ -2602,6 +2762,7 @@ impl App {
         if user_input.is_empty() || self.commander.busy {
             return;
         }
+        self.start_commander_palette_video();
 
         if self.handle_commander_slash_command(&user_input) {
             self.commander.input.clear();
@@ -2649,11 +2810,15 @@ impl App {
                     status.push("relaunch_failed");
                 }
                 format!(
-                    "- id:{} | name:{} | type:{} | status:{}",
+                    "- id:{} | name:{} | type:{} | status:{}{}",
                     pane.id,
                     pane.title,
                     pane.command,
-                    status.join(",")
+                    status.join(","),
+                    self.agent_handoffs
+                        .get(&pane.id)
+                        .map(|handoff| format!(" | handoff:{}", format_agent_handoff(handoff)))
+                        .unwrap_or_default()
                 )
             })
             .collect::<Vec<_>>();
@@ -2662,11 +2827,35 @@ impl App {
             .filter(|preset| preset.command != COMMANDER_COMMAND)
             .map(|preset| preset.command.to_string())
             .collect::<Vec<_>>();
+        let workspace_roster = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .map(|(idx, workspace)| {
+                let status = if idx == self.active_workspace {
+                    "active"
+                } else {
+                    "inactive"
+                };
+                format!(
+                    "- {} | name:{} | status:{}",
+                    idx + 1,
+                    workspace.name,
+                    status
+                )
+            })
+            .collect::<Vec<_>>();
         let (tx, rx) = mpsc::channel();
         self.commander.rx = Some(rx);
 
         thread::spawn(move || {
-            let result = run_commander_llm(user_input, pane_names, pane_roster, agent_types);
+            let result = run_commander_llm(
+                user_input,
+                pane_names,
+                pane_roster,
+                agent_types,
+                workspace_roster,
+            );
             let _ = tx.send(result);
         });
     }
@@ -2695,6 +2884,20 @@ impl App {
                     .history
                     .push("Commander: opening settings.".to_string());
                 self.queue_tts("Opening settings.");
+            }
+            CommanderSlashCommand::CreateWorkspace(name) => {
+                let note = self
+                    .create_workspace_from_request(name.as_deref())
+                    .unwrap_or_else(|err| err);
+                self.commander.history.push(format!("Commander: {}", note));
+                self.queue_tts(&note);
+            }
+            CommanderSlashCommand::SwitchWorkspace(selector) => {
+                let note = self
+                    .switch_workspace_from_request(&selector)
+                    .unwrap_or_else(|err| err);
+                self.commander.history.push(format!("Commander: {}", note));
+                self.queue_tts(&note);
             }
         }
 
@@ -2828,6 +3031,22 @@ impl App {
             .collect::<Vec<_>>();
         let close_note = self.close_panes_from_requests(&close_requests);
 
+        let workspace_create_note = if let Some(name) = step.workspace_create.as_ref() {
+            Some(
+                self.create_workspace_from_request(name.as_deref())
+                    .unwrap_or_else(|err| err),
+            )
+        } else {
+            None
+        };
+
+        let workspace_note = step.workspace_switch.as_deref().and_then(|selector| {
+            match self.switch_workspace_from_request(selector) {
+                Ok(note) => Some(note),
+                Err(err) => Some(err),
+            }
+        });
+
         if should_refocus_commander {
             self.focus_commander_pane();
         }
@@ -2837,6 +3056,8 @@ impl App {
             creation.note.as_deref(),
             rename_note.as_deref(),
             close_note.as_deref(),
+            workspace_create_note.as_deref(),
+            workspace_note.as_deref(),
         ]
         .into_iter()
         .flatten()
@@ -3375,6 +3596,157 @@ impl App {
         }
     }
 
+    pub(crate) fn commander_palette_video_frame(&self) -> Option<&str> {
+        if self.commander_palette_video.child.is_some()
+            && !self.commander_palette_video.frame_text.trim().is_empty()
+        {
+            Some(self.commander_palette_video.frame_text.as_str())
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn set_commander_palette_video_size(&mut self, rows: u16, cols: u16) {
+        let rows = rows.max(1);
+        let cols = cols.max(1);
+        if rows == self.commander_palette_video.rows && cols == self.commander_palette_video.cols {
+            return;
+        }
+        self.commander_palette_video.rows = rows;
+        self.commander_palette_video.cols = cols;
+        self.commander_palette_video
+            .parser
+            .set_size(commander_palette_video_source_rows(rows), cols);
+        self.commander_palette_video.frame_text.clear();
+        if self.commander_palette_video.child.is_some() {
+            self.start_commander_palette_video();
+        }
+    }
+
+    fn poll_tts_events(&mut self) -> bool {
+        let Some(rx) = self.tts.event_rx.as_ref() else {
+            return false;
+        };
+        let mut saw_event = false;
+        let mut saw_speak_finished = false;
+        let mut disconnected = false;
+        loop {
+            match rx.try_recv() {
+                Ok(TtsEvent::SpeakStarted) => {
+                    saw_event = true;
+                }
+                Ok(TtsEvent::SpeakFinished) => {
+                    saw_event = true;
+                    saw_speak_finished = true;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+        if saw_speak_finished {
+            self.stop_commander_palette_video();
+        }
+        if disconnected {
+            self.tts.event_rx = None;
+        }
+        saw_event
+    }
+
+    fn poll_commander_palette_video(&mut self) -> bool {
+        let Some(rx) = self.commander_palette_video.rx.as_ref() else {
+            return false;
+        };
+        let mut updated = false;
+        loop {
+            match rx.try_recv() {
+                Ok(bytes) => {
+                    self.commander_palette_video.parser.process(&bytes);
+                    let rows: Vec<String> = {
+                        let screen = self.commander_palette_video.parser.screen();
+                        let (_, cols) = screen.size();
+                        screen.rows(0, cols).collect()
+                    };
+                    self.commander_palette_video.frame_text = normalize_commander_video_frame(
+                        rows,
+                        self.commander_palette_video.rows,
+                        self.commander_palette_video.cols,
+                    );
+                    updated = true;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.commander_palette_video.rx = None;
+                    break;
+                }
+            }
+        }
+        updated
+    }
+
+    fn start_commander_palette_video(&mut self) {
+        if self.tts.tx.is_none() {
+            return;
+        }
+        self.stop_commander_palette_video();
+
+        let bin_path = resolve_ascii_video_binary();
+        let video_path = Path::new("/home/aaron/lab/ascii-video/src/video/slash-dance.mp4");
+        let Some(bin_path) = bin_path else {
+            return;
+        };
+        if !video_path.exists() {
+            return;
+        }
+
+        let rows = self.commander_palette_video.rows.max(1);
+        let cols = self.commander_palette_video.cols.max(1);
+        // ascii-video reserves one terminal row for its status footer.
+        // Give it one extra PTY row so the visual content still fills
+        // the Commander panel while the footer lands off-screen.
+        let source_rows = commander_palette_video_source_rows(rows);
+        let command = format!(
+            "stty rows {source_rows} cols {cols}; COLUMNS={cols} LINES={source_rows} {} {}",
+            sh_quote(bin_path),
+            sh_quote(video_path)
+        );
+        let mut child = match Command::new("script")
+            .arg("-qfc")
+            .arg(command)
+            .arg("/dev/null")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => return,
+        };
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        };
+
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        thread::spawn(move || pump_commander_video_output(stdout, tx));
+
+        self.commander_palette_video.parser = vt100::Parser::new(source_rows, cols, 0);
+        self.commander_palette_video.frame_text.clear();
+        self.commander_palette_video.rx = Some(rx);
+        self.commander_palette_video.child = Some(child);
+    }
+
+    fn stop_commander_palette_video(&mut self) {
+        if let Some(mut child) = self.commander_palette_video.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.commander_palette_video.rx = None;
+        self.commander_palette_video.frame_text.clear();
+    }
+
     fn close_panes_from_requests(&mut self, requests: &[String]) -> Option<String> {
         if requests.is_empty() {
             return None;
@@ -3639,6 +4011,7 @@ impl App {
         } else {
             self.maximized_pane = Some(self.focused);
         }
+        self.rebuild_hit_test_cache();
     }
 
     pub(crate) fn is_maximized(&self) -> bool {
@@ -3654,31 +4027,21 @@ impl App {
     }
 
     fn resize_target_at(&self, size: Rect, x: u16, y: u16) -> Option<ResizeTarget> {
-        if self.maximized_pane.is_some() {
-            return None;
-        }
-
-        let mut boundaries = Vec::new();
-        if self.debug_container_boxes {
-            self.layout.collect_debug_resize_boundaries(
-                Self::content_area(size),
-                0,
-                &mut boundaries,
-            );
-        } else {
-            self.layout
-                .collect_resize_boundaries(Self::content_area(size), 0, &mut boundaries);
-        }
-
+        let content = Self::content_area(size);
+        let boundaries = self
+            .hit_test_cache
+            .as_ref()
+            .filter(|cache| cache.content == content)
+            .map(|cache| &cache.resize_boundaries)?;
         let boundary = boundaries
-            .into_iter()
+            .iter()
             .filter(|boundary| resize_boundary_hit(boundary, x, y))
             .min_by_key(|boundary| boundary.depth)?;
 
         let pane_a = *boundary.first_pane_ids.first()?;
         let pane_b = *boundary.second_pane_ids.first()?;
-        let mut pane_ids = boundary.first_pane_ids;
-        pane_ids.extend(boundary.second_pane_ids);
+        let mut pane_ids = boundary.first_pane_ids.clone();
+        pane_ids.extend(boundary.second_pane_ids.iter().copied());
 
         Some(ResizeTarget {
             pane_a,
@@ -3686,6 +4049,72 @@ impl App {
             direction: boundary.direction,
             pane_ids,
         })
+    }
+
+    fn rebuild_hit_test_cache(&mut self) {
+        let content = Self::content_area(self.last_terminal_size);
+        let placements = if let Some(pane_id) = self.maximized_pane {
+            vec![Placement {
+                pane_id,
+                area: content,
+                exposed: ExposedSides {
+                    top: true,
+                    bottom: true,
+                    left: true,
+                    right: true,
+                },
+            }]
+        } else if self.debug_container_boxes {
+            self.debug_layout_areas(content)
+                .1
+                .into_iter()
+                .map(|placement| Placement {
+                    pane_id: placement.pane_id,
+                    area: placement.pane_area,
+                    exposed: ExposedSides {
+                        top: true,
+                        bottom: true,
+                        left: true,
+                        right: true,
+                    },
+                })
+                .collect()
+        } else {
+            self.pane_placements(content)
+        };
+
+        let mut row_candidates = vec![Vec::new(); content.height as usize];
+        for (idx, placement) in placements.iter().enumerate() {
+            let start = placement.area.y.saturating_sub(content.y) as usize;
+            let end = placement
+                .area
+                .bottom()
+                .saturating_sub(content.y)
+                .min(content.height) as usize;
+            for row in start..end {
+                if let Some(bucket) = row_candidates.get_mut(row) {
+                    bucket.push(idx);
+                }
+            }
+        }
+
+        let mut resize_boundaries = Vec::new();
+        if self.maximized_pane.is_none() {
+            if self.debug_container_boxes {
+                self.layout
+                    .collect_debug_resize_boundaries(content, 0, &mut resize_boundaries);
+            } else {
+                self.layout
+                    .collect_resize_boundaries(content, 0, &mut resize_boundaries);
+            }
+        }
+
+        self.hit_test_cache = Some(HitTestCache {
+            content,
+            placements,
+            row_candidates,
+            resize_boundaries,
+        });
     }
 
     fn resize_between_panes(
@@ -3774,6 +4203,7 @@ fn run_commander_llm(
     pane_names: Vec<String>,
     pane_roster: Vec<String>,
     agent_types: Vec<String>,
+    workspace_roster: Vec<String>,
 ) -> CommanderWorkerResult {
     let pane_list = pane_names
         .iter()
@@ -3786,36 +4216,44 @@ fn run_commander_llm(
         .map(|name| format!("- {}", name))
         .collect::<Vec<_>>()
         .join("\n");
+    let workspace_list = workspace_roster.join("\n");
 
     let prompt = format!(
         "You are a command router for a terminal multiplexer.\n\
          Available pane names (match one exactly):\n{pane_list}\n\
          Current pane roster with status metadata:\n{pane_status_list}\n\
          Available pane types for creation (canonical command tokens):\n{agent_list}\n\
+         Available workspaces:\n{workspace_list}\n\
          Speech aliases: codecs/code-ex/codacs => codex, open code/open-code => opencode.\n\n\
          User request:\n{user_input}\n\n\
          If the request has multiple parts, dependencies, or sequencing (for example \"do X, then Y\"), decompose it into ordered steps.\n\
          Return either:\n\
-         1) EXACTLY these 7 lines and nothing else (single-step mode):\n\
-         ACTION=<SEND|TASK|CREATE|CREATE_AND_SEND|CREATE_AND_TASK|RENAME|RENAME_AND_SEND|RENAME_AND_TASK|CLOSE|CLOSE_AND_SEND|CLOSE_AND_TASK|CREATE_AND_RENAME|CREATE_RENAME_AND_SEND|CREATE_RENAME_AND_TASK|CREATE_AND_CLOSE|CREATE_CLOSE_AND_SEND|CREATE_CLOSE_AND_TASK|RENAME_AND_CLOSE|RENAME_CLOSE_AND_SEND|RENAME_CLOSE_AND_TASK|CREATE_RENAME_AND_CLOSE|CREATE_RENAME_CLOSE_AND_SEND|CREATE_RENAME_CLOSE_AND_TASK|REPLY>\n\
+         1) EXACTLY these 9 lines and nothing else (single-step mode):\n\
+         ACTION=<SEND|TASK|CREATE|CREATE_AND_SEND|CREATE_AND_TASK|RENAME|RENAME_AND_SEND|RENAME_AND_TASK|CLOSE|CLOSE_AND_SEND|CLOSE_AND_TASK|CREATE_AND_RENAME|CREATE_RENAME_AND_SEND|CREATE_RENAME_AND_TASK|CREATE_AND_CLOSE|CREATE_CLOSE_AND_SEND|CREATE_CLOSE_AND_TASK|RENAME_AND_CLOSE|RENAME_CLOSE_AND_SEND|RENAME_CLOSE_AND_TASK|CREATE_RENAME_AND_CLOSE|CREATE_RENAME_CLOSE_AND_SEND|CREATE_RENAME_CLOSE_AND_TASK|SWITCH_WORKSPACE|CREATE_WORKSPACE|REPLY>\n\
          TARGET=<pane selector or NONE; selectors may be exact pane names, new, all, focused, id:<pane-id>, status:<focused|running|exited|relaunch_failed|worker|new>, or type:<command>>\n\
          MESSAGE=<text to send to target pane or NONE; it must be the exact text for that target>\n\
          SPEECH=<short spoken summary for TTS or NONE; summarize the actual result in natural language and avoid task labels/system wording>\n\
          CREATE=<comma-separated agent:count pairs using canonical type names (e.g. codex:2,opencode:1) or NONE>\n\
          RENAME=<comma-separated selector=>new name pairs (e.g. focused=>Plan,id:2=>Backend) or NONE>\n\
-         CLOSE=<comma-separated selectors or NONE; selectors may be exact pane names, id:<pane-id>, status:<focused|running|exited|relaunch_failed|commander|worker>, or type:<command>>\n\n\
-         2) OR one or more ordered step blocks (multi-step mode), each block with EXACTLY these 9 lines:\n\
+         CLOSE=<comma-separated selectors or NONE; selectors may be exact pane names, id:<pane-id>, status:<focused|running|exited|relaunch_failed|commander|worker>, or type:<command>>\n\
+         NEW_WORKSPACE=<workspace name or NONE; use NONE for the default workspace name>\n\
+         WORKSPACE=<workspace selector or NONE; selectors may be exact workspace name, workspace number, next, previous, current>\n\n\
+         2) OR one or more ordered step blocks (multi-step mode), each block with EXACTLY these 11 lines:\n\
          STEP=<short id>\n\
-         ACTION=<SEND|TASK|CREATE|CREATE_AND_SEND|CREATE_AND_TASK|RENAME|RENAME_AND_SEND|RENAME_AND_TASK|CLOSE|CLOSE_AND_SEND|CLOSE_AND_TASK|CREATE_AND_RENAME|CREATE_RENAME_AND_SEND|CREATE_RENAME_AND_TASK|CREATE_AND_CLOSE|CREATE_CLOSE_AND_SEND|CREATE_CLOSE_AND_TASK|RENAME_AND_CLOSE|RENAME_CLOSE_AND_SEND|RENAME_CLOSE_AND_TASK|CREATE_RENAME_AND_CLOSE|CREATE_RENAME_CLOSE_AND_SEND|CREATE_RENAME_CLOSE_AND_TASK|REPLY>\n\
+         ACTION=<SEND|TASK|CREATE|CREATE_AND_SEND|CREATE_AND_TASK|RENAME|RENAME_AND_SEND|RENAME_AND_TASK|CLOSE|CLOSE_AND_SEND|CLOSE_AND_TASK|CREATE_AND_RENAME|CREATE_RENAME_AND_SEND|CREATE_RENAME_AND_TASK|CREATE_AND_CLOSE|CREATE_CLOSE_AND_SEND|CREATE_CLOSE_AND_TASK|RENAME_AND_CLOSE|RENAME_CLOSE_AND_SEND|RENAME_CLOSE_AND_TASK|CREATE_RENAME_AND_CLOSE|CREATE_RENAME_CLOSE_AND_SEND|CREATE_RENAME_CLOSE_AND_TASK|SWITCH_WORKSPACE|CREATE_WORKSPACE|REPLY>\n\
          TARGET=<pane selector or NONE; supports ref:<name> and ref:last in addition to normal selectors>\n\
          MESSAGE=<text or NONE>\n\
          SPEECH=<short spoken summary for TTS or NONE; summarize the actual result in natural language and avoid task labels/system wording>\n\
          CREATE=<agent:count list or NONE>\n\
          RENAME=<selector=>new name list or NONE; selectors can include ref:<name> and ref:last>\n\
          CLOSE=<selector list or NONE; selectors can include ref:<name> and ref:last>\n\
+         NEW_WORKSPACE=<workspace name or NONE>\n\
+         WORKSPACE=<workspace selector or NONE>\n\
          SAVE=<reference name for panes created by this step, or NONE>\n\
          In multi-step mode, put steps in execution order and do not include any text outside the step blocks.\n\
          If the user asks to rename a pane, put the rename request in RENAME and keep MESSAGE as NONE unless they also asked to send text.\n\
+         If the user asks to switch workspaces, use ACTION=SWITCH_WORKSPACE, put the target workspace in WORKSPACE, and keep MESSAGE as NONE unless they also asked to send text.\n\
+         If the user asks to create a new workspace, use ACTION=CREATE_WORKSPACE, put the requested name in NEW_WORKSPACE or NONE, and keep MESSAGE as NONE unless they also asked to send text.\n\
          Use ACTION=REPLY when no pane operations are needed and you should answer directly.\n\
          For ACTION=REPLY, set TARGET=NONE and put the spoken reply in MESSAGE using this style: warm and natural, contractions only, 1-3 words for simple confirmations, one short sentence for status/questions, no formal filler.\n\
          Use MESSAGE as the exact text for the target pane. Do not wrap it in task instructions, labels, or metadata.\n\
@@ -3862,6 +4300,8 @@ fn parse_commander_router_output(text: &str) -> Option<CommanderWorkerResult> {
     let mut create = None::<String>;
     let mut rename = None::<String>;
     let mut close = None::<String>;
+    let mut new_workspace = None::<String>;
+    let mut workspace = None::<String>;
 
     for line in text.lines() {
         let trimmed = line.trim();
@@ -3879,6 +4319,10 @@ fn parse_commander_router_output(text: &str) -> Option<CommanderWorkerResult> {
             rename = Some(value.to_string());
         } else if let Some(value) = trimmed.strip_prefix("CLOSE=") {
             close = Some(value.trim().to_string());
+        } else if let Some(value) = trimmed.strip_prefix("NEW_WORKSPACE=") {
+            new_workspace = Some(value.trim().to_string());
+        } else if let Some(value) = trimmed.strip_prefix("WORKSPACE=") {
+            workspace = Some(value.trim().to_string());
         }
     }
 
@@ -3897,6 +4341,15 @@ fn parse_commander_router_output(text: &str) -> Option<CommanderWorkerResult> {
         .as_deref()
         .map(parse_close_requests)
         .unwrap_or_default();
+    let workspace_create = (action
+        .as_deref()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("CREATE_WORKSPACE")))
+    .then(|| {
+        new_workspace
+            .as_deref()
+            .and_then(parse_workspace_create_name)
+    });
+    let workspace_switch = workspace.as_deref().and_then(parse_workspace_switch);
     let action = action.unwrap_or_default().to_ascii_uppercase();
     let target = target.unwrap_or_default();
     let message = message.unwrap_or_default();
@@ -3912,6 +4365,8 @@ fn parse_commander_router_output(text: &str) -> Option<CommanderWorkerResult> {
         && !message.is_empty()
         && action != "CREATE"
         && action != "CLOSE"
+        && action != "SWITCH_WORKSPACE"
+        && action != "CREATE_WORKSPACE"
         && action != "REPLY";
 
     Some(CommanderWorkerResult {
@@ -3924,6 +4379,8 @@ fn parse_commander_router_output(text: &str) -> Option<CommanderWorkerResult> {
         create_requests,
         rename_requests,
         close_requests,
+        workspace_switch,
+        workspace_create,
     })
 }
 
@@ -3955,7 +4412,16 @@ fn parse_commander_step_blocks(text: &str) -> Vec<CommanderExecutionStep> {
         let key = key.trim().to_ascii_uppercase();
         if matches!(
             key.as_str(),
-            "ACTION" | "TARGET" | "MESSAGE" | "SPEECH" | "CREATE" | "RENAME" | "CLOSE" | "SAVE"
+            "ACTION"
+                | "TARGET"
+                | "MESSAGE"
+                | "SPEECH"
+                | "CREATE"
+                | "RENAME"
+                | "CLOSE"
+                | "SAVE"
+                | "NEW_WORKSPACE"
+                | "WORKSPACE"
         ) {
             fields.insert(key, value.trim().to_string());
         }
@@ -4001,6 +4467,8 @@ fn build_commander_step_from_fields(
         && !message.is_empty()
         && action != "CREATE"
         && action != "CLOSE"
+        && action != "SWITCH_WORKSPACE"
+        && action != "CREATE_WORKSPACE"
         && action != "REPLY";
 
     let create_requests = fields
@@ -4015,6 +4483,14 @@ fn build_commander_step_from_fields(
         .get("CLOSE")
         .map(|value| parse_close_requests(value))
         .unwrap_or_default();
+    let workspace_create = (action == "CREATE_WORKSPACE").then(|| {
+        fields
+            .get("NEW_WORKSPACE")
+            .and_then(|value| parse_workspace_create_name(value))
+    });
+    let workspace_switch = fields
+        .get("WORKSPACE")
+        .and_then(|value| parse_workspace_switch(value));
     let save_as = fields.get("SAVE").and_then(|value| {
         let trimmed = value.trim();
         if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
@@ -4034,6 +4510,8 @@ fn build_commander_step_from_fields(
         create_requests,
         rename_requests,
         close_requests,
+        workspace_switch,
+        workspace_create,
     })
 }
 
@@ -4060,6 +4538,113 @@ fn normalize_commander_reply_text(message: &str) -> Option<String> {
     }
 }
 
+fn parse_agent_handoff(text: &str) -> Option<AgentHandoff> {
+    let mut latest_block = None::<String>;
+    let mut current_block = None::<Vec<String>>;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed == "COMMANDER_HANDOFF" {
+            current_block = Some(Vec::new());
+            continue;
+        }
+        if trimmed == "END_COMMANDER_HANDOFF" {
+            if let Some(lines) = current_block.take() {
+                latest_block = Some(lines.join("\n"));
+            }
+            continue;
+        }
+        if let Some(lines) = current_block.as_mut() {
+            lines.push(line.to_string());
+        }
+    }
+
+    let block = latest_block?;
+    let mut status = None;
+    let mut summary = None;
+    let mut changed_files = None;
+    let mut tests = None;
+    let mut risks = None;
+    let mut next = None;
+
+    for line in block.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim();
+        match key.as_str() {
+            "status" => status = parse_handoff_status(value),
+            "summary" => summary = Some(value.to_string()),
+            "changed_files" => changed_files = Some(parse_handoff_changed_files(value)),
+            "tests" => tests = Some(value.to_string()),
+            "risks" => risks = Some(value.to_string()),
+            "next" => next = Some(value.to_string()),
+            _ => {}
+        }
+    }
+
+    Some(AgentHandoff {
+        status: status?,
+        summary: summary.unwrap_or_default(),
+        changed_files: changed_files.unwrap_or_default(),
+        tests: tests.unwrap_or_default(),
+        risks: risks.unwrap_or_default(),
+        next: next.unwrap_or_default(),
+    })
+}
+
+fn parse_handoff_status(value: &str) -> Option<HandoffStatus> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "success" => Some(HandoffStatus::Success),
+        "questionable" => Some(HandoffStatus::Questionable),
+        "failed" => Some(HandoffStatus::Failed),
+        "needs_tests" | "needs tests" | "needs-testing" => Some(HandoffStatus::NeedsTests),
+        "blocked" => Some(HandoffStatus::Blocked),
+        _ => None,
+    }
+}
+
+fn parse_handoff_changed_files(value: &str) -> Vec<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+        return Vec::new();
+    }
+    trimmed
+        .split(',')
+        .map(str::trim)
+        .filter(|path| !path.is_empty() && !path.eq_ignore_ascii_case("none"))
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn format_agent_handoff(handoff: &AgentHandoff) -> String {
+    let files = if handoff.changed_files.is_empty() {
+        "none".to_string()
+    } else {
+        handoff.changed_files.join(",")
+    };
+    format!(
+        "status={}, summary={}, files={}, tests={}, risks={}, next={}",
+        format_handoff_status(handoff.status),
+        handoff.summary,
+        files,
+        handoff.tests,
+        handoff.risks,
+        handoff.next
+    )
+}
+
+fn format_handoff_status(status: HandoffStatus) -> &'static str {
+    match status {
+        HandoffStatus::Success => "success",
+        HandoffStatus::Questionable => "questionable",
+        HandoffStatus::Failed => "failed",
+        HandoffStatus::NeedsTests => "needs_tests",
+        HandoffStatus::Blocked => "blocked",
+    }
+}
+
 fn build_outgoing_payload(
     payload: &str,
     submit_payload: bool,
@@ -4072,11 +4657,36 @@ fn build_outgoing_payload(
         return payload.to_string();
     }
 
-    if pane_command == LOGIN_SHELL_SENTINEL || pane_count <= 1 {
+    if pane_command == LOGIN_SHELL_SENTINEL {
         return payload.to_string();
     }
 
-    build_sharded_task_prompt(payload, shard_index, pane_count, pane_name, pane_command)
+    if pane_count <= 1 {
+        return append_commander_handoff_contract(payload);
+    }
+
+    append_commander_handoff_contract(&build_sharded_task_prompt(
+        payload,
+        shard_index,
+        pane_count,
+        pane_name,
+        pane_command,
+    ))
+}
+
+fn append_commander_handoff_contract(payload: &str) -> String {
+    format!(
+        "{}\n\nWhen finished, end with exactly this handoff block:\n\
+COMMANDER_HANDOFF\n\
+status: success|questionable|failed|needs_tests|blocked\n\
+summary: <short result>\n\
+changed_files: <paths or none>\n\
+tests: <tests run and result, or not run>\n\
+risks: <remaining concerns or none>\n\
+next: <recommended next action or none>\n\
+END_COMMANDER_HANDOFF",
+        payload.trim_end()
+    )
 }
 
 fn build_sharded_task_prompt(
@@ -4124,23 +4734,62 @@ fn parse_commander_slash_command(input: &str) -> Option<CommanderSlashCommand> {
     let trimmed = input.trim();
     let command = trimmed.strip_prefix('/')?.trim();
     let normalized = command.to_ascii_lowercase();
+    let workspace_arg = command
+        .strip_prefix("workspace ")
+        .or_else(|| command.strip_prefix("workspace:"))
+        .map(str::trim);
+    if let Some(arg) = workspace_arg {
+        if arg.eq_ignore_ascii_case("new") {
+            return Some(CommanderSlashCommand::CreateWorkspace(None));
+        }
+        if let Some(name) = arg.strip_prefix("new ").map(str::trim) {
+            return Some(CommanderSlashCommand::CreateWorkspace(
+                parse_workspace_create_name(name),
+            ));
+        }
+        if let Some(name) = arg.strip_prefix("create ").map(str::trim) {
+            return Some(CommanderSlashCommand::CreateWorkspace(
+                parse_workspace_create_name(name),
+            ));
+        }
+    }
 
     match normalized.as_str() {
         "theme" => Some(CommanderSlashCommand::OpenTheme),
         "settings" => Some(CommanderSlashCommand::OpenSettings),
-        _ => None,
+        "new workspace" | "create workspace" | "workspace new" => {
+            Some(CommanderSlashCommand::CreateWorkspace(None))
+        }
+        _ => normalized
+            .strip_prefix("workspace ")
+            .or_else(|| normalized.strip_prefix("workspace:"))
+            .or_else(|| normalized.strip_prefix("switch "))
+            .map(str::trim)
+            .filter(|selector| !selector.is_empty())
+            .map(|selector| CommanderSlashCommand::SwitchWorkspace(selector.to_string())),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::agent_command_for_input;
 
     #[test]
     fn outgoing_payload_is_forwarded_verbatim() {
-        let outgoing = build_outgoing_payload("df -h", true, 1, 1, "terminal", "codex");
+        let outgoing =
+            build_outgoing_payload("df -h", true, 1, 1, "terminal", LOGIN_SHELL_SENTINEL);
 
         assert_eq!(outgoing, "df -h");
+    }
+
+    #[test]
+    fn agent_task_payload_gets_handoff_contract() {
+        let outgoing = build_outgoing_payload("Refactor the parser.", true, 1, 1, "alpha", "codex");
+
+        assert!(outgoing.contains("Refactor the parser."));
+        assert!(outgoing.contains("COMMANDER_HANDOFF"));
+        assert!(outgoing.contains("END_COMMANDER_HANDOFF"));
     }
 
     #[test]
@@ -4156,12 +4805,50 @@ mod tests {
     }
 
     #[test]
+    fn agent_input_aliases_map_to_canonical_command() {
+        assert_eq!(agent_command_for_input("codex"), Some("codex"));
+        assert_eq!(agent_command_for_input("open code"), Some("opencode"));
+        assert_eq!(agent_command_for_input("pi"), Some("pi"));
+        assert_eq!(agent_command_for_input("shell"), Some(LOGIN_SHELL_SENTINEL));
+        assert_eq!(agent_command_for_input("unknown"), None);
+    }
+
+    #[test]
     fn sharded_agent_payload_gets_distinct_role_prompt() {
         let outgoing = build_outgoing_payload("Refactor the parser.", true, 3, 2, "beta", "codex");
 
         assert!(outgoing.contains("Shard: 2/3"));
         assert!(outgoing.contains("Role: implement a distinct slice of the task"));
         assert!(outgoing.contains("Work only on your distinct slice"));
+        assert!(outgoing.contains("COMMANDER_HANDOFF"));
+    }
+
+    #[test]
+    fn parses_latest_agent_handoff_block() {
+        let handoff = parse_agent_handoff(
+            "COMMANDER_HANDOFF\n\
+             status: failed\n\
+             summary: old\n\
+             changed_files: none\n\
+             tests: not run\n\
+             risks: stale\n\
+             next: retry\n\
+             END_COMMANDER_HANDOFF\n\
+             COMMANDER_HANDOFF\n\
+             status: needs_tests\n\
+             summary: Implemented parser changes.\n\
+             changed_files: src/app.rs, src/pane.rs\n\
+             tests: cargo test commander_ --bin split_tui passed\n\
+             risks: Needs full test suite.\n\
+             next: Run cargo test.\n\
+             END_COMMANDER_HANDOFF",
+        )
+        .expect("expected handoff");
+
+        assert_eq!(handoff.status, HandoffStatus::NeedsTests);
+        assert_eq!(handoff.summary, "Implemented parser changes.");
+        assert_eq!(handoff.changed_files, vec!["src/app.rs", "src/pane.rs"]);
+        assert_eq!(handoff.next, "Run cargo test.");
     }
 
     #[test]
@@ -4174,7 +4861,111 @@ mod tests {
             parse_commander_slash_command("/settings"),
             Some(CommanderSlashCommand::OpenSettings)
         ));
+        assert!(matches!(
+            parse_commander_slash_command("/workspace 2"),
+            Some(CommanderSlashCommand::SwitchWorkspace(selector)) if selector == "2"
+        ));
+        assert!(matches!(
+            parse_commander_slash_command("/switch next"),
+            Some(CommanderSlashCommand::SwitchWorkspace(selector)) if selector == "next"
+        ));
+        assert!(matches!(
+            parse_commander_slash_command("/workspace new"),
+            Some(CommanderSlashCommand::CreateWorkspace(None))
+        ));
+        assert!(matches!(
+            parse_commander_slash_command("/workspace new Research"),
+            Some(CommanderSlashCommand::CreateWorkspace(Some(name))) if name == "Research"
+        ));
         assert!(parse_commander_slash_command("theme").is_none());
+    }
+
+    #[test]
+    fn commander_single_step_parses_workspace_switch() {
+        let result = parse_commander_router_output(
+            "ACTION=SWITCH_WORKSPACE\n\
+             TARGET=NONE\n\
+             MESSAGE=NONE\n\
+             SPEECH=Switched workspaces.\n\
+             CREATE=NONE\n\
+             RENAME=NONE\n\
+             CLOSE=NONE\n\
+             NEW_WORKSPACE=NONE\n\
+             WORKSPACE=Research",
+        )
+        .expect("expected router result");
+
+        assert_eq!(result.workspace_switch.as_deref(), Some("Research"));
+        assert!(result.target_name.is_none());
+    }
+
+    #[test]
+    fn commander_step_parses_workspace_switch() {
+        let result = parse_commander_router_output(
+            "STEP=switch\n\
+             ACTION=SWITCH_WORKSPACE\n\
+             TARGET=NONE\n\
+             MESSAGE=NONE\n\
+             SPEECH=Switched workspaces.\n\
+             CREATE=NONE\n\
+             RENAME=NONE\n\
+             CLOSE=NONE\n\
+             NEW_WORKSPACE=NONE\n\
+             WORKSPACE=next\n\
+             SAVE=NONE",
+        )
+        .expect("expected router result");
+
+        assert_eq!(result.steps.len(), 1);
+        assert_eq!(result.steps[0].workspace_switch.as_deref(), Some("next"));
+        assert!(result.steps[0].target_name.is_none());
+    }
+
+    #[test]
+    fn commander_single_step_parses_workspace_create() {
+        let result = parse_commander_router_output(
+            "ACTION=CREATE_WORKSPACE\n\
+             TARGET=NONE\n\
+             MESSAGE=NONE\n\
+             SPEECH=Created a workspace.\n\
+             CREATE=NONE\n\
+             RENAME=NONE\n\
+             CLOSE=NONE\n\
+             NEW_WORKSPACE=Research\n\
+             WORKSPACE=NONE",
+        )
+        .expect("expected router result");
+
+        assert_eq!(
+            result
+                .workspace_create
+                .as_ref()
+                .and_then(|name| name.as_deref()),
+            Some("Research")
+        );
+        assert!(result.target_name.is_none());
+    }
+
+    #[test]
+    fn commander_step_parses_workspace_create() {
+        let result = parse_commander_router_output(
+            "STEP=create-workspace\n\
+             ACTION=CREATE_WORKSPACE\n\
+             TARGET=NONE\n\
+             MESSAGE=NONE\n\
+             SPEECH=Created a workspace.\n\
+             CREATE=NONE\n\
+             RENAME=NONE\n\
+             CLOSE=NONE\n\
+             NEW_WORKSPACE=NONE\n\
+             WORKSPACE=NONE\n\
+             SAVE=NONE",
+        )
+        .expect("expected router result");
+
+        assert_eq!(result.steps.len(), 1);
+        assert_eq!(result.steps[0].workspace_create, Some(None));
+        assert!(result.steps[0].target_name.is_none());
     }
 
     #[test]
@@ -4194,12 +4985,19 @@ mod tests {
 
 fn init_tts_state() -> TtsState {
     if !parse_bool_env_with_default("CODEUI_TTS", true) {
-        return TtsState { tx: None };
+        return TtsState {
+            tx: None,
+            event_rx: None,
+        };
     }
     let (tx, rx) = mpsc::channel::<String>();
+    let (event_tx, event_rx) = mpsc::channel::<TtsEvent>();
     let config = tts_config_from_env();
-    thread::spawn(move || run_tts_worker(rx, config));
-    TtsState { tx: Some(tx) }
+    thread::spawn(move || run_tts_worker(rx, event_tx, config));
+    TtsState {
+        tx: Some(tx),
+        event_rx: Some(event_rx),
+    }
 }
 
 fn tts_config_from_env() -> TtsConfig {
@@ -4218,15 +5016,83 @@ fn tts_config_from_env() -> TtsConfig {
     }
 }
 
-fn run_tts_worker(rx: Receiver<String>, config: TtsConfig) {
+fn run_tts_worker(rx: Receiver<String>, event_tx: Sender<TtsEvent>, config: TtsConfig) {
     for text in rx {
         if text.trim().is_empty() {
             continue;
         }
+        let _ = event_tx.send(TtsEvent::SpeakStarted);
         if speak_with_edge_tts(&text, &config) {
+            let _ = event_tx.send(TtsEvent::SpeakFinished);
             continue;
         }
         let _ = Command::new("espeak").arg(&text).status();
+        let _ = event_tx.send(TtsEvent::SpeakFinished);
+    }
+}
+
+fn resolve_ascii_video_binary() -> Option<&'static Path> {
+    let release = Path::new("/home/aaron/lab/ascii-video/target/release/ascii-video");
+    if release.exists() {
+        return Some(release);
+    }
+    let debug = Path::new("/home/aaron/lab/ascii-video/target/debug/ascii-video");
+    if debug.exists() {
+        return Some(debug);
+    }
+    None
+}
+
+fn commander_palette_video_source_rows(rows: u16) -> u16 {
+    rows.saturating_add(1)
+}
+
+fn normalize_commander_video_frame(
+    rows: Vec<String>,
+    target_rows: u16,
+    target_cols: u16,
+) -> String {
+    let target_rows = target_rows.max(1) as usize;
+    let target_cols = target_cols.max(1) as usize;
+    let mut normalized = Vec::with_capacity(target_rows);
+
+    for row in rows.into_iter().take(target_rows) {
+        normalized.push(fit_commander_video_row(row, target_cols));
+    }
+
+    while normalized.len() < target_rows {
+        normalized.push(" ".repeat(target_cols));
+    }
+
+    normalized.join("\n")
+}
+
+fn fit_commander_video_row(row: String, target_cols: usize) -> String {
+    let mut out: String = row.chars().take(target_cols).collect();
+    let width = out.chars().count();
+    if width < target_cols {
+        out.extend(std::iter::repeat_n(' ', target_cols - width));
+    }
+    out
+}
+
+fn sh_quote(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    format!("'{}'", raw.replace('\'', "'\"'\"'"))
+}
+
+fn pump_commander_video_output(mut reader: impl Read + Send + 'static, tx: Sender<Vec<u8>>) {
+    let mut buf = vec![0u8; 4096];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if tx.send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
     }
 }
 
@@ -4382,6 +5248,27 @@ fn parse_close_requests(text: &str) -> Vec<String> {
         .filter(|token| !token.is_empty())
         .map(ToString::to_string)
         .collect()
+}
+
+fn parse_workspace_switch(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn parse_workspace_create_name(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("none")
+        || trimmed.eq_ignore_ascii_case("new")
+    {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 fn parse_rename_requests(text: &str) -> Vec<(String, String)> {

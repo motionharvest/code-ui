@@ -2,12 +2,13 @@ use std::{
     fs::File,
     io::{Read, Write},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    process::Command,
     sync::mpsc::{self, Receiver, TryRecvError},
     thread,
 };
 
 use crate::{
-    ui::agent_binary_for_command,
+    ui::{agent_binary_for_command, agent_command_for_input},
     utils::{resolve_login_shell_command, LOGIN_SHELL_SENTINEL},
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton};
@@ -62,6 +63,7 @@ pub(crate) struct Pane {
     writer: File,
     rx: Receiver<Vec<u8>>,
     child: Pid,
+    tmux_session: String,
     pub(crate) cols: u16,
     pub(crate) rows: u16,
     pub(crate) scrollback: usize,
@@ -93,12 +95,15 @@ impl Pane {
         cols: u16,
     ) -> anyhow::Result<Self> {
         let command: String = command.into();
-        // What we actually exec: the resume hint if we have one, otherwise the
-        // canonical agent command (resolved through the shell sentinel).
-        let exec_line = match resume_command.as_deref() {
+        // What we actually run inside the persistent tmux session: the resume
+        // hint if we have one, otherwise the canonical agent command.
+        let pane_command = match resume_command.as_deref() {
             Some(line) => line.to_string(),
             None => resolve_login_shell_command(&command),
         };
+        let tmux_session = tmux_session_name(id);
+        ensure_tmux_session(&tmux_session, &pane_command)?;
+        let exec_line = format!("tmux attach-session -t {}", shell_quote(&tmux_session));
         let agent_binary = agent_binary_for_command(&command);
         let ws = Winsize {
             ws_row: rows,
@@ -134,6 +139,7 @@ impl Pane {
                     writer,
                     rx,
                     child,
+                    tmux_session,
                     cols,
                     rows,
                     scrollback: 0,
@@ -144,6 +150,7 @@ impl Pane {
                     cached_view: None,
                     view_dirty: true,
                 };
+                pane.replay_tmux_history();
                 pane.sync_scrollback();
                 Ok(pane)
             }
@@ -205,13 +212,12 @@ impl Pane {
         processed
     }
 
-    /// Send SIGTERM to the child process group. Used by the graceful-shutdown
-    /// path to give the agent a chance to print its resume hint before we
-    /// tear everything down.
-    pub(crate) fn request_exit(&self) {
-        unsafe {
-            libc::kill(self.child.as_raw(), libc::SIGTERM);
-        }
+    /// Permanently close the persistent session backing this pane. This is
+    /// used when the user closes/replaces a pane, not when the whole app exits.
+    pub(crate) fn terminate_session(&self) {
+        let _ = Command::new("tmux")
+            .args(["kill-session", "-t", &self.tmux_session])
+            .status();
     }
 
     /// Spawn a fresh login shell into this pane, replacing the previous PTY
@@ -248,6 +254,30 @@ impl Pane {
         // Drop sends SIGTERM/waitpid for the old (already-exited) child.
         *self = new;
         Ok(())
+    }
+
+    fn replay_tmux_history(&mut self) {
+        let Ok(output) = Command::new("tmux")
+            .args([
+                "capture-pane",
+                "-p",
+                "-e",
+                "-S",
+                "-2000",
+                "-t",
+                &self.tmux_session,
+            ])
+            .output()
+        else {
+            return;
+        };
+        if output.status.success() && !output.stdout.is_empty() {
+            self.parser.process(&output.stdout);
+            if !output.stdout.ends_with(b"\n") {
+                self.parser.process(b"\n");
+            }
+            self.view_dirty = true;
+        }
     }
 
     /// Best-effort: scan whatever is currently on screen and store a resume
@@ -492,8 +522,16 @@ impl Pane {
         if !command.is_empty() {
             self.last_command = Some(command.to_string());
             self.last_replayed_command = None;
+            if let Some(agent_command) = agent_command_for_input(command) {
+                self.set_command(agent_command.to_string());
+            }
         }
         self.clear_pending_input();
+    }
+
+    pub(crate) fn set_command(&mut self, command: String) {
+        self.command = command;
+        self.agent_binary = agent_binary_for_command(&self.command);
     }
 
     fn insert_tracked_text(&mut self, text: &str) {
@@ -630,6 +668,18 @@ impl Pane {
             end_row,
             end_col.saturating_add(1),
         )
+    }
+
+    pub(crate) fn recent_plain_text(&mut self) -> String {
+        let saved = self.scrollback;
+        self.parser.set_scrollback(0);
+        let rows: Vec<String> = {
+            let screen = self.parser.screen();
+            let (_, cols) = screen.size();
+            screen.rows(0, cols).collect()
+        };
+        self.parser.set_scrollback(saved);
+        rows.join("\n")
     }
 
     fn build_styled_view(&self, selection: Option<PaneSelection>) -> Text<'static> {
@@ -836,6 +886,52 @@ fn pump_pty_output(mut reader: File, tx: mpsc::Sender<Vec<u8>>) {
             Err(_) => break,
         }
     }
+}
+
+fn ensure_tmux_session(session: &str, command: &str) -> anyhow::Result<()> {
+    let has_session = Command::new("tmux")
+        .args(["has-session", "-t", session])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if has_session {
+        return Ok(());
+    }
+
+    let status = Command::new("tmux")
+        .args(["new-session", "-d", "-s", session, command])
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("failed to create tmux session {session}");
+    }
+}
+
+fn tmux_session_name(pane_id: usize) -> String {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in cwd.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("codeui-{hash:016x}-pane-{pane_id}")
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    let mut out = String::from("'");
+    for ch in value.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 fn exec_command(command: &str) -> ! {
