@@ -2,9 +2,10 @@ use std::{
     fs::File,
     io::{Read, Write},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
-    process::Command,
+    process::{Command, Stdio},
     sync::mpsc::{self, Receiver, TryRecvError},
     thread,
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -73,6 +74,7 @@ pub(crate) struct Pane {
     input_cursor: usize,
     cached_view: Option<Text<'static>>,
     view_dirty: bool,
+    first_paint_pending: bool,
 }
 
 impl Drop for Pane {
@@ -103,7 +105,16 @@ impl Pane {
         };
         let tmux_session = tmux_session_name(id);
         ensure_tmux_session(&tmux_session, &pane_command)?;
-        let exec_line = format!("tmux attach-session -t {}", shell_quote(&tmux_session));
+        let session_q = shell_quote(&tmux_session);
+        let command_q = shell_quote(&pane_command);
+        let exec_line = format!(
+            "tmux attach-session -t {session} 2>/dev/null || \
+             (tmux new-session -d -s {session} {command} >/dev/null 2>&1 && \
+              tmux set-option -t {session} status off >/dev/null 2>&1 && \
+              tmux attach-session -t {session} 2>/dev/null)",
+            session = session_q,
+            command = command_q
+        );
         let agent_binary = agent_binary_for_command(&command);
         let ws = Winsize {
             ws_row: rows,
@@ -149,6 +160,7 @@ impl Pane {
                     input_cursor: 0,
                     cached_view: None,
                     view_dirty: true,
+                    first_paint_pending: true,
                 };
                 pane.replay_tmux_history();
                 pane.sync_scrollback();
@@ -183,6 +195,9 @@ impl Pane {
     /// Drain any pending PTY output into the parser. Returns true if any bytes
     /// were processed (i.e. the rendered view may have changed).
     pub(crate) fn pump(&mut self) -> bool {
+        if self.first_paint_pending {
+            return false;
+        }
         let mut processed = false;
         let mut disconnected = false;
         loop {
@@ -212,12 +227,22 @@ impl Pane {
         processed
     }
 
+    /// Called by the UI renderer once the pane has been painted at least once.
+    /// New panes intentionally delay PTY output processing until this point so
+    /// tmux attach redraw artifacts don't flash before the pane frame appears.
+    pub(crate) fn mark_painted(&mut self) {
+        self.first_paint_pending = false;
+    }
+
     /// Permanently close the persistent session backing this pane. This is
     /// used when the user closes/replaces a pane, not when the whole app exits.
     pub(crate) fn terminate_session(&self) {
         let _ = Command::new("tmux")
             .args(["kill-session", "-t", &self.tmux_session])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status();
+        wait_for_tmux_session_gone(&self.tmux_session, Duration::from_millis(300));
     }
 
     /// Spawn a fresh login shell into this pane, replacing the previous PTY
@@ -616,14 +641,6 @@ impl Pane {
         }
     }
 
-    pub(crate) fn needs_scrollbar(&self, viewport_width: u16, viewport_height: u16) -> bool {
-        if self.scrollback_max > 0 {
-            return true;
-        }
-
-        self.rendered_height(viewport_width) > usize::from(viewport_height)
-    }
-
     pub(crate) fn scrollbar_state(
         &self,
         viewport_width: u16,
@@ -679,6 +696,13 @@ impl Pane {
             screen.rows(0, cols).collect()
         };
         self.parser.set_scrollback(saved);
+        rows.join("\n")
+    }
+
+    pub(crate) fn visible_plain_text(&self) -> String {
+        let screen = self.parser.screen();
+        let (_, cols) = screen.size();
+        let rows: Vec<String> = screen.rows(0, cols).collect();
         rows.join("\n")
     }
 
@@ -891,20 +915,49 @@ fn pump_pty_output(mut reader: File, tx: mpsc::Sender<Vec<u8>>) {
 fn ensure_tmux_session(session: &str, command: &str) -> anyhow::Result<()> {
     let has_session = Command::new("tmux")
         .args(["has-session", "-t", session])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .map(|status| status.success())
         .unwrap_or(false);
-    if has_session {
-        return Ok(());
+    if !has_session {
+        let status = Command::new("tmux")
+            .args(["new-session", "-d", "-s", session, command])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("failed to create tmux session {session}");
+        }
     }
 
-    let status = Command::new("tmux")
-        .args(["new-session", "-d", "-s", session, command])
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        anyhow::bail!("failed to create tmux session {session}");
+    // The embedded tmux client is never shown directly to the user, so the
+    // status bar is pure noise inside pane captures and initial redraws.
+    let _ = Command::new("tmux")
+        .args(["set-option", "-t", session, "status", "off"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    Ok(())
+}
+
+fn wait_for_tmux_session_gone(session: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let exists = Command::new("tmux")
+            .args(["has-session", "-t", session])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !exists {
+            break;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
     }
 }
 

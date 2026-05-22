@@ -12,16 +12,70 @@ use crate::{
 };
 
 pub(crate) const COMMANDER_COMMAND: &str = "commander";
-pub(crate) const TOP_CHROME_ROWS: u16 = 3;
-pub(crate) const WORKSPACE_SIDEBAR_WIDTH: u16 = 24;
+pub(crate) const TOP_CHROME_ROWS: u16 = 2;
+pub(crate) const WORKSPACE_SIDEBAR_WIDTH: u16 = 48;
+pub(crate) const WORKSPACE_BAR_HEIGHT: u16 = 1;
 const APP_NAME: &str = "Code UI";
 const APP_VERSION: &str = "0.0.2";
 const APP_HANDLE: &str = "@motionharvest";
 const WORKSPACE_ENTRY_MARGIN_X: u16 = 1;
 const WORKSPACE_ENTRY_MARGIN_TOP: u16 = 0;
-const WORKSPACE_ENTRY_HEIGHT: u16 = 3;
-const WORKSPACE_ENTRY_GAP: u16 = 0;
-const COMMANDER_HEIGHT_MULTIPLIER: u16 = 5;
+const WORKSPACE_ENTRY_HEIGHT: u16 = 1;
+const WORKSPACE_ENTRY_GAP: u16 = 1;
+const WORKSPACE_TAB_WIDTH: u16 = 18;
+const COMMANDER_TAB_WIDTH: u16 = WORKSPACE_SIDEBAR_WIDTH;
+
+fn commander_panel_width(sidebar_area: Rect) -> u16 {
+    COMMANDER_TAB_WIDTH.min(sidebar_area.width.saturating_sub(1))
+}
+
+fn color_to_rgb(color: Color) -> Option<(u8, u8, u8)> {
+    match color {
+        Color::Rgb(r, g, b) => Some((r, g, b)),
+        Color::Black => Some((0, 0, 0)),
+        Color::Red => Some((205, 49, 49)),
+        Color::Green => Some((13, 188, 121)),
+        Color::Yellow => Some((229, 229, 16)),
+        Color::Blue => Some((36, 114, 200)),
+        Color::Magenta => Some((188, 63, 188)),
+        Color::Cyan => Some((17, 168, 205)),
+        Color::Gray => Some((229, 229, 229)),
+        Color::DarkGray => Some((102, 102, 102)),
+        Color::LightRed => Some((241, 76, 76)),
+        Color::LightGreen => Some((35, 209, 139)),
+        Color::LightYellow => Some((245, 245, 67)),
+        Color::LightBlue => Some((59, 142, 234)),
+        Color::LightMagenta => Some((214, 112, 214)),
+        Color::LightCyan => Some((41, 184, 219)),
+        Color::White => Some((255, 255, 255)),
+        Color::Indexed(_) | Color::Reset => None,
+    }
+}
+
+fn color_contrast_delta(a: Color, b: Color) -> Option<u16> {
+    let (ar, ag, ab) = color_to_rgb(a)?;
+    let (br, bg, bb) = color_to_rgb(b)?;
+    Some(ar.abs_diff(br) as u16 + ag.abs_diff(bg) as u16 + ab.abs_diff(bb) as u16)
+}
+
+fn selected_tab_bg(theme: Theme) -> Color {
+    let candidate = theme.palette[14];
+    match color_contrast_delta(candidate, theme.background) {
+        Some(delta) if delta >= 180 => candidate,
+        _ => theme.accent,
+    }
+}
+
+fn selected_tab_style(theme: Theme) -> Style {
+    Style::default()
+        .fg(theme.background)
+        .bg(selected_tab_bg(theme))
+        .add_modifier(Modifier::BOLD)
+}
+
+fn deselected_tab_style(theme: Theme) -> Style {
+    Style::default().fg(theme.background).bg(theme.muted)
+}
 
 /// Truncate to a maximum number of terminal cells (counted as Unicode scalar
 /// values, matching ratatui's default monospace assumption).
@@ -217,70 +271,43 @@ pub(crate) fn help_debug_toggle_button_area(area: Rect) -> Rect {
 }
 
 pub(crate) fn workspace_item_area(sidebar_area: Rect, index: usize) -> Rect {
-    let first_workspace_y = commander_item_area(sidebar_area)
-        .bottom()
-        .saturating_add(WORKSPACE_ENTRY_GAP);
-    let y = first_workspace_y.saturating_add(
-        (index as u16).saturating_mul(WORKSPACE_ENTRY_HEIGHT.saturating_add(WORKSPACE_ENTRY_GAP)),
+    let first_workspace_x = sidebar_area
+        .x
+        .saturating_add(commander_panel_width(sidebar_area))
+        .saturating_add(1)
+        .min(sidebar_area.right());
+    let x = first_workspace_x.saturating_add(
+        (index as u16).saturating_mul(WORKSPACE_TAB_WIDTH.saturating_add(WORKSPACE_ENTRY_GAP)),
     );
     Rect {
-        x: sidebar_area.x.saturating_add(WORKSPACE_ENTRY_MARGIN_X),
-        y,
-        width: sidebar_area
-            .width
-            .saturating_sub(WORKSPACE_ENTRY_MARGIN_X.saturating_mul(2)),
+        x,
+        y: sidebar_area.y.saturating_add(WORKSPACE_ENTRY_MARGIN_TOP),
+        width: WORKSPACE_TAB_WIDTH.min(
+            sidebar_area
+                .width
+                .saturating_sub(x.saturating_sub(sidebar_area.x)),
+        ),
         height: WORKSPACE_ENTRY_HEIGHT.min(
             sidebar_area
                 .height
-                .saturating_sub(y.saturating_sub(sidebar_area.y)),
+                .saturating_sub(WORKSPACE_ENTRY_MARGIN_TOP),
         ),
     }
-}
-
-fn sidebar_slot_area(sidebar_area: Rect, slot_index: usize) -> Rect {
-    let y = sidebar_area
-        .y
-        .saturating_add(WORKSPACE_ENTRY_MARGIN_TOP)
-        .saturating_add(
-            (slot_index as u16)
-                .saturating_mul(WORKSPACE_ENTRY_HEIGHT.saturating_add(WORKSPACE_ENTRY_GAP)),
-        );
-    Rect {
-        x: sidebar_area.x.saturating_add(WORKSPACE_ENTRY_MARGIN_X),
-        y,
-        width: sidebar_area
-            .width
-            .saturating_sub(WORKSPACE_ENTRY_MARGIN_X.saturating_mul(2)),
-        height: WORKSPACE_ENTRY_HEIGHT.min(
-            sidebar_area
-                .height
-                .saturating_sub(y.saturating_sub(sidebar_area.y)),
-        ),
-    }
-}
-
-pub(crate) fn commander_item_area(sidebar_area: Rect) -> Rect {
-    let mut area = sidebar_slot_area(sidebar_area, 0);
-    let desired = WORKSPACE_ENTRY_HEIGHT.saturating_mul(COMMANDER_HEIGHT_MULTIPLIER);
-    area.height = desired.min(
-        sidebar_area
-            .height
-            .saturating_sub(WORKSPACE_ENTRY_MARGIN_TOP),
-    );
-    area
 }
 
 pub(crate) fn workspace_add_button_area(sidebar_area: Rect, workspace_count: usize) -> Rect {
-    workspace_item_area(sidebar_area, workspace_count)
+    let mut area = workspace_item_area(sidebar_area, workspace_count);
+    area.width = 3.min(area.width);
+    area
 }
 
 pub(crate) fn workspace_menu_button_area(sidebar_area: Rect, index: usize) -> Rect {
     let item = workspace_item_area(sidebar_area, index);
     Rect {
-        x: item.right().saturating_sub(3),
-        y: item.y.saturating_add(1),
-        width: 1.min(item.width.saturating_sub(2)),
-        height: 1.min(item.height.saturating_sub(2)),
+        x: item.right().saturating_sub(1),
+        y: item.y,
+        width: 1.min(item.width),
+        height: 1.min(item.height),
     }
 }
 
@@ -315,17 +342,13 @@ pub(crate) fn workspace_add_button_hit(
     )
 }
 
-pub(crate) fn commander_button_hit(sidebar_area: Rect, x: u16, y: u16) -> bool {
-    contains(commander_item_area(sidebar_area), x, y)
-}
-
 pub(crate) fn render_workspace_sidebar(
     f: &mut ratatui::Frame<'_>,
     sidebar_area: Rect,
     theme: Theme,
     workspace_names: &[String],
     active_workspace_index: usize,
-    commander_selected: bool,
+    _commander_selected: bool,
     sidebar_workspace_selected_index: Option<usize>,
     sidebar_add_button_selected: bool,
 ) {
@@ -338,139 +361,71 @@ pub(crate) fn render_workspace_sidebar(
         sidebar_area,
     );
 
-    let commander_area = commander_item_area(sidebar_area);
-    if commander_area.width >= 3 && commander_area.height >= 3 {
-        let commander_style = if commander_selected {
-            Style::default().fg(theme.accent).bg(theme.background)
-        } else {
-            Style::default().fg(theme.muted).bg(theme.background)
-        };
-        f.render_widget(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(commander_style)
-                .style(Style::default().bg(theme.background)),
-            commander_area,
-        );
-    }
-
     for (idx, name) in workspace_names.iter().enumerate() {
         let item_area = workspace_item_area(sidebar_area, idx);
-        if item_area.width < 3 || item_area.height < 3 {
+        if item_area.width == 0 || item_area.height == 0 {
             continue;
         }
         let active = idx == active_workspace_index;
         let keyboard_selected = sidebar_workspace_selected_index == Some(idx);
-        let border_style = if active || keyboard_selected {
-            Style::default()
-                .fg(theme.accent)
-                .bg(theme.background)
-                .add_modifier(Modifier::BOLD)
+        let style = if active || keyboard_selected {
+            selected_tab_style(theme)
         } else {
-            Style::default().fg(theme.muted).bg(theme.background)
+            deselected_tab_style(theme)
         };
-        let border_type = if active && keyboard_selected {
-            BorderType::Double
-        } else if keyboard_selected {
-            BorderType::Thick
-        } else {
-            BorderType::Rounded
-        };
-        let label_width = item_area.width.saturating_sub(5) as usize;
+        let label_width = item_area.width.saturating_sub(2) as usize;
         let label = truncate_to_width(name, label_width);
-        let menu_area = workspace_menu_button_area(sidebar_area, idx);
-        let label_area = Rect {
-            x: item_area.x.saturating_add(1),
-            y: item_area.y.saturating_add(1),
-            width: item_area.width.saturating_sub(4),
-            height: 1,
-        };
-
         f.render_widget(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(border_type)
-                .border_style(border_style)
-                .style(Style::default().bg(theme.background)),
+            Paragraph::new(format!(" {} ", label))
+                .alignment(Alignment::Left)
+                .style(style),
             item_area,
         );
-        f.render_widget(
-            Paragraph::new(label)
-                .alignment(Alignment::Center)
-                .style(border_style),
-            label_area,
-        );
-
-        if menu_area.width > 0 && menu_area.height > 0 {
-            f.render_widget(
-                Paragraph::new("⋮")
-                    .alignment(Alignment::Center)
-                    .style(border_style),
-                menu_area,
-            );
-        }
     }
 
     let add_area = workspace_add_button_area(sidebar_area, workspace_names.len());
-    if add_area.width >= 3 && add_area.height >= 3 {
+    if add_area.width > 0 && add_area.height > 0 {
         let style = if sidebar_add_button_selected {
-            Style::default()
-                .fg(theme.accent)
-                .bg(theme.background)
-                .add_modifier(Modifier::BOLD)
+            selected_tab_style(theme)
         } else {
-            Style::default().fg(theme.muted).bg(theme.background)
-        };
-        let border_type = if sidebar_add_button_selected {
-            BorderType::Thick
-        } else {
-            BorderType::Rounded
+            deselected_tab_style(theme)
         };
         f.render_widget(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(border_type)
-                .border_style(style)
-                .style(Style::default().bg(theme.background)),
-            add_area,
-        );
-        f.render_widget(
-            Paragraph::new("+")
-                .alignment(Alignment::Center)
+            Paragraph::new(" + ")
+                .alignment(Alignment::Left)
                 .style(style),
-            Rect {
-                x: add_area.x.saturating_add(1),
-                y: add_area.y.saturating_add(1),
-                width: add_area.width.saturating_sub(2),
-                height: 1,
-            },
+            add_area,
         );
     }
 }
 
-pub(crate) fn render_top_chrome(f: &mut ratatui::Frame<'_>, size: Rect, theme: Theme) {
+pub(crate) fn render_top_chrome(
+    f: &mut ratatui::Frame<'_>,
+    size: Rect,
+    theme: Theme,
+    usage_summary: Option<&str>,
+) {
     if size.width == 0 || size.height < 2 {
         return;
     }
 
-    let header_row = Rect {
+    let title_row = Rect {
         x: size.x,
-        y: size.y.saturating_add(1),
+        y: size.y,
         width: size.width,
         height: 1,
     };
-    if header_row.y >= size.bottom() {
+    if title_row.y >= size.bottom() {
         return;
     }
 
     let handle_width = APP_HANDLE.chars().count() as u16;
     let handle_area = Rect {
-        x: header_row
+        x: title_row
             .x
-            .saturating_add(header_row.width.saturating_sub(handle_width)),
-        y: header_row.y,
-        width: handle_width.min(header_row.width),
+            .saturating_add(title_row.width.saturating_sub(handle_width)),
+        y: title_row.y,
+        width: handle_width.min(title_row.width),
         height: 1,
     };
     f.render_widget(
@@ -480,7 +435,7 @@ pub(crate) fn render_top_chrome(f: &mut ratatui::Frame<'_>, size: Rect, theme: T
         handle_area,
     );
 
-    let left_width = header_row
+    let left_width = title_row
         .width
         .saturating_sub(handle_area.width.saturating_add(1));
     if left_width == 0 {
@@ -502,11 +457,50 @@ pub(crate) fn render_top_chrome(f: &mut ratatui::Frame<'_>, size: Rect, theme: T
     f.render_widget(
         title,
         Rect {
-            x: header_row
+            x: title_row
                 .x
                 .saturating_add(WORKSPACE_ENTRY_MARGIN_X.saturating_add(1)),
-            y: header_row.y,
+            y: title_row.y,
             width: left_width.saturating_sub(WORKSPACE_ENTRY_MARGIN_X.saturating_add(1)),
+            height: 1,
+        },
+    );
+
+    let Some(usage_summary) = usage_summary else {
+        return;
+    };
+    let usage_summary = usage_summary.trim();
+    if usage_summary.is_empty() {
+        return;
+    }
+    let stats_row = Rect {
+        x: size.x,
+        y: size.y.saturating_add(1),
+        width: size.width,
+        height: 1,
+    };
+    if stats_row.y >= size.bottom() || stats_row.width == 0 {
+        return;
+    }
+    let stats_width = stats_row
+        .width
+        .saturating_sub(WORKSPACE_ENTRY_MARGIN_X.saturating_add(2)) as usize;
+    if stats_width == 0 {
+        return;
+    }
+    let stats_text = truncate_to_width(usage_summary, stats_width);
+    f.render_widget(
+        Paragraph::new(format!(" {}", stats_text))
+            .alignment(Alignment::Left)
+            .style(Style::default().fg(theme.muted).bg(theme.background)),
+        Rect {
+            x: stats_row
+                .x
+                .saturating_add(WORKSPACE_ENTRY_MARGIN_X.saturating_add(1)),
+            y: stats_row.y,
+            width: stats_row
+                .width
+                .saturating_sub(WORKSPACE_ENTRY_MARGIN_X.saturating_add(1)),
             height: 1,
         },
     );

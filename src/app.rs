@@ -22,16 +22,16 @@ use crate::{
     pane::{Pane, PaneMouseEventKind, PaneSelection},
     theme::{load_persisted_theme_index, save_persisted_theme, Theme, THEMES},
     ui::{
-        commander_button_hit, default_agent_index, help_close_button_area,
-        help_debug_toggle_button_area, help_modal_area, new_pane_picker_list_area,
-        new_pane_picker_modal_area, new_pane_picker_name_input_area,
-        panel_settings_agent_list_area, panel_settings_cancel_button_area,
-        panel_settings_close_button_area, panel_settings_confirm_button_area,
-        panel_settings_modal_area, panel_settings_modal_inner, panel_settings_name_input_area,
-        workspace_add_button_hit, workspace_hit_index, workspace_menu_hit_index,
-        workspace_settings_action_hit_index, workspace_settings_modal_area,
-        workspace_settings_name_input_area, Modal, PanelSettingsFocus, AGENT_PRESETS,
-        COMMANDER_COMMAND, TOP_CHROME_ROWS, WORKSPACE_SIDEBAR_WIDTH,
+        default_agent_index, help_close_button_area, help_debug_toggle_button_area,
+        help_modal_area, new_pane_picker_list_area, new_pane_picker_modal_area,
+        new_pane_picker_name_input_area, panel_settings_agent_list_area,
+        panel_settings_cancel_button_area, panel_settings_close_button_area,
+        panel_settings_confirm_button_area, panel_settings_modal_area, panel_settings_modal_inner,
+        panel_settings_name_input_area, workspace_add_button_hit, workspace_hit_index,
+        workspace_menu_hit_index, workspace_settings_action_hit_index,
+        workspace_settings_modal_area, workspace_settings_name_input_area, Modal,
+        PanelSettingsFocus, AGENT_PRESETS, COMMANDER_COMMAND, TOP_CHROME_ROWS,
+        WORKSPACE_BAR_HEIGHT, WORKSPACE_SIDEBAR_WIDTH,
     },
     utils::{arrow_key_to_split_side, contains, key_to_bytes, LOGIN_SHELL_SENTINEL},
 };
@@ -481,23 +481,37 @@ impl App {
 
     pub(crate) fn workspace_sidebar_area(size: Rect) -> Rect {
         let body = Self::body_area(size);
-        let width = WORKSPACE_SIDEBAR_WIDTH.min(body.width.saturating_sub(1));
+        let height = WORKSPACE_BAR_HEIGHT.min(body.height.saturating_sub(1));
+        let y = body.y;
         Rect {
             x: body.x,
-            y: body.y,
+            y,
+            width: body.width,
+            height: height.min(body.height.saturating_sub(y.saturating_sub(body.y))),
+        }
+    }
+
+    pub(crate) fn commander_panel_area(size: Rect) -> Rect {
+        let body = Self::body_area(size);
+        let width = WORKSPACE_SIDEBAR_WIDTH.min(body.width.saturating_sub(1));
+        let y = body.y.saturating_add(1);
+        Rect {
+            x: body.x,
+            y,
             width,
-            height: body.height,
+            height: body.height.saturating_sub(y.saturating_sub(body.y)),
         }
     }
 
     pub(crate) fn content_area(size: Rect) -> Rect {
         let body = Self::body_area(size);
-        let sidebar = Self::workspace_sidebar_area(size);
+        let commander = Self::commander_panel_area(size);
+        let y = body.y.saturating_add(1);
         Rect {
-            x: sidebar.right(),
-            y: body.y,
-            width: body.width.saturating_sub(sidebar.width),
-            height: body.height,
+            x: commander.right(),
+            y,
+            width: body.width.saturating_sub(commander.width),
+            height: body.height.saturating_sub(y.saturating_sub(body.y)),
         }
     }
 
@@ -567,7 +581,13 @@ impl App {
         for placement in placements {
             if let Some(pane) = self.pane_mut(placement.pane_id) {
                 let inner = pane_inner_area(placement.area, placement.exposed);
-                let content_cols = inner.width.saturating_sub(1).max(1);
+                let show_scrollbar = inner.width > 3;
+                let content_cols = if show_scrollbar {
+                    inner.width.saturating_sub(2)
+                } else {
+                    inner.width
+                }
+                .max(1);
                 let content_rows = inner.height.max(1);
                 pane.resize(content_rows, content_cols);
             }
@@ -906,11 +926,6 @@ impl App {
             return Ok(false);
         }
 
-        if commander_button_hit(sidebar, x, y) {
-            self.focus_commander_from_sidebar(size);
-            return Ok(true);
-        }
-
         if let Some(workspace_index) =
             workspace_menu_hit_index(sidebar, self.workspaces.len(), x, y)
         {
@@ -926,7 +941,7 @@ impl App {
             self.create_workspace(size)?;
             return Ok(true);
         }
-        Ok(true)
+        Ok(false)
     }
 
     fn focus_commander_from_sidebar(&mut self, size: Rect) {
@@ -1025,16 +1040,18 @@ impl App {
             || self.sidebar_add_button_focused
         {
             match side {
-                SplitSide::Top => self.move_sidebar_focus(size, -1),
-                SplitSide::Bottom => self.move_sidebar_focus(size, 1),
-                SplitSide::Right => self.focus_pane(self.focused),
-                SplitSide::Left => {}
+                SplitSide::Left => self.move_sidebar_focus(size, -1),
+                SplitSide::Right => self.move_sidebar_focus(size, 1),
+                SplitSide::Bottom => self.focus_pane(self.focused),
+                SplitSide::Top => {}
             }
             return;
         }
 
         let moved = self.focus_adjacent(size, side);
-        if !moved && side == SplitSide::Left && Self::sidebar_is_visible(size) {
+        if !moved && side == SplitSide::Left {
+            self.focus_commander_from_sidebar(size);
+        } else if !moved && side == SplitSide::Top && Self::sidebar_is_visible(size) {
             self.focus_workspace_tab_from_sidebar(self.active_workspace);
         }
     }
@@ -1870,6 +1887,34 @@ impl App {
             }
         }
 
+        if !self.focused_pane_is_commander()
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+            && !key.modifiers.contains(KeyModifiers::SHIFT)
+        {
+            if let Some(pane) = self.focused_pane_mut() {
+                match key.code {
+                    KeyCode::PageUp => {
+                        pane.page_up();
+                        return Ok(());
+                    }
+                    KeyCode::PageDown => {
+                        pane.page_down();
+                        return Ok(());
+                    }
+                    KeyCode::Home => {
+                        pane.scroll_top();
+                        return Ok(());
+                    }
+                    KeyCode::End => {
+                        pane.scroll_bottom();
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         if self.focused_pane_is_commander() {
             match key.code {
                 KeyCode::Enter => {
@@ -2028,7 +2073,9 @@ impl App {
             && self.drag_resize.is_none()
             && self.drag_swap.is_none()
             && self.drag_pane_mouse.is_none()
-            && !self.text_selection.is_some_and(|selection| selection.active)
+            && !self
+                .text_selection
+                .is_some_and(|selection| selection.active)
         {
             return Ok(());
         }
@@ -2291,12 +2338,37 @@ impl App {
             return Ok(());
         }
 
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && contains(Self::commander_panel_area(size), mouse.column, mouse.row)
+        {
+            self.focus_commander_from_sidebar(size);
+            self.text_selection = None;
+            return Ok(());
+        }
+
         let clicked = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
         let down_button = match mouse.kind {
             MouseEventKind::Down(button) => Some(button),
             _ => None,
         };
         let Some(placement) = self.placement_at(size, mouse.column, mouse.row) else {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    if !self.focused_pane_is_commander() {
+                        if let Some(pane) = self.focused_pane_mut() {
+                            pane.scroll_up();
+                        }
+                    }
+                }
+                MouseEventKind::ScrollDown => {
+                    if !self.focused_pane_is_commander() {
+                        if let Some(pane) = self.focused_pane_mut() {
+                            pane.scroll_down();
+                        }
+                    }
+                }
+                _ => {}
+            }
             return Ok(());
         };
 
@@ -2403,8 +2475,10 @@ impl App {
                     let Some((x, y)) = Self::pane_mouse_cell(inner, mouse.column, mouse.row) else {
                         return Ok(());
                     };
-                    if pane.scrollback_max > 0 || !pane.send_mouse_wheel(true, x, y)? {
-                        pane.scroll_up();
+                    let before = pane.scrollback;
+                    pane.scroll_up();
+                    if pane.scrollback == before {
+                        let _ = pane.send_mouse_wheel(true, x, y)?;
                     }
                 }
             }
@@ -2417,8 +2491,10 @@ impl App {
                     let Some((x, y)) = Self::pane_mouse_cell(inner, mouse.column, mouse.row) else {
                         return Ok(());
                     };
-                    if pane.scrollback_max > 0 || !pane.send_mouse_wheel(false, x, y)? {
-                        pane.scroll_down();
+                    let before = pane.scrollback;
+                    pane.scroll_down();
+                    if pane.scrollback == before {
+                        let _ = pane.send_mouse_wheel(false, x, y)?;
                     }
                 }
             }
@@ -4264,6 +4340,7 @@ fn run_commander_llm(
     );
 
     let output = Command::new("agent")
+        .arg("--trust")
         .arg("-p")
         .arg("--output-format")
         .arg("text")
@@ -4273,15 +4350,46 @@ fn run_commander_llm(
         .output();
 
     let Ok(output) = output else {
-        return CommanderWorkerResult::empty();
+        return commander_router_message(
+            "Couldn't run the Commander router. Check that the `agent` CLI is installed."
+                .to_string(),
+        );
     };
 
     if !output.status.success() {
-        return CommanderWorkerResult::empty();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr_line = stderr
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("unknown error");
+        let message = if stderr_line
+            .to_ascii_lowercase()
+            .contains("workspace trust required")
+        {
+            "Commander router is blocked by workspace trust. Run `agent --trust` once in this workspace.".to_string()
+        } else {
+            format!("Commander router failed: {stderr_line}")
+        };
+        return commander_router_message(message);
     }
 
     let text = String::from_utf8_lossy(&output.stdout).to_string();
-    parse_commander_router_output(&text).unwrap_or_else(CommanderWorkerResult::empty)
+    if let Some(result) = parse_commander_router_output(&text) {
+        result
+    } else if let Some(reply) = normalize_commander_reply_text(&text) {
+        commander_router_message(reply)
+    } else {
+        commander_router_message("Commander router returned an empty response.".to_string())
+    }
+}
+
+fn commander_router_message(message: String) -> CommanderWorkerResult {
+    CommanderWorkerResult {
+        reply_text: Some(message.clone()),
+        speech_text: Some(message),
+        ..CommanderWorkerResult::empty()
+    }
 }
 
 fn parse_commander_router_output(text: &str) -> Option<CommanderWorkerResult> {
