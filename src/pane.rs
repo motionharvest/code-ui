@@ -22,7 +22,6 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::ScrollbarState,
 };
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
@@ -641,22 +640,6 @@ impl Pane {
         }
     }
 
-    pub(crate) fn scrollbar_state(
-        &self,
-        viewport_width: u16,
-        viewport_height: u16,
-    ) -> ScrollbarState {
-        if self.scrollback_max > 0 {
-            return ScrollbarState::new(self.scrollback_max.saturating_add(1))
-                .position(self.scrollback_max.saturating_sub(self.scrollback))
-                .viewport_content_length(usize::from(viewport_height));
-        }
-
-        ScrollbarState::new(self.rendered_height(viewport_width))
-            .position(0)
-            .viewport_content_length(usize::from(viewport_height))
-    }
-
     /// Returns the rendered terminal contents as a styled `Text`. The result is
     /// cached and only rebuilt when the underlying screen has actually changed
     /// (new PTY bytes, scroll, or resize). When clean, this just clones the
@@ -789,29 +772,6 @@ impl Pane {
         Some((col, row))
     }
 
-    fn rendered_height(&self, viewport_width: u16) -> usize {
-        let viewport_width = usize::from(viewport_width.max(1));
-        let screen = self.parser.screen();
-        let (rows, cols) = screen.size();
-        let mut height = 0usize;
-
-        for row in 0..rows {
-            let mut row_width = 0usize;
-            for col in 0..cols {
-                let Some(cell) = screen.cell(row, col) else {
-                    continue;
-                };
-                if cell.has_contents() {
-                    let cell_width = if cell.is_wide() { 2 } else { 1 };
-                    row_width = row_width.max(usize::from(col) + cell_width);
-                }
-            }
-
-            height = height.saturating_add(row_width.max(1).div_ceil(viewport_width));
-        }
-
-        height
-    }
 }
 
 fn normalized_selection(selection: PaneSelection) -> ((u16, u16), (u16, u16)) {

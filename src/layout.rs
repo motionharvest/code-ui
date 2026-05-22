@@ -83,9 +83,8 @@ const RATIO_SCALE: u16 = 10_000;
 const RATIO_HALF: u16 = RATIO_SCALE / 2;
 
 pub(crate) const PANE_INNER_MARGIN: u16 = 1;
-// Single row of title text on the pane's top edge. PANE_INNER_MARGIN below
-// already separates it from the pane contents.
-pub(crate) const PANE_TITLE_BAR_HEIGHT: u16 = 1;
+// Two rows of title text/chrome on the pane's top edge.
+pub(crate) const PANE_TITLE_BAR_HEIGHT: u16 = 2;
 /// Extra left padding before the title glyphs.
 pub(crate) const PANE_TITLE_LEFT_PADDING: u16 = 1;
 
@@ -96,15 +95,15 @@ pub(crate) fn pane_borders(_exposed: ExposedSides) -> Borders {
 }
 
 pub(crate) fn pane_title_y(area: Rect) -> u16 {
-    // Title text sits on the top row of the title bar.
+    // Primary title text sits on the top row of the title bar.
     area.y
 }
 
 pub(crate) fn pane_title_bar_area(area: Rect) -> Rect {
     Rect {
-        x: area.x.saturating_add(1),
+        x: area.x,
         y: area.y,
-        width: area.width.saturating_sub(2),
+        width: area.width,
         height: PANE_TITLE_BAR_HEIGHT.min(area.height),
     }
 }

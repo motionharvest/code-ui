@@ -32,6 +32,7 @@ use crate::{
         workspace_settings_modal_area, workspace_settings_name_input_area, Modal,
         PanelSettingsFocus, AGENT_PRESETS, COMMANDER_COMMAND, TOP_CHROME_ROWS,
         WORKSPACE_BAR_HEIGHT, WORKSPACE_SIDEBAR_WIDTH,
+        agent_label_for_command,
     },
     utils::{arrow_key_to_split_side, contains, key_to_bytes, LOGIN_SHELL_SENTINEL},
 };
@@ -581,13 +582,7 @@ impl App {
         for placement in placements {
             if let Some(pane) = self.pane_mut(placement.pane_id) {
                 let inner = pane_inner_area(placement.area, placement.exposed);
-                let show_scrollbar = inner.width > 3;
-                let content_cols = if show_scrollbar {
-                    inner.width.saturating_sub(2)
-                } else {
-                    inner.width
-                }
-                .max(1);
+                let content_cols = inner.width.max(1);
                 let content_rows = inner.height.max(1);
                 pane.resize(content_rows, content_cols);
             }
@@ -1375,7 +1370,10 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
         {
-            if self.copy_text_selection()? {
+            let has_text_selection = self
+                .text_selection
+                .is_some_and(|selection| selection.start != selection.end);
+            if self.copy_text_selection()? || has_text_selection {
                 return Ok(());
             }
             if !self.focused_pane_is_commander() {
@@ -2372,14 +2370,19 @@ impl App {
             return Ok(());
         };
 
-        let Some(pane_title) = self
+        let Some((pane_title, pane_command)) = self
             .panes
             .iter()
             .find(|pane| pane.id == placement.pane_id)
-            .map(|pane| pane.title.clone())
+            .map(|pane| (pane.title.clone(), pane.command.clone()))
         else {
             return Ok(());
         };
+        let pane_title = format!(
+            "{} [{}] ▼",
+            pane_title,
+            agent_label_for_command(&pane_command)
+        );
 
         let was_focused = self.focused == placement.pane_id;
 

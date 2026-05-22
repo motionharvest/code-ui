@@ -12,7 +12,8 @@ use std::{
     io::{self, BufRead, BufReader},
     path::{Path, PathBuf},
     process::Command,
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, RwLock},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -20,6 +21,7 @@ use std::{
 /// user closes the TUI (Ctrl+Q, Ctrl+R, or a layout-collapse close).
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(750);
 const MOUSE_MOVE_DEBOUNCE: Duration = Duration::from_millis(16);
+const MOUSE_DRAG_DEBOUNCE: Duration = Duration::from_millis(8);
 
 use anyhow::Context;
 use crossterm::{
@@ -36,8 +38,8 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Text},
-    widgets::{Block, BorderType, Borders, Paragraph, Scrollbar, ScrollbarOrientation, Wrap},
+    text::{Line, Span, Text},
+    widgets::{Block, BorderType, Borders, Paragraph, Wrap},
     Frame, Terminal,
 };
 
@@ -48,6 +50,7 @@ use layout::{
 };
 use theme::Theme;
 use ui::{
+    agent_label_for_command,
     render_help_modal, render_new_pane_picker_modal, render_panel_settings_modal,
     render_theme_modal, render_top_chrome, render_workspace_settings_modal,
     render_workspace_sidebar, truncate_to_width,
@@ -71,6 +74,8 @@ fn main() -> anyhow::Result<()> {
 
     let size = terminal.size()?;
     let mut app = App::new(size.height, size.width).context("failed to create panes")?;
+
+    spawn_tokscale_refresh_thread();
 
     let res = run(&mut terminal, &mut app);
     let reload_requested = app.reload_requested;
@@ -231,12 +236,181 @@ const CODEX_PRICE_OUTPUT_PER_1M: f64 = 14.0;
 static CODEX_SESSIONS_CACHE: OnceLock<Mutex<CodexSessionsCache>> = OnceLock::new();
 static PANE_CODEX_SESSION_MAP: OnceLock<Mutex<HashMap<usize, String>>> = OnceLock::new();
 
+// ---------------------------------------------------------------------------
+// Tokscale integration – background refresh of cross-agent token usage
+// ---------------------------------------------------------------------------
+
+const TOKSCALE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Default)]
+struct TokscaleEntry {
+    client: String,
+    input: f64,
+    output: f64,
+    cache_read: f64,
+    cost: f64,
+}
+
+#[derive(Clone, Default)]
+struct TokscaleData {
+    entries: Vec<TokscaleEntry>,
+    total_input: f64,
+    total_output: f64,
+    total_cache_read: f64,
+    total_cost: f64,
+}
+
+impl TokscaleData {
+    fn total_tokens(&self) -> f64 {
+        self.total_input + self.total_output + self.total_cache_read
+    }
+
+    fn client_cost(&self, client: &str) -> Option<f64> {
+        let mut total = 0.0;
+        let mut found = false;
+        for entry in &self.entries {
+            if entry.client.eq_ignore_ascii_case(client) {
+                total += entry.cost;
+                found = true;
+            }
+        }
+        found.then_some(total)
+    }
+
+    fn client_tokens(&self, client: &str) -> Option<f64> {
+        let mut total = 0.0;
+        let mut found = false;
+        for entry in &self.entries {
+            if entry.client.eq_ignore_ascii_case(client) {
+                total += entry.input + entry.output + entry.cache_read;
+                found = true;
+            }
+        }
+        found.then_some(total)
+    }
+}
+
+static TOKSCALE_DATA: OnceLock<Arc<RwLock<Option<TokscaleData>>>> = OnceLock::new();
+
+fn tokscale_data_handle() -> &'static Arc<RwLock<Option<TokscaleData>>> {
+    TOKSCALE_DATA.get_or_init(|| Arc::new(RwLock::new(None)))
+}
+
+fn spawn_tokscale_refresh_thread() {
+    let handle = Arc::clone(tokscale_data_handle());
+    thread::spawn(move || {
+        loop {
+            if let Some(data) = run_tokscale_json() {
+                if let Ok(mut guard) = handle.write() {
+                    *guard = Some(data);
+                }
+            }
+            thread::sleep(TOKSCALE_REFRESH_INTERVAL);
+        }
+    });
+}
+
+fn run_tokscale_json() -> Option<TokscaleData> {
+    let output = Command::new("tokscale")
+        .args(["--json", "--today"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    parse_tokscale_json(&text)
+}
+
+fn parse_tokscale_json(text: &str) -> Option<TokscaleData> {
+    let mut data = TokscaleData::default();
+    data.total_input = extract_json_number(text, "totalInput").unwrap_or(0.0);
+    data.total_output = extract_json_number(text, "totalOutput").unwrap_or(0.0);
+    data.total_cache_read = extract_json_number(text, "totalCacheRead").unwrap_or(0.0);
+    data.total_cost = extract_json_number(text, "totalCost").unwrap_or(0.0);
+
+    // Parse the "entries" array – each element is a JSON object.
+    if let Some(entries_start) = text.find("\"entries\"") {
+        let rest = &text[entries_start..];
+        if let Some(bracket) = rest.find('[') {
+            let array_text = &rest[bracket..];
+            data.entries = parse_tokscale_entries(array_text);
+        }
+    }
+
+    Some(data)
+}
+
+fn parse_tokscale_entries(array_text: &str) -> Vec<TokscaleEntry> {
+    let mut entries = Vec::new();
+    let mut depth = 0i32;
+    let mut obj_start: Option<usize> = None;
+
+    for (i, ch) in array_text.char_indices() {
+        match ch {
+            '[' if depth == 0 => depth = 1,
+            '{' => {
+                depth += 1;
+                if depth == 2 {
+                    obj_start = Some(i);
+                }
+            }
+            '}' => {
+                if depth == 2 {
+                    if let Some(start) = obj_start.take() {
+                        let obj = &array_text[start..=i];
+                        let client = extract_json_string(obj, "client").unwrap_or_default();
+                        let input = extract_json_number(obj, "input").unwrap_or(0.0);
+                        let output = extract_json_number(obj, "output").unwrap_or(0.0);
+                        let cache_read = extract_json_number(obj, "cacheRead").unwrap_or(0.0);
+                        let cost = extract_json_number(obj, "cost").unwrap_or(0.0);
+                        entries.push(TokscaleEntry {
+                            client,
+                            input,
+                            output,
+                            cache_read,
+                            cost,
+                        });
+                    }
+                }
+                depth -= 1;
+            }
+            ']' if depth == 1 => break,
+            _ => {}
+        }
+    }
+    entries
+}
+
+fn read_tokscale_data() -> Option<TokscaleData> {
+    let handle = tokscale_data_handle();
+    handle.read().ok()?.clone()
+}
+
+/// Map a pane command to the corresponding tokscale client name.
+fn pane_command_to_tokscale_client(command: &str) -> Option<&'static str> {
+    match command.to_ascii_lowercase().as_str() {
+        "codex" => Some("codex"),
+        "opencode" => Some("opencode"),
+        "pi" => Some("pi"),
+        "claude" | "claude-code" => Some("claude"),
+        "agent" | "cursor" => Some("cursor"),
+        "amp" | "ampcode" => Some("amp"),
+        "gemini" => Some("gemini"),
+        "copilot" => Some("copilot"),
+        _ => None,
+    }
+}
+
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> anyhow::Result<()> {
     let mut cursor_visible = false;
     let mut mouse_capture_enabled = true;
     let mut mouse_pointer_shape = MousePointerShape::Default;
     let mut last_mouse_position: Option<(u16, u16)> = None;
     let mut last_mouse_move_at: Option<std::time::Instant> = None;
+    let mut last_mouse_drag_at: Option<std::time::Instant> = None;
     let mut last_size = terminal.size()?;
     app.resize(last_size.height, last_size.width);
     // Force an initial paint.
@@ -270,8 +444,18 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                 workspace_pane_ids.sort_unstable();
                 workspace_pane_ids.dedup();
                 let pane_usage = collect_workspace_pane_usage(app, &workspace_pane_ids);
-                let workspace_usage = aggregate_workspace_usage(&pane_usage);
-                let workspace_usage_label = format_workspace_usage_totals(workspace_usage);
+                let workspace_usage_label =
+                    if let Some(ts) = read_tokscale_data() {
+                        let totals = WorkspaceUsageTotals {
+                            tokens: Some(ts.total_tokens()),
+                            cost_usd: Some(ts.total_cost),
+                            context_pct: None,
+                        };
+                        format_workspace_usage_totals(totals)
+                    } else {
+                        let workspace_usage = aggregate_workspace_usage(&pane_usage);
+                        format_workspace_usage_totals(workspace_usage)
+                    };
 
                 render_top_chrome(f, f.size(), theme, Some(&workspace_usage_label));
                 let workspace_names = app.workspace_names();
@@ -362,10 +546,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                     } else {
                         theme.muted
                     };
-                    let mut chrome_style = Style::default().fg(border_color).bg(theme.background);
-                    if focused || in_resize_preview || in_swap_preview {
-                        chrome_style = chrome_style.add_modifier(Modifier::BOLD);
-                    }
+                    let chrome_style = Style::default().fg(border_color).bg(theme.background);
 
                     let block = Block::default()
                         .borders(pane_borders(placement.exposed))
@@ -387,73 +568,109 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                                     .copied()
                                     .unwrap_or_default(),
                             );
-                            let scroll_badge = if pane.scrollback_max > 0 {
-                                if pane.scrollback == 0 {
-                                    "scroll:BOT".to_string()
-                                } else {
-                                    format!("scroll:{}/{}", pane.scrollback, pane.scrollback_max)
-                                }
-                            } else {
-                                "scroll:BOT".to_string()
-                            };
-                            let title = match (usage_badge.is_empty(), focused) {
-                                (true, true) => {
-                                    format!("{}{} {}", pane.title, preview, scroll_badge)
-                                }
-                                (false, true) => {
-                                    format!(
-                                        "{}{} {} {}",
-                                        pane.title, preview, usage_badge, scroll_badge
-                                    )
-                                }
-                                (true, false) => format!("{}{}", pane.title, preview),
-                                (false, false) => {
-                                    format!("{}{} {}", pane.title, preview, usage_badge)
-                                }
-                            };
+                            let pane_type = agent_label_for_command(&pane.command);
+                            let title = format!("{}{} [{}] ▼", pane.title, preview, pane_type);
                             let title_max = title_bar_width
                                 .saturating_sub(pane_title_chrome_reserve(pane_area.width))
-                                .saturating_sub(PANE_TITLE_LEFT_PADDING + 1)
+                                .saturating_sub(PANE_TITLE_LEFT_PADDING + 7)
                                 as usize;
-                            let title_text = format!(" {} ", truncate_to_width(&title, title_max));
-                            let title_slot_w =
-                                title_bar_width.saturating_sub(PANE_TITLE_LEFT_PADDING);
+                            let title_slot_w = title_bar_width;
+                            let title_body = truncate_to_width(&title, title_max);
+                            let usage_max = title_slot_w.saturating_sub(7) as usize;
+                            let usage_body = truncate_to_width(&usage_badge, usage_max);
+                            let top_label_prefix = format!("╭─┐ {}", title_body);
+                            let bottom_prefix = "│ └ ";
+                            let bottom_after_usage = " ";
+                            let top_corner_col = top_label_prefix.chars().count() + 2;
+                            let bottom_corner_col = bottom_prefix.chars().count()
+                                + usage_body.chars().count()
+                                + bottom_after_usage.chars().count()
+                                + 1;
+                            let top_corner_padding =
+                                bottom_corner_col.saturating_sub(top_corner_col);
+                            let top_prefix = format!(
+                                "{top_label_prefix}{} ┌",
+                                " ".repeat(top_corner_padding)
+                            );
+                            let top_min_len = top_prefix.chars().count() + 2;
+                            let bottom_min_len = bottom_prefix.chars().count()
+                                + usage_body.chars().count()
+                                + bottom_after_usage.chars().count()
+                                + 1;
+                            let target_len = top_min_len.max(bottom_min_len);
+                            let top_dash_count =
+                                target_len.saturating_sub(top_prefix.chars().count());
+                            let bottom_dash_count =
+                                target_len.saturating_sub(bottom_min_len + 2);
+                            let title_text =
+                                format!("{top_prefix}{}", "─".repeat(top_dash_count));
                             f.render_widget(
                                 Paragraph::new(title_text)
                                     .alignment(Alignment::Left)
                                     .style(chrome_style),
                                 Rect {
-                                    x: title_bar.x.saturating_add(PANE_TITLE_LEFT_PADDING),
+                                    x: title_bar.x,
                                     y: title_y,
                                     width: title_slot_w,
                                     height: 1,
                                 },
                             );
+
+                            if title_y.saturating_add(1) < pane_area.bottom() {
+                                let usage_line = Line::from(vec![
+                                    Span::styled(bottom_prefix, chrome_style),
+                                    Span::styled(
+                                        usage_body,
+                                        Style::default().fg(theme.muted).bg(theme.background),
+                                    ),
+                                    Span::styled(
+                                        format!(
+                                            "{bottom_after_usage}{}┘",
+                                            "─".repeat(bottom_dash_count)
+                                        ),
+                                        chrome_style,
+                                    ),
+                                ]);
+                                f.render_widget(
+                                    Paragraph::new(usage_line)
+                                        .alignment(Alignment::Left)
+                                        .style(chrome_style),
+                                    Rect {
+                                        x: title_bar.x,
+                                        y: title_y.saturating_add(1),
+                                        width: title_slot_w,
+                                        height: 1,
+                                    },
+                                );
+                            }
                         }
 
-                        if pane_area.width >= 11 {
-                            let maximize_icon = if is_maximized { "🗗" } else { "⛶" };
+                        let maximize_icon = if is_maximized { "🗗" } else { "⛶" };
+                        let controls_top = format!("─┐ {maximize_icon}  🗙 ┌─╮");
+                        let controls_bottom = " └──────┘ │";
+                        let controls_width = controls_top.chars().count() as u16;
+                        if pane_area.width >= controls_width {
+                            let controls_x = pane_area.right().saturating_sub(controls_width);
                             f.render_widget(
-                                Paragraph::new(format!(" {} ", maximize_icon)).style(chrome_style),
+                                Paragraph::new(controls_top).style(chrome_style),
                                 Rect {
-                                    x: pane_area.right().saturating_sub(8),
+                                    x: controls_x,
                                     y: title_y,
-                                    width: 3,
+                                    width: controls_width,
                                     height: 1,
                                 },
                             );
-                        }
-
-                        if pane_area.width >= 6 {
-                            f.render_widget(
-                                Paragraph::new("🗙 ").style(chrome_style),
-                                Rect {
-                                    x: pane_area.right().saturating_sub(4),
-                                    y: title_y,
-                                    width: 2,
-                                    height: 1,
-                                },
-                            );
+                            if title_y.saturating_add(1) < pane_area.bottom() {
+                                f.render_widget(
+                                    Paragraph::new(controls_bottom).style(chrome_style),
+                                    Rect {
+                                        x: controls_x,
+                                        y: title_y.saturating_add(1),
+                                        width: controls_width,
+                                        height: 1,
+                                    },
+                                );
+                            }
                         }
                     }
 
@@ -464,17 +681,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                             continue;
                         }
 
-                        let show_scrollbar = inner.width > 3;
-                        let content_area = if show_scrollbar {
-                            Rect {
-                                x: inner.x,
-                                y: inner.y,
-                                width: inner.width.saturating_sub(2),
-                                height: inner.height,
-                            }
-                        } else {
-                            inner
-                        };
+                        let content_area = inner;
 
                         let pane_view =
                             pane_view_for_render(pane.styled_view(selection), theme, focused);
@@ -482,32 +689,6 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                             .wrap(Wrap { trim: false })
                             .style(Style::default().bg(theme.background));
                         f.render_widget(paragraph, content_area);
-
-                        if show_scrollbar {
-                            let scrollbar = Scrollbar::default()
-                                .orientation(ScrollbarOrientation::VerticalRight)
-                                .begin_symbol(Some("↑"))
-                                .end_symbol(Some("↓"))
-                                .track_symbol(Some("│"))
-                                .track_style(Style::default().fg(theme.muted))
-                                .thumb_style(if focused {
-                                    Style::default().fg(theme.accent)
-                                } else {
-                                    Style::default().fg(theme.muted)
-                                });
-                            let mut state =
-                                pane.scrollbar_state(content_area.width, content_area.height);
-                            f.render_stateful_widget(
-                                scrollbar,
-                                Rect {
-                                    x: inner.right().saturating_sub(1),
-                                    y: inner.y,
-                                    width: 1,
-                                    height: inner.height,
-                                },
-                                &mut state,
-                            );
-                        }
 
                         if modal_is_none && focused && !commander_focused {
                             if let Some((x, y)) = pane.cursor_position_in(content_area) {
@@ -620,20 +801,34 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                     dirty = true;
                 }
                 Event::Mouse(mouse) => {
-                    if matches!(mouse.kind, MouseEventKind::Moved) {
-                        let now = std::time::Instant::now();
-                        if last_mouse_move_at
-                            .is_some_and(|last| now.duration_since(last) < MOUSE_MOVE_DEBOUNCE)
-                        {
-                            continue;
+                    let now = std::time::Instant::now();
+                    match mouse.kind {
+                        MouseEventKind::Moved => {
+                            if last_mouse_move_at.is_some_and(|last| {
+                                now.duration_since(last) < MOUSE_MOVE_DEBOUNCE
+                            }) {
+                                continue;
+                            }
+                            last_mouse_move_at = Some(now);
+                            last_mouse_position = Some((mouse.column, mouse.row));
+                            app.handle_mouse(mouse, size)?;
                         }
-                        last_mouse_move_at = Some(now);
-                        last_mouse_position = Some((mouse.column, mouse.row));
-                        app.handle_mouse(mouse, size)?;
-                    } else {
-                        last_mouse_position = Some((mouse.column, mouse.row));
-                        app.handle_mouse(mouse, size)?;
-                        dirty = true;
+                        MouseEventKind::Drag(_) => {
+                            if last_mouse_drag_at.is_some_and(|last| {
+                                now.duration_since(last) < MOUSE_DRAG_DEBOUNCE
+                            }) {
+                                continue;
+                            }
+                            last_mouse_drag_at = Some(now);
+                            last_mouse_position = Some((mouse.column, mouse.row));
+                            app.handle_mouse(mouse, size)?;
+                            dirty = true;
+                        }
+                        _ => {
+                            last_mouse_position = Some((mouse.column, mouse.row));
+                            app.handle_mouse(mouse, size)?;
+                            dirty = true;
+                        }
                     }
                 }
                 Event::Paste(text) => {
@@ -826,6 +1021,8 @@ fn render_commander_sidebar_panel(
 }
 
 fn collect_workspace_pane_usage(app: &App, pane_ids: &[usize]) -> HashMap<usize, PaneUsageStats> {
+    let tokscale = read_tokscale_data();
+
     let cwd = env::current_dir().ok();
     let codex_sessions = cwd
         .as_deref()
@@ -837,11 +1034,39 @@ fn collect_workspace_pane_usage(app: &App, pane_ids: &[usize]) -> HashMap<usize,
         map.retain(|pane_id, _| pane_ids.contains(pane_id));
     }
     let mut claimed_codex_sessions = HashSet::<String>::new();
+
+    // Count how many panes share each tokscale client so we can split evenly.
+    let mut client_pane_counts: HashMap<&str, usize> = HashMap::new();
+    if tokscale.is_some() {
+        for pane_id in pane_ids {
+            if let Some(pane) = app.pane(*pane_id) {
+                if let Some(client) = pane_command_to_tokscale_client(&pane.command) {
+                    *client_pane_counts.entry(client).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
     let mut out = HashMap::with_capacity(pane_ids.len());
     for pane_id in pane_ids {
         if let Some(pane) = app.pane(*pane_id) {
             let pane_text = pane.visible_plain_text();
             let mut stats = parse_pane_usage_stats(&pane_text);
+
+            // Try tokscale per-client data first.
+            if let Some(ref ts) = tokscale {
+                if let Some(client) = pane_command_to_tokscale_client(&pane.command) {
+                    let share = *client_pane_counts.get(client).unwrap_or(&1).max(&1);
+                    if let Some(tokens) = ts.client_tokens(client) {
+                        stats.tokens = Some(tokens / share as f64);
+                    }
+                    if let Some(cost) = ts.client_cost(client) {
+                        stats.cost_usd = Some(cost / share as f64);
+                    }
+                }
+            }
+
+            // Codex session files can still provide context window %.
             if pane.command == "codex" {
                 let mapped_session = mapping_guard
                     .as_ref()
@@ -858,7 +1083,16 @@ fn collect_workspace_pane_usage(app: &App, pane_ids: &[usize]) -> HashMap<usize,
                     if let Some(map) = mapping_guard.as_mut() {
                         map.insert(*pane_id, session_id);
                     }
-                    stats = pane_usage_stats_from_codex_session(usage);
+                    let codex_stats = pane_usage_stats_from_codex_session(usage);
+                    // Tokscale provides better cost/token data; only take
+                    // context % from the session file when tokscale didn't
+                    // already populate it.
+                    if stats.context_pct.is_none() {
+                        stats.context_pct = codex_stats.context_pct;
+                    }
+                    if tokscale.is_none() {
+                        stats = codex_stats;
+                    }
                 }
             } else if let Some(map) = mapping_guard.as_mut() {
                 map.remove(pane_id);
@@ -1175,9 +1409,16 @@ fn extract_json_number(line: &str, key: &str) -> Option<f64> {
 }
 
 fn extract_json_string(line: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\":\"");
+    let needle = format!("\"{key}\":");
     let key_index = line.find(&needle)?;
     let mut i = key_index + needle.len();
+    while i < line.len() && line.as_bytes()[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= line.len() || line.as_bytes()[i] != b'"' {
+        return None;
+    }
+    i += 1;
     let mut out = String::new();
     let bytes = line.as_bytes();
     let mut escaped = false;
@@ -1487,19 +1728,17 @@ fn aggregate_workspace_usage(by_pane: &HashMap<usize, PaneUsageStats>) -> Worksp
 
 fn format_pane_usage_badge(stats: PaneUsageStats) -> String {
     format!(
-        "[tok {} | ${} | ctx {}]",
+        "tok {} | ${}",
         format_optional_token_count(stats.tokens),
         format_optional_currency(stats.cost_usd),
-        format_optional_percent(stats.context_pct)
     )
 }
 
 fn format_workspace_usage_totals(totals: WorkspaceUsageTotals) -> String {
     format!(
-        "Σ tok {} | ${} | ctx {}",
+        "Σ tok {} | ${}",
         format_optional_token_count(totals.tokens),
         format_optional_currency(totals.cost_usd),
-        format_optional_percent(totals.context_pct)
     )
 }
 
@@ -1517,12 +1756,6 @@ fn format_optional_currency(value: Option<f64>) -> String {
         .unwrap_or_else(|| "--".to_string())
 }
 
-fn format_optional_percent(value: Option<f64>) -> String {
-    value
-        .filter(|v| v.is_finite() && *v >= 0.0)
-        .map(|v| format!("{}%", format_trimmed_decimal(v, 1)))
-        .unwrap_or_else(|| "--".to_string())
-}
 
 fn format_token_count(value: f64) -> String {
     if value >= 1_000_000_000.0 {
@@ -2230,6 +2463,65 @@ mod tests {
             + (0.2 * CODEX_PRICE_CACHED_INPUT_PER_1M)
             + (0.1 * CODEX_PRICE_OUTPUT_PER_1M);
         assert!((cost - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parses_tokscale_json_output() {
+        let json = r#"{
+  "groupBy": "client,model",
+  "entries": [
+    {
+      "client": "codex",
+      "mergedClients": null,
+      "model": "gpt-5.3-codex",
+      "provider": "openai",
+      "input": 85181,
+      "output": 8175,
+      "cacheRead": 1530112,
+      "cacheWrite": 0,
+      "reasoning": 1405,
+      "messageCount": 26,
+      "cost": 0.55095635
+    },
+    {
+      "client": "claude",
+      "mergedClients": null,
+      "model": "claude-opus-4",
+      "provider": "anthropic",
+      "input": 42000,
+      "output": 3000,
+      "cacheRead": 100000,
+      "cacheWrite": 0,
+      "reasoning": 0,
+      "messageCount": 10,
+      "cost": 1.25
+    }
+  ],
+  "totalInput": 127181,
+  "totalOutput": 11175,
+  "totalCacheRead": 1630112,
+  "totalCacheWrite": 0,
+  "totalMessages": 36,
+  "totalCost": 1.80095635,
+  "processingTimeMs": 5000
+}"#;
+        let data = parse_tokscale_json(json).expect("should parse");
+        assert_eq!(data.total_input, 127_181.0);
+        assert_eq!(data.total_output, 11_175.0);
+        assert_eq!(data.total_cache_read, 1_630_112.0);
+        assert!((data.total_cost - 1.80095635).abs() < 1e-6);
+        assert_eq!(data.entries.len(), 2);
+        assert_eq!(data.entries[0].client, "codex");
+        assert!((data.entries[0].cost - 0.55095635).abs() < 1e-6);
+        assert_eq!(data.entries[1].client, "claude");
+        assert!((data.entries[1].cost - 1.25).abs() < 1e-6);
+
+        assert!((data.client_cost("codex").unwrap() - 0.55095635).abs() < 1e-6);
+        assert!((data.client_cost("claude").unwrap() - 1.25).abs() < 1e-6);
+        assert!(data.client_cost("opencode").is_none());
+
+        let codex_tokens = data.client_tokens("codex").unwrap();
+        assert!((codex_tokens - (85181.0 + 8175.0 + 1530112.0)).abs() < 1e-6);
     }
 
     #[test]

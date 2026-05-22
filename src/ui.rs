@@ -153,6 +153,19 @@ pub(crate) fn agent_binary_for_command(command: &str) -> Option<&'static str> {
         .and_then(|preset| preset.binary)
 }
 
+pub(crate) fn agent_label_for_command(command: &str) -> &'static str {
+    let normalized = match command {
+        "cursor-agent" => "agent",
+        "opencode-agent" => "opencode",
+        other => other,
+    };
+    AGENT_PRESETS
+        .iter()
+        .find(|preset| preset.command == normalized)
+        .map(|preset| preset.label)
+        .unwrap_or("Terminal")
+}
+
 pub(crate) fn agent_command_for_input(input: &str) -> Option<&'static str> {
     let normalized = input
         .trim()
