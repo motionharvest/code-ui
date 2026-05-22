@@ -561,7 +561,6 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                     if title_y < pane_area.bottom() {
                         let title_bar_width = title_bar.width;
                         if title_bar_width > PANE_TITLE_LEFT_PADDING {
-                            let preview = if in_resize_preview { " resizing" } else { "" };
                             let usage_badge = format_pane_usage_badge(
                                 pane_usage
                                     .get(&placement.pane_id)
@@ -569,7 +568,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                                     .unwrap_or_default(),
                             );
                             let pane_type = agent_label_for_command(&pane.command);
-                            let title = format!("{}{} [{}] ▼", pane.title, preview, pane_type);
+                            let title = format!("{} [{}] ▼", pane.title, pane_type);
                             let title_max = title_bar_width
                                 .saturating_sub(pane_title_chrome_reserve(pane_area.width))
                                 .saturating_sub(PANE_TITLE_LEFT_PADDING + 7)
