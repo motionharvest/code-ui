@@ -59,7 +59,7 @@ fn color_contrast_delta(a: Color, b: Color) -> Option<u16> {
 }
 
 fn selected_tab_bg(theme: Theme) -> Color {
-    let candidate = theme.palette[14];
+    let candidate = theme.palette.get(14).copied().unwrap_or(theme.accent);
     match color_contrast_delta(candidate, theme.background) {
         Some(delta) if delta >= 180 => candidate,
         _ => theme.accent,
@@ -394,11 +394,10 @@ pub(crate) fn render_workspace_sidebar(
         } else {
             deselected_tab_style(theme)
         };
-        let summary_style = Style::default().fg(theme.background).bg(style.bg.unwrap_or(theme.muted));
-        f.render_widget(
-            Block::default().style(style),
-            item_area,
-        );
+        let summary_style = Style::default()
+            .fg(theme.background)
+            .bg(style.bg.unwrap_or(theme.muted));
+        f.render_widget(Block::default().style(style), item_area);
         let label_width = item_area.width.saturating_sub(2) as usize;
         let label = truncate_to_width(name, label_width);
         f.render_widget(
@@ -413,7 +412,10 @@ pub(crate) fn render_workspace_sidebar(
             },
         );
         if item_area.height >= 2 {
-            let summary = workspace_summaries.get(idx).map(|s| s.as_str()).unwrap_or("");
+            let summary = workspace_summaries
+                .get(idx)
+                .map(|s| s.as_str())
+                .unwrap_or("");
             let summary_text = truncate_to_width(summary, label_width);
             f.render_widget(
                 Paragraph::new(format!(" {} ", summary_text))
@@ -436,10 +438,7 @@ pub(crate) fn render_workspace_sidebar(
         } else {
             deselected_tab_style(theme)
         };
-        f.render_widget(
-            Block::default().style(style),
-            add_area,
-        );
+        f.render_widget(Block::default().style(style), add_area);
         f.render_widget(
             Paragraph::new(" + ")
                 .alignment(Alignment::Left)

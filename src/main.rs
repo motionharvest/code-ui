@@ -49,10 +49,9 @@ use layout::{
 };
 use theme::Theme;
 use ui::{
-    agent_label_for_command,
-    render_help_modal, render_new_pane_picker_modal, render_panel_settings_modal,
-    render_theme_modal, render_top_chrome, render_workspace_settings_modal,
-    render_workspace_sidebar, truncate_to_width,
+    agent_label_for_command, render_help_modal, render_new_pane_picker_modal,
+    render_panel_settings_modal, render_theme_modal, render_top_chrome,
+    render_workspace_settings_modal, render_workspace_sidebar, truncate_to_width,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -297,15 +296,13 @@ fn tokscale_data_handle() -> &'static Arc<RwLock<Option<TokscaleData>>> {
 
 fn spawn_tokscale_refresh_thread() {
     let handle = Arc::clone(tokscale_data_handle());
-    thread::spawn(move || {
-        loop {
-            if let Some(data) = run_tokscale_json() {
-                if let Ok(mut guard) = handle.write() {
-                    *guard = Some(data);
-                }
+    thread::spawn(move || loop {
+        if let Some(data) = run_tokscale_json() {
+            if let Ok(mut guard) = handle.write() {
+                *guard = Some(data);
             }
-            thread::sleep(TOKSCALE_REFRESH_INTERVAL);
         }
+        thread::sleep(TOKSCALE_REFRESH_INTERVAL);
     });
 }
 
@@ -442,18 +439,17 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                 workspace_pane_ids.sort_unstable();
                 workspace_pane_ids.dedup();
                 let pane_usage = collect_workspace_pane_usage(app, &workspace_pane_ids);
-                let workspace_usage_label =
-                    if let Some(ts) = read_tokscale_data() {
-                        let totals = WorkspaceUsageTotals {
-                            tokens: Some(ts.total_tokens()),
-                            cost_usd: Some(ts.total_cost),
-                            context_pct: None,
-                        };
-                        format_workspace_usage_totals(totals)
-                    } else {
-                        let workspace_usage = aggregate_workspace_usage(&pane_usage);
-                        format_workspace_usage_totals(workspace_usage)
+                let workspace_usage_label = if let Some(ts) = read_tokscale_data() {
+                    let totals = WorkspaceUsageTotals {
+                        tokens: Some(ts.total_tokens()),
+                        cost_usd: Some(ts.total_cost),
+                        context_pct: None,
                     };
+                    format_workspace_usage_totals(totals)
+                } else {
+                    let workspace_usage = aggregate_workspace_usage(&pane_usage);
+                    format_workspace_usage_totals(workspace_usage)
+                };
 
                 render_top_chrome(f, f.size(), theme, Some(&workspace_usage_label));
                 let workspace_names = app.workspace_names();
@@ -587,10 +583,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                                 + 1;
                             let top_corner_padding =
                                 bottom_corner_col.saturating_sub(top_corner_col);
-                            let top_prefix = format!(
-                                "{top_label_prefix}{} ┌",
-                                " ".repeat(top_corner_padding)
-                            );
+                            let top_prefix =
+                                format!("{top_label_prefix}{} ┌", " ".repeat(top_corner_padding));
                             let top_min_len = top_prefix.chars().count() + 2;
                             let bottom_min_len = bottom_prefix.chars().count()
                                 + usage_body.chars().count()
@@ -599,10 +593,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                             let target_len = top_min_len.max(bottom_min_len);
                             let top_dash_count =
                                 target_len.saturating_sub(top_prefix.chars().count());
-                            let bottom_dash_count =
-                                target_len.saturating_sub(bottom_min_len + 2);
-                            let title_text =
-                                format!("{top_prefix}{}", "─".repeat(top_dash_count));
+                            let bottom_dash_count = target_len.saturating_sub(bottom_min_len + 2);
+                            let title_text = format!("{top_prefix}{}", "─".repeat(top_dash_count));
                             f.render_widget(
                                 Paragraph::new(title_text)
                                     .alignment(Alignment::Left)
@@ -974,12 +966,39 @@ fn render_commander_sidebar_panel(
         height: input_top.saturating_sub(inner.y),
     };
     if logs_area.height > 0 {
-        app.set_commander_palette_video_size(logs_area.height, logs_area.width);
-        let frame = app.commander_palette_video_frame().map(str::to_string);
-        if let Some(frame) = frame.as_deref() {
-            render_ascii_character_overlay(f, logs_area, frame, theme);
+        let [top_third, middle_third, bottom_third] = split_rect_into_thirds(logs_area);
+
+        // Intentionally leave the top third blank for now.
+        if middle_third.height > 0 {
+            app.set_commander_palette_video_size(middle_third.height, middle_third.width);
+            let frame = app.commander_palette_video_frame().map(str::to_string);
+            if let Some(frame) = frame.as_deref() {
+                render_ascii_character_overlay(f, middle_third, frame, theme);
+            }
+        } else {
+            app.set_commander_palette_video_size(0, 0);
         }
-        render_commander_chat_overlay(f, logs_area, app.commander_history(), theme);
+        let chat_area = if bottom_third.height > 0 {
+            bottom_third
+        } else if middle_third.height > 0 {
+            middle_third
+        } else {
+            top_third
+        };
+        if chat_area.height > 0 && chat_area.y > logs_area.y && logs_area.width > 0 {
+            let divider = "─".repeat(logs_area.width as usize);
+            f.render_widget(
+                Paragraph::new(divider)
+                    .style(Style::default().fg(theme.muted).bg(theme.background)),
+                Rect {
+                    x: logs_area.x,
+                    y: chat_area.y.saturating_sub(1),
+                    width: logs_area.width,
+                    height: 1,
+                },
+            );
+        }
+        render_commander_chat_overlay(f, chat_area, app.commander_history(), theme);
     }
 
     let input_area = Rect {
@@ -1741,7 +1760,6 @@ fn format_optional_currency(value: Option<f64>) -> String {
         .unwrap_or_else(|| "--".to_string())
 }
 
-
 fn format_token_count(value: f64) -> String {
     if value >= 1_000_000_000.0 {
         return format!("{}B", format_trimmed_decimal(value / 1_000_000_000.0, 1));
@@ -1778,7 +1796,7 @@ fn format_trimmed_decimal(value: f64, decimals: usize) -> String {
     s
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum ChatSide {
     Left,
     Right,
@@ -1794,6 +1812,9 @@ struct ChatRenderLine {
 }
 
 fn render_commander_chat_overlay(f: &mut Frame<'_>, area: Rect, history: &[String], theme: Theme) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
     let lines = build_commander_chat_lines(history, area.width, theme);
     let max_lines = area.height as usize;
     let start = lines.len().saturating_sub(max_lines);
@@ -1888,6 +1909,7 @@ fn build_commander_chat_lines(history: &[String], width: u16, theme: Theme) -> V
 
     let mut out = Vec::<ChatRenderLine>::new();
     let max_inner_width = total_width.saturating_sub(6).max(8);
+    let mut last_side: Option<ChatSide> = None;
 
     for entry in history {
         let trimmed = entry.trim();
@@ -1895,24 +1917,49 @@ fn build_commander_chat_lines(history: &[String], width: u16, theme: Theme) -> V
             continue;
         }
 
-        let (side, text, bubble_bg, bubble_fg) = if let Some(text) = trimmed.strip_prefix("You: ") {
-            (ChatSide::Right, text.trim(), user_bg, user_fg)
-        } else if let Some(text) = trimmed.strip_prefix("Commander: ") {
-            (ChatSide::Left, text.trim(), commander_bg, commander_fg)
-        } else {
-            out.push(ChatRenderLine {
-                side: ChatSide::Left,
-                text: trimmed.to_string(),
-                fg: theme.muted,
-                bg: theme.background,
-                is_tail: false,
-            });
-            continue;
-        };
+        let (side, speaker, text, bubble_bg, bubble_fg) =
+            if let Some(text) = trimmed.strip_prefix("You: ") {
+                (ChatSide::Right, "You", text.trim(), user_bg, user_fg)
+            } else if let Some(text) = trimmed.strip_prefix("Commander: ") {
+                (
+                    ChatSide::Left,
+                    "Commander",
+                    text.trim(),
+                    commander_bg,
+                    commander_fg,
+                )
+            } else {
+                out.push(ChatRenderLine {
+                    side: ChatSide::Left,
+                    text: trimmed.to_string(),
+                    fg: theme.muted,
+                    bg: theme.background,
+                    is_tail: false,
+                });
+                continue;
+            };
 
         if text.is_empty() {
             continue;
         }
+
+        // Add lightweight speaker context so the transcript reads as dialogue.
+        if last_side.is_some() && last_side != Some(side) {
+            out.push(ChatRenderLine {
+                side: ChatSide::Left,
+                text: String::new(),
+                fg: theme.foreground,
+                bg: theme.background,
+                is_tail: false,
+            });
+        }
+        out.push(ChatRenderLine {
+            side,
+            text: format!("{speaker}:"),
+            fg: theme.muted,
+            bg: theme.background,
+            is_tail: false,
+        });
 
         let wrapped = hard_wrap_text(text, max_inner_width);
         let inner_width = wrapped
@@ -1951,6 +1998,7 @@ fn build_commander_chat_lines(history: &[String], width: u16, theme: Theme) -> V
             bg: theme.background,
             is_tail: false,
         });
+        last_side = Some(side);
     }
 
     out
@@ -1976,6 +2024,60 @@ fn hard_wrap_text(text: &str, width: usize) -> Vec<String> {
         col += 1;
     }
     lines
+}
+
+fn split_rect_into_thirds(area: Rect) -> [Rect; 3] {
+    if area.height == 0 {
+        return [
+            Rect {
+                x: area.x,
+                y: area.y,
+                width: area.width,
+                height: 0,
+            },
+            Rect {
+                x: area.x,
+                y: area.y,
+                width: area.width,
+                height: 0,
+            },
+            Rect {
+                x: area.x,
+                y: area.y,
+                width: area.width,
+                height: 0,
+            },
+        ];
+    }
+
+    let base = area.height / 3;
+    let remainder = area.height % 3;
+    let h0 = base;
+    let h1 = base;
+    let h2 = base + remainder;
+    let y1 = area.y.saturating_add(h0);
+    let y2 = y1.saturating_add(h1);
+
+    [
+        Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: h0,
+        },
+        Rect {
+            x: area.x,
+            y: y1,
+            width: area.width,
+            height: h1,
+        },
+        Rect {
+            x: area.x,
+            y: y2,
+            width: area.width,
+            height: h2,
+        },
+    ]
 }
 
 fn pane_view_for_render(view: Text<'static>, theme: Theme, focused: bool) -> Text<'static> {
@@ -2081,23 +2183,25 @@ fn recolor_color(color: Color, theme: Theme, mode: PaneColorMode, is_foreground:
             }
         }
         PaneColorMode::Palette => match color {
-            Color::Black => theme.palette[0],
-            Color::Red => theme.palette[1],
-            Color::Green => theme.palette[2],
-            Color::Yellow => theme.palette[3],
-            Color::Blue => theme.palette[4],
-            Color::Magenta => theme.palette[5],
-            Color::Cyan => theme.palette[6],
-            Color::Gray => theme.palette[7],
-            Color::DarkGray => theme.palette[8],
-            Color::LightRed => theme.palette[9],
-            Color::LightGreen => theme.palette[10],
-            Color::LightYellow => theme.palette[11],
-            Color::LightBlue => theme.palette[12],
-            Color::LightMagenta => theme.palette[13],
-            Color::LightCyan => theme.palette[14],
-            Color::White => theme.palette[15],
-            Color::Indexed(index) if index < 16 => theme.palette[index as usize],
+            Color::Black => palette_color(theme, 0),
+            Color::Red => palette_color(theme, 1),
+            Color::Green => palette_color(theme, 2),
+            Color::Yellow => palette_color(theme, 3),
+            Color::Blue => palette_color(theme, 4),
+            Color::Magenta => palette_color(theme, 5),
+            Color::Cyan => palette_color(theme, 6),
+            Color::Gray => palette_color(theme, 7),
+            Color::DarkGray => palette_color(theme, 8),
+            Color::LightRed => palette_color(theme, 9),
+            Color::LightGreen => palette_color(theme, 10),
+            Color::LightYellow => palette_color(theme, 11),
+            Color::LightBlue => palette_color(theme, 12),
+            Color::LightMagenta => palette_color(theme, 13),
+            Color::LightCyan => palette_color(theme, 14),
+            Color::White => palette_color(theme, 15),
+            Color::Indexed(index) if (index as usize) < theme.palette.len() => {
+                palette_color(theme, index as usize)
+            }
             Color::Indexed(index) => nearest_theme_color(indexed_color_to_rgb(index), theme),
             Color::Rgb(_, _, _) => nearest_theme_color(color_to_rgb(color), theme),
             Color::Reset => default_foreground(theme, mode),
@@ -2105,10 +2209,19 @@ fn recolor_color(color: Color, theme: Theme, mode: PaneColorMode, is_foreground:
     }
 }
 
+fn palette_color(theme: Theme, index: usize) -> Color {
+    theme
+        .palette
+        .get(index)
+        .copied()
+        .unwrap_or(theme.foreground)
+}
+
 fn nearest_theme_color(color: (u8, u8, u8), theme: Theme) -> Color {
     theme
         .palette
-        .into_iter()
+        .iter()
+        .copied()
         .min_by_key(|candidate| color_distance_sq(color, color_to_rgb(*candidate)))
         .unwrap_or(theme.foreground)
 }
@@ -2242,6 +2355,26 @@ mod tests {
     use super::*;
     use ratatui::style::Stylize;
 
+    const TEST_PALETTE: &[Color] = &[
+        Color::Rgb(20, 20, 24),
+        Color::Rgb(220, 80, 90),
+        Color::Rgb(90, 200, 120),
+        Color::Rgb(230, 200, 120),
+        Color::Rgb(90, 160, 240),
+        Color::Rgb(220, 120, 220),
+        Color::Rgb(80, 200, 210),
+        Color::Rgb(220, 220, 230),
+        Color::Rgb(120, 120, 130),
+        Color::Rgb(255, 130, 150),
+        Color::Rgb(140, 220, 150),
+        Color::Rgb(255, 220, 120),
+        Color::Rgb(120, 180, 255),
+        Color::Rgb(240, 160, 240),
+        Color::Rgb(120, 230, 230),
+        Color::Rgb(255, 255, 255),
+    ];
+    const RESET_PALETTE: &[Color] = &[Color::Reset; 16];
+
     fn test_theme() -> Theme {
         Theme {
             name: "Test",
@@ -2251,24 +2384,7 @@ mod tests {
             accent: Color::Rgb(80, 140, 220),
             title_bar: Color::Rgb(190, 160, 90),
             passthrough: false,
-            palette: [
-                Color::Rgb(20, 20, 24),
-                Color::Rgb(220, 80, 90),
-                Color::Rgb(90, 200, 120),
-                Color::Rgb(230, 200, 120),
-                Color::Rgb(90, 160, 240),
-                Color::Rgb(220, 120, 220),
-                Color::Rgb(80, 200, 210),
-                Color::Rgb(220, 220, 230),
-                Color::Rgb(120, 120, 130),
-                Color::Rgb(255, 130, 150),
-                Color::Rgb(140, 220, 150),
-                Color::Rgb(255, 220, 120),
-                Color::Rgb(120, 180, 255),
-                Color::Rgb(240, 160, 240),
-                Color::Rgb(120, 230, 230),
-                Color::Rgb(255, 255, 255),
-            ],
+            palette: TEST_PALETTE,
         }
     }
 
@@ -2349,7 +2465,7 @@ mod tests {
             accent: Color::Reset,
             title_bar: Color::Reset,
             passthrough: true,
-            palette: [Color::Reset; 16],
+            palette: RESET_PALETTE,
         };
 
         let text = Text {

@@ -771,7 +771,6 @@ impl Pane {
 
         Some((col, row))
     }
-
 }
 
 fn normalized_selection(selection: PaneSelection) -> ((u16, u16), (u16, u16)) {
