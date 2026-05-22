@@ -13,14 +13,14 @@ use crate::{
 
 pub(crate) const COMMANDER_COMMAND: &str = "commander";
 pub(crate) const TOP_CHROME_ROWS: u16 = 2;
-pub(crate) const WORKSPACE_SIDEBAR_WIDTH: u16 = 48;
-pub(crate) const WORKSPACE_BAR_HEIGHT: u16 = 1;
+pub(crate) const WORKSPACE_SIDEBAR_WIDTH: u16 = 47;
+pub(crate) const WORKSPACE_BAR_HEIGHT: u16 = 2;
 const APP_NAME: &str = "Code UI";
 const APP_VERSION: &str = "0.0.2";
 const APP_HANDLE: &str = "@motionharvest";
 const WORKSPACE_ENTRY_MARGIN_X: u16 = 1;
 const WORKSPACE_ENTRY_MARGIN_TOP: u16 = 0;
-const WORKSPACE_ENTRY_HEIGHT: u16 = 1;
+const WORKSPACE_ENTRY_HEIGHT: u16 = 2;
 const WORKSPACE_ENTRY_GAP: u16 = 1;
 const WORKSPACE_TAB_WIDTH: u16 = 18;
 const COMMANDER_TAB_WIDTH: u16 = WORKSPACE_SIDEBAR_WIDTH;
@@ -311,6 +311,8 @@ pub(crate) fn workspace_item_area(sidebar_area: Rect, index: usize) -> Rect {
 pub(crate) fn workspace_add_button_area(sidebar_area: Rect, workspace_count: usize) -> Rect {
     let mut area = workspace_item_area(sidebar_area, workspace_count);
     area.width = 3.min(area.width);
+    area.y = area.y.saturating_add(area.height.saturating_sub(1));
+    area.height = 1.min(area.height);
     area
 }
 
@@ -360,6 +362,7 @@ pub(crate) fn render_workspace_sidebar(
     sidebar_area: Rect,
     theme: Theme,
     workspace_names: &[String],
+    workspace_summaries: &[String],
     active_workspace_index: usize,
     _commander_selected: bool,
     sidebar_workspace_selected_index: Option<usize>,
@@ -368,6 +371,11 @@ pub(crate) fn render_workspace_sidebar(
     if sidebar_area.width == 0 || sidebar_area.height == 0 {
         return;
     }
+
+    let divider_x = sidebar_area
+        .x
+        .saturating_add(commander_panel_width(sidebar_area))
+        .min(sidebar_area.right().saturating_sub(1));
 
     f.render_widget(
         Block::default().style(Style::default().bg(theme.background)),
@@ -386,14 +394,39 @@ pub(crate) fn render_workspace_sidebar(
         } else {
             deselected_tab_style(theme)
         };
+        let summary_style = Style::default().fg(theme.background).bg(style.bg.unwrap_or(theme.muted));
+        f.render_widget(
+            Block::default().style(style),
+            item_area,
+        );
         let label_width = item_area.width.saturating_sub(2) as usize;
         let label = truncate_to_width(name, label_width);
         f.render_widget(
             Paragraph::new(format!(" {} ", label))
                 .alignment(Alignment::Left)
                 .style(style),
-            item_area,
+            Rect {
+                x: item_area.x,
+                y: item_area.y,
+                width: item_area.width,
+                height: 1,
+            },
         );
+        if item_area.height >= 2 {
+            let summary = workspace_summaries.get(idx).map(|s| s.as_str()).unwrap_or("");
+            let summary_text = truncate_to_width(summary, label_width);
+            f.render_widget(
+                Paragraph::new(format!(" {} ", summary_text))
+                    .alignment(Alignment::Left)
+                    .style(summary_style),
+                Rect {
+                    x: item_area.x,
+                    y: item_area.y.saturating_add(1),
+                    width: item_area.width,
+                    height: 1,
+                },
+            );
+        }
     }
 
     let add_area = workspace_add_button_area(sidebar_area, workspace_names.len());
@@ -404,10 +437,51 @@ pub(crate) fn render_workspace_sidebar(
             deselected_tab_style(theme)
         };
         f.render_widget(
+            Block::default().style(style),
+            add_area,
+        );
+        f.render_widget(
             Paragraph::new(" + ")
                 .alignment(Alignment::Left)
                 .style(style),
-            add_area,
+            Rect {
+                x: add_area.x,
+                y: add_area.y,
+                width: add_area.width,
+                height: 1,
+            },
+        );
+        let rule_width = sidebar_area.right().saturating_sub(add_area.right());
+        if rule_width > 0 {
+            let line_area = Rect {
+                x: add_area.right(),
+                y: add_area.y,
+                width: rule_width,
+                height: 1,
+            };
+            f.render_widget(
+                Paragraph::new("─".repeat(rule_width as usize))
+                    .alignment(Alignment::Left)
+                    .style(Style::default().fg(theme.muted).bg(theme.background)),
+                line_area,
+            );
+        }
+    }
+
+    let full_size = f.size();
+    let line_height = full_size.bottom().saturating_sub(sidebar_area.bottom());
+    if line_height > 0 && divider_x < full_size.right() {
+        let line = Text::from(vec![Line::from("│"); line_height as usize]);
+        f.render_widget(
+            Paragraph::new(line)
+                .alignment(Alignment::Left)
+                .style(Style::default().fg(theme.muted).bg(theme.background)),
+            Rect {
+                x: divider_x,
+                y: sidebar_area.bottom(),
+                width: 1,
+                height: line_height,
+            },
         );
     }
 }
@@ -503,7 +577,7 @@ pub(crate) fn render_top_chrome(
     }
     let stats_text = truncate_to_width(usage_summary, stats_width);
     f.render_widget(
-        Paragraph::new(format!(" {}", stats_text))
+        Paragraph::new(stats_text.to_string())
             .alignment(Alignment::Left)
             .style(Style::default().fg(theme.muted).bg(theme.background)),
         Rect {

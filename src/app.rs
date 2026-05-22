@@ -481,14 +481,12 @@ impl App {
     }
 
     pub(crate) fn workspace_sidebar_area(size: Rect) -> Rect {
-        let body = Self::body_area(size);
-        let height = WORKSPACE_BAR_HEIGHT.min(body.height.saturating_sub(1));
-        let y = body.y;
+        let height = WORKSPACE_BAR_HEIGHT.min(size.height);
         Rect {
-            x: body.x,
-            y,
-            width: body.width,
-            height: height.min(body.height.saturating_sub(y.saturating_sub(body.y))),
+            x: size.x,
+            y: size.y,
+            width: size.width,
+            height,
         }
     }
 
@@ -500,19 +498,21 @@ impl App {
             x: body.x,
             y,
             width,
-            height: body.height.saturating_sub(y.saturating_sub(body.y)),
+            height: body.height.saturating_sub(1),
         }
     }
 
     pub(crate) fn content_area(size: Rect) -> Rect {
         let body = Self::body_area(size);
         let commander = Self::commander_panel_area(size);
-        let y = body.y.saturating_add(1);
+        let divider_width = 1;
         Rect {
-            x: commander.right(),
-            y,
-            width: body.width.saturating_sub(commander.width),
-            height: body.height.saturating_sub(y.saturating_sub(body.y)),
+            x: commander.right().saturating_add(divider_width),
+            y: commander.y,
+            width: body
+                .width
+                .saturating_sub(commander.width.saturating_add(divider_width)),
+            height: commander.height,
         }
     }
 
@@ -520,6 +520,19 @@ impl App {
         self.workspaces
             .iter()
             .map(|workspace| workspace.name.clone())
+            .collect()
+    }
+
+    pub(crate) fn workspace_pane_summaries(&self) -> Vec<String> {
+        self.workspaces
+            .iter()
+            .map(|workspace| {
+                let mut ids = Vec::new();
+                workspace.layout.collect_leaf_ids(&mut ids);
+                let count = ids.len();
+                let noun = if count == 1 { "Pane" } else { "Panes" };
+                format!("{} {}", count, noun)
+            })
             .collect()
     }
 

@@ -21,7 +21,6 @@ use std::{
 /// user closes the TUI (Ctrl+Q, Ctrl+R, or a layout-collapse close).
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(750);
 const MOUSE_MOVE_DEBOUNCE: Duration = Duration::from_millis(16);
-const MOUSE_DRAG_DEBOUNCE: Duration = Duration::from_millis(8);
 
 use anyhow::Context;
 use crossterm::{
@@ -410,7 +409,6 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
     let mut mouse_pointer_shape = MousePointerShape::Default;
     let mut last_mouse_position: Option<(u16, u16)> = None;
     let mut last_mouse_move_at: Option<std::time::Instant> = None;
-    let mut last_mouse_drag_at: Option<std::time::Instant> = None;
     let mut last_size = terminal.size()?;
     app.resize(last_size.height, last_size.width);
     // Force an initial paint.
@@ -459,11 +457,13 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
 
                 render_top_chrome(f, f.size(), theme, Some(&workspace_usage_label));
                 let workspace_names = app.workspace_names();
+                let workspace_summaries = app.workspace_pane_summaries();
                 render_workspace_sidebar(
                     f,
                     App::workspace_sidebar_area(f.size()),
                     theme,
                     &workspace_names,
+                    &workspace_summaries,
                     app.active_workspace_index(),
                     app.commander_focused(),
                     app.sidebar_workspace_focused(),
@@ -801,34 +801,20 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                     dirty = true;
                 }
                 Event::Mouse(mouse) => {
-                    let now = std::time::Instant::now();
-                    match mouse.kind {
-                        MouseEventKind::Moved => {
-                            if last_mouse_move_at.is_some_and(|last| {
-                                now.duration_since(last) < MOUSE_MOVE_DEBOUNCE
-                            }) {
-                                continue;
-                            }
-                            last_mouse_move_at = Some(now);
-                            last_mouse_position = Some((mouse.column, mouse.row));
-                            app.handle_mouse(mouse, size)?;
+                    if matches!(mouse.kind, MouseEventKind::Moved) {
+                        let now = std::time::Instant::now();
+                        if last_mouse_move_at
+                            .is_some_and(|last| now.duration_since(last) < MOUSE_MOVE_DEBOUNCE)
+                        {
+                            continue;
                         }
-                        MouseEventKind::Drag(_) => {
-                            if last_mouse_drag_at.is_some_and(|last| {
-                                now.duration_since(last) < MOUSE_DRAG_DEBOUNCE
-                            }) {
-                                continue;
-                            }
-                            last_mouse_drag_at = Some(now);
-                            last_mouse_position = Some((mouse.column, mouse.row));
-                            app.handle_mouse(mouse, size)?;
-                            dirty = true;
-                        }
-                        _ => {
-                            last_mouse_position = Some((mouse.column, mouse.row));
-                            app.handle_mouse(mouse, size)?;
-                            dirty = true;
-                        }
+                        last_mouse_move_at = Some(now);
+                        last_mouse_position = Some((mouse.column, mouse.row));
+                        app.handle_mouse(mouse, size)?;
+                    } else {
+                        last_mouse_position = Some((mouse.column, mouse.row));
+                        app.handle_mouse(mouse, size)?;
+                        dirty = true;
                     }
                 }
                 Event::Paste(text) => {
