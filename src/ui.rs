@@ -160,6 +160,7 @@ const COMMANDER_FRAME_LEFT: &str = "│";
 const COMMANDER_FRAME_RIGHT_POST: &str = "│";
 const COMMANDER_FRAME_CHIN: &str = "─╮";
 const WORKSPACE_ROW2_TAIL: &str = "───╯";
+const WORKSPACE_ROW2_LEAD: &str = "╰───";
 const WORKSPACE_ROW2_TAIL_WIDTH: u16 = 4;
 const COMMANDER_ROW2_TRAILING_MUTED_DASHES: usize = 2;
 const COMMANDER_ROW2_GAP: u16 = 1;
@@ -537,6 +538,14 @@ fn workspace_row2_tail_x(layout: TopBarLayout) -> u16 {
         .saturating_add(COMMANDER_ROW2_SHIFT_RIGHT)
 }
 
+fn workspace_row2_lead_x(layout: TopBarLayout) -> u16 {
+    layout
+        .commander_frame
+        .right()
+        .saturating_add(COMMANDER_ROW2_GAP)
+        .saturating_sub(COMMANDER_ROW2_SHIFT_RIGHT)
+}
+
 fn render_workspace_row2_gap_fill(f: &mut ratatui::Frame<'_>, layout: TopBarLayout, theme: Theme) {
     if layout.bar.height < 2 {
         return;
@@ -569,6 +578,24 @@ fn render_workspace_row2_tail(f: &mut ratatui::Frame<'_>, layout: TopBarLayout, 
     let style = Style::default().fg(theme.muted).bg(theme.background);
     f.render_widget(
         Paragraph::new(WORKSPACE_ROW2_TAIL).style(style),
+        Rect {
+            x,
+            y,
+            width: WORKSPACE_ROW2_TAIL_WIDTH,
+            height: 1,
+        },
+    );
+}
+
+fn render_workspace_row2_lead(f: &mut ratatui::Frame<'_>, layout: TopBarLayout, theme: Theme) {
+    if layout.bar.height < 2 {
+        return;
+    }
+    let y = layout.right_cluster_rule_y;
+    let x = workspace_row2_lead_x(layout);
+    let style = Style::default().fg(theme.muted).bg(theme.background);
+    f.render_widget(
+        Paragraph::new(WORKSPACE_ROW2_LEAD).style(style),
         Rect {
             x,
             y,
@@ -677,10 +704,12 @@ fn render_commander_frame(
     if frame.height > 1 {
         let bottom_y = frame.y.saturating_add(1);
         let bottom_x = frame.x.saturating_add(COMMANDER_ROW2_SHIFT_RIGHT);
-        let bottom_render_width = frame.width.saturating_sub(COMMANDER_ROW2_SHIFT_RIGHT);
+        let bottom_render_width = frame
+            .width
+            .saturating_sub(COMMANDER_ROW2_SHIFT_RIGHT.saturating_mul(2));
         let bottom_width = bottom_render_width as usize;
-        if bottom_width >= 2 {
-            let dash_count = bottom_width.saturating_sub(2);
+        if bottom_width >= 1 {
+            let dash_count = bottom_width.saturating_sub(1);
             let bottom_line = if commander_focused && dash_count > 0 {
                 let muted_dashes = COMMANDER_ROW2_TRAILING_MUTED_DASHES.min(dash_count);
                 let main_dashes = dash_count.saturating_sub(muted_dashes);
@@ -697,13 +726,11 @@ fn render_commander_frame(
                         connector_style,
                     ));
                 }
-                spans.push(Span::styled("╯", connector_style));
                 Line::from(spans)
             } else {
                 let mut bottom = String::with_capacity(bottom_width);
                 bottom.push('╰');
                 bottom.extend(std::iter::repeat_n('─', dash_count));
-                bottom.push('╯');
                 Line::from(Span::styled(bottom, border_style))
             };
             f.render_widget(
@@ -1169,8 +1196,10 @@ pub(crate) fn render_workspace_sidebar(
         commander_focused,
         commander_input,
     );
+    render_workspace_row2_lead(f, layout, theme);
     if commander_focused {
         render_workspace_row2_tail(f, layout, theme);
+        render_workspace_row2_lead(f, layout, theme);
     }
 
     let add_area = workspace_add_button_area(sidebar_area, workspace_names, active_workspace_index);
