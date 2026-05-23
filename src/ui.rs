@@ -157,7 +157,8 @@ pub(crate) const WORKSPACE_BAR_HEIGHT: u16 = 2;
 pub(crate) const COMMANDER_PROMPT: &str = " Commander > ";
 const COMMANDER_CONNECTOR: &str = "╭─";
 const COMMANDER_FRAME_LEFT: &str = "│";
-const COMMANDER_FRAME_RIGHT: &str = "│─╮";
+const COMMANDER_FRAME_RIGHT_POST: &str = "│";
+const COMMANDER_FRAME_CHIN: &str = "─╮";
 const WORKSPACE_ROW2_TAIL: &str = "───╯";
 const WORKSPACE_ROW2_TAIL_WIDTH: u16 = 4;
 const COMMANDER_ROW2_GAP: u16 = 1;
@@ -610,7 +611,9 @@ fn render_commander_frame(
     };
     let connector_width = COMMANDER_CONNECTOR.chars().count() as u16;
     let left_cap_width = COMMANDER_FRAME_LEFT.chars().count() as u16;
-    let right_cap_width = COMMANDER_FRAME_RIGHT.chars().count() as u16;
+    let right_post_width = COMMANDER_FRAME_RIGHT_POST.chars().count() as u16;
+    let chin_width = COMMANDER_FRAME_CHIN.chars().count() as u16;
+    let right_cap_width = right_post_width.saturating_add(chin_width);
     if connector_width > 0 && top_row.width > 0 {
         f.render_widget(
             Paragraph::new(COMMANDER_CONNECTOR).style(connector_style),
@@ -635,7 +638,10 @@ fn render_commander_frame(
     }
     if top_row.width > right_cap_width {
         f.render_widget(
-            Paragraph::new(COMMANDER_FRAME_RIGHT).style(border_style),
+            Paragraph::new(Line::from(vec![
+                Span::styled(COMMANDER_FRAME_RIGHT_POST, border_style),
+                Span::styled(COMMANDER_FRAME_CHIN, connector_style),
+            ])),
             Rect {
                 x: top_row.right().saturating_sub(right_cap_width),
                 y: top_row.y,
