@@ -36,6 +36,9 @@ use crate::{
     utils::{arrow_key_to_split_side, contains, key_to_bytes, LOGIN_SHELL_SENTINEL},
 };
 
+/// Max gap between two Ctrl+Q presses before quit is cancelled.
+const QUIT_CONFIRM_WINDOW: Duration = Duration::from_millis(600);
+
 pub(crate) struct App {
     pub(crate) panes: Vec<Pane>,
     workspaces: Vec<WorkspaceState>,
@@ -65,6 +68,7 @@ pub(crate) struct App {
     tts: TtsState,
     last_terminal_size: Rect,
     hit_test_cache: Option<HitTestCache>,
+    last_quit_key_press: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -517,6 +521,7 @@ impl App {
                 height: rows,
             },
             hit_test_cache: None,
+            last_quit_key_press: None,
         };
         app.rebuild_hit_test_cache();
         Ok(app)
@@ -1891,7 +1896,15 @@ impl App {
         }
 
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
-            self.running = false;
+            let now = Instant::now();
+            if self
+                .last_quit_key_press
+                .is_some_and(|t| now.duration_since(t) <= QUIT_CONFIRM_WINDOW)
+            {
+                self.running = false;
+            } else {
+                self.last_quit_key_press = Some(now);
+            }
             return Ok(());
         }
 

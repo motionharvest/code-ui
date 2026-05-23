@@ -16,10 +16,6 @@ pub(crate) fn pane_chrome_title_label(pane_title: &str, command: &str) -> String
     format!("{} [{}] ▼", pane_title, agent_label_for_command(command))
 }
 
-pub(crate) fn commander_chrome_title_label() -> String {
-    "Commander [harness]".to_string()
-}
-
 /// Two-row title bar chrome shared by workspace panes and the Commander panel.
 pub(crate) fn render_panel_title_chrome(
     f: &mut ratatui::Frame<'_>,
@@ -353,7 +349,7 @@ fn selected_tab_style(theme: Theme) -> Style {
 }
 
 fn inactive_workspace_tab_style(theme: Theme, keyboard_focused: bool) -> Style {
-    let mut style = Style::default().fg(theme.accent).bg(theme.background);
+    let mut style = Style::default().fg(theme.muted).bg(theme.background);
     if keyboard_focused {
         style = style.add_modifier(Modifier::BOLD);
     }
@@ -629,6 +625,13 @@ fn render_commander_frame(
     } else {
         Style::default().fg(theme.foreground).bg(theme.background)
     };
+    let prompt_style = if commander_focused {
+        Style::default()
+            .fg(selected_tab_bg(theme))
+            .bg(theme.background)
+    } else {
+        Style::default().fg(theme.muted).bg(theme.background)
+    };
 
     let top_row = Rect {
         x: frame.x,
@@ -691,7 +694,7 @@ fn render_commander_frame(
             Paragraph::new(Line::from(vec![
                 Span::styled(
                     COMMANDER_PROMPT,
-                    Style::default().fg(theme.muted).bg(theme.background),
+                    prompt_style,
                 ),
                 Span::styled(visible_input, input_style),
             ]))
@@ -1398,7 +1401,7 @@ pub(crate) fn render_help_modal(
         "Ctrl+Space: Show/hide shortcuts\n\
 T: Theme selector\n\
 D: Toggle container debug boxes\n\
-Ctrl+Q: Quit\n\
+Ctrl+Q twice: Quit\n\
 Ctrl+Alt+Arrows: Split pane (pick agent)\n\
 Ctrl+Shift+A / B: Split right / down\n\
 Ctrl+PgUp/PgDn: Cycle pane focus\n\

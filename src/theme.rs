@@ -425,8 +425,8 @@ pub(crate) const THEMES: &[Theme] = &[
         name: "Synthwave",
         background: Color::Rgb(38, 35, 53),
         foreground: Color::Rgb(255, 255, 255),
-        muted: Color::Rgb(254, 222, 93),
-        accent: Color::Rgb(54, 249, 246),
+        muted: Color::Rgb(140, 130, 201),
+        accent: Color::Rgb(244, 69, 247),
         title_bar: Color::Rgb(52, 41, 79),
         passthrough: false,
         palette: &[
