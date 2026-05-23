@@ -1229,7 +1229,6 @@ fn render_right_cluster_rule(
 
     let rule_style = Style::default().fg(theme.muted).bg(theme.background);
     let mut line = vec!['─'; w];
-    line[w - 1] = '╯';
     for pipe_x in right_cluster_separator_pipe_columns(cluster, usage_summary) {
         let col = pipe_x.saturating_sub(cluster.x) as usize;
         if col < w {
