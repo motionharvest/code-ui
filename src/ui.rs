@@ -154,7 +154,7 @@ pub(crate) fn render_panel_title_chrome(
 pub(crate) const COMMANDER_COMMAND: &str = "commander";
 pub(crate) const TOP_CHROME_ROWS: u16 = 2;
 pub(crate) const WORKSPACE_BAR_HEIGHT: u16 = 2;
-pub(crate) const COMMANDER_PROMPT: &str = "Commander > ";
+pub(crate) const COMMANDER_PROMPT: &str = " Commander > ";
 const COMMANDER_FRAME_LEFT: &str = "╭─│";
 const COMMANDER_FRAME_RIGHT: &str = "│─╮";
 const WORKSPACE_ROW2_TAIL: &str = "───╯";
@@ -162,6 +162,7 @@ const WORKSPACE_ROW2_TAIL_WIDTH: u16 = 4;
 const COMMANDER_ROW2_GAP: u16 = 1;
 const COMMANDER_AFTER_ADD_PAD: u16 = 3;
 const COMMANDER_SHIFT_LEFT: u16 = 2;
+const COMMANDER_ROW2_SHIFT_RIGHT: u16 = 2;
 const TOP_BAR_RIGHT_GAP: u16 = 1;
 const RIGHT_CLUSTER_SEP: &str = " │ ";
 const APP_NAME: &str = "Code UI";
@@ -522,15 +523,43 @@ fn render_workspace_tab_chrome(
     );
 }
 
+fn workspace_row2_tail_x(layout: TopBarLayout) -> u16 {
+    layout
+        .commander_frame
+        .x
+        .saturating_sub(WORKSPACE_ROW2_TAIL_WIDTH.saturating_add(COMMANDER_ROW2_GAP))
+        .saturating_add(COMMANDER_ROW2_SHIFT_RIGHT)
+}
+
+fn render_workspace_row2_gap_fill(f: &mut ratatui::Frame<'_>, layout: TopBarLayout, theme: Theme) {
+    if layout.bar.height < 2 {
+        return;
+    }
+    let y = layout.right_cluster_rule_y;
+    let x = layout.workspace_tab_rule_end_x;
+    let width = workspace_row2_tail_x(layout).saturating_sub(x);
+    if width == 0 {
+        return;
+    }
+    let fill = std::iter::repeat_n('─', width as usize).collect::<String>();
+    let style = Style::default().fg(theme.muted).bg(theme.background);
+    f.render_widget(
+        Paragraph::new(fill).style(style),
+        Rect {
+            x,
+            y,
+            width,
+            height: 1,
+        },
+    );
+}
+
 fn render_workspace_row2_tail(f: &mut ratatui::Frame<'_>, layout: TopBarLayout, theme: Theme) {
     if layout.bar.height < 2 {
         return;
     }
     let y = layout.right_cluster_rule_y;
-    let x = layout
-        .commander_frame
-        .x
-        .saturating_sub(WORKSPACE_ROW2_TAIL_WIDTH.saturating_add(COMMANDER_ROW2_GAP));
+    let x = workspace_row2_tail_x(layout);
     let style = Style::default().fg(theme.muted).bg(theme.background);
     f.render_widget(
         Paragraph::new(WORKSPACE_ROW2_TAIL).style(style),
@@ -630,7 +659,7 @@ fn render_commander_frame(
             f.render_widget(
                 Paragraph::new(bottom).style(border_style),
                 Rect {
-                    x: frame.x,
+                    x: frame.x.saturating_add(COMMANDER_ROW2_SHIFT_RIGHT),
                     y: bottom_y,
                     width: frame.width,
                     height: 1,
@@ -1081,6 +1110,7 @@ pub(crate) fn render_workspace_sidebar(
         active_workspace_index,
         layout.workspace_tab_rule_end_x,
     );
+    render_workspace_row2_gap_fill(f, layout, theme);
     render_workspace_row2_tail(f, layout, theme);
     render_commander_frame(
         f,
