@@ -162,7 +162,6 @@ const COMMANDER_FRAME_CHIN: &str = "─╮";
 const WORKSPACE_ROW2_TAIL: &str = "───╯";
 const WORKSPACE_ROW2_LEAD: &str = "╰───";
 const WORKSPACE_ROW2_TAIL_WIDTH: u16 = 4;
-const COMMANDER_ROW2_TRAILING_MUTED_DASHES: usize = 2;
 const COMMANDER_ROW2_GAP: u16 = 1;
 const COMMANDER_AFTER_ADD_PAD: u16 = 3;
 const COMMANDER_SHIFT_LEFT: u16 = 2;
@@ -710,31 +709,11 @@ fn render_commander_frame(
         let bottom_width = bottom_render_width as usize;
         if bottom_width >= 2 {
             let dash_count = bottom_width.saturating_sub(2);
-            let bottom_line = if commander_focused {
-                let muted_dashes = COMMANDER_ROW2_TRAILING_MUTED_DASHES.min(dash_count);
-                let main_dashes = dash_count.saturating_sub(muted_dashes);
-                let mut spans = vec![Span::styled("╰", border_style)];
-                if main_dashes > 0 {
-                    spans.push(Span::styled(
-                        std::iter::repeat_n('─', main_dashes).collect::<String>(),
-                        border_style,
-                    ));
-                }
-                if muted_dashes > 0 {
-                    spans.push(Span::styled(
-                        std::iter::repeat_n('─', muted_dashes).collect::<String>(),
-                        connector_style,
-                    ));
-                }
-                spans.push(Span::styled("╯", border_style));
-                Line::from(spans)
-            } else {
-                let mut bottom = String::with_capacity(bottom_width);
-                bottom.push('╰');
-                bottom.extend(std::iter::repeat_n('─', dash_count));
-                bottom.push('╯');
-                Line::from(Span::styled(bottom, border_style))
-            };
+            let mut bottom = String::with_capacity(bottom_width);
+            bottom.push('╰');
+            bottom.extend(std::iter::repeat_n('─', dash_count));
+            bottom.push('╯');
+            let bottom_line = Line::from(Span::styled(bottom, border_style));
             f.render_widget(
                 Paragraph::new(bottom_line),
                 Rect {
