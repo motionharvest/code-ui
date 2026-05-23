@@ -708,9 +708,9 @@ fn render_commander_frame(
             .width
             .saturating_sub(COMMANDER_ROW2_SHIFT_RIGHT.saturating_mul(2));
         let bottom_width = bottom_render_width as usize;
-        if bottom_width >= 1 {
-            let dash_count = bottom_width.saturating_sub(1);
-            let bottom_line = if commander_focused && dash_count > 0 {
+        if bottom_width >= 2 {
+            let dash_count = bottom_width.saturating_sub(2);
+            let bottom_line = if commander_focused {
                 let muted_dashes = COMMANDER_ROW2_TRAILING_MUTED_DASHES.min(dash_count);
                 let main_dashes = dash_count.saturating_sub(muted_dashes);
                 let mut spans = vec![Span::styled("╰", border_style)];
@@ -726,11 +726,13 @@ fn render_commander_frame(
                         connector_style,
                     ));
                 }
+                spans.push(Span::styled("╯", border_style));
                 Line::from(spans)
             } else {
                 let mut bottom = String::with_capacity(bottom_width);
                 bottom.push('╰');
                 bottom.extend(std::iter::repeat_n('─', dash_count));
+                bottom.push('╯');
                 Line::from(Span::styled(bottom, border_style))
             };
             f.render_widget(
