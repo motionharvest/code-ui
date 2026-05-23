@@ -5,6 +5,11 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
 };
 
+/// Returns the background color to use - Reset for transparency passthrough
+pub(crate) fn bg_color(theme: Theme) -> Color {
+    theme.background
+}
+
 use crate::{
     layout::pane_combobox_dropdown_area,
     theme::Theme,
@@ -91,7 +96,7 @@ pub(crate) fn render_panel_title_chrome(
             Span::styled(bottom_prefix, chrome_style),
             Span::styled(
                 usage_body,
-                Style::default().fg(theme.muted).bg(theme.background),
+                Style::default().fg(theme.muted).bg(bg_color(theme)),
             ),
             Span::styled(
                 format!(
@@ -342,14 +347,21 @@ fn selected_tab_bg(theme: Theme) -> Color {
 }
 
 fn selected_tab_style(theme: Theme) -> Style {
+    let bg = selected_tab_bg(theme);
+    // When transparent, use Reset for foreground to not override terminal colors
+    let fg = if theme.background == Color::Reset {
+        Color::Reset
+    } else {
+        theme.background
+    };
     Style::default()
-        .fg(theme.background)
-        .bg(selected_tab_bg(theme))
+        .fg(fg)
+        .bg(bg)
         .add_modifier(Modifier::BOLD)
 }
 
 fn inactive_workspace_tab_style(theme: Theme, keyboard_focused: bool) -> Style {
-    let mut style = Style::default().fg(theme.muted).bg(theme.background);
+    let mut style = Style::default().fg(theme.muted).bg(bg_color(theme));
     if keyboard_focused {
         style = style.add_modifier(Modifier::BOLD);
     }
@@ -357,7 +369,7 @@ fn inactive_workspace_tab_style(theme: Theme, keyboard_focused: bool) -> Style {
 }
 
 fn workspace_tab_rule_style(theme: Theme) -> Style {
-    Style::default().fg(theme.muted).bg(theme.background)
+    Style::default().fg(theme.muted).bg(bg_color(theme))
 }
 
 fn workspace_tabs_start_x(sidebar_area: Rect) -> u16 {
@@ -440,7 +452,7 @@ fn workspace_tab_rule_span_style(ch: char, theme: Theme) -> Style {
     if ch == '▀' {
         Style::default()
             .fg(selected_tab_bg(theme))
-            .bg(theme.background)
+            .bg(bg_color(theme))
     } else {
         workspace_tab_rule_style(theme)
     }
@@ -458,7 +470,7 @@ fn render_workspace_tab_chrome(
         return;
     }
 
-    let tab_row_style = Style::default().fg(theme.muted).bg(theme.background);
+    let tab_row_style = Style::default().fg(theme.muted).bg(bg_color(theme));
 
     for idx in 0..workspace_names.len().saturating_sub(1) {
         let left = workspace_item_area(sidebar_area, workspace_names, idx, active_workspace_index);
@@ -552,7 +564,7 @@ fn render_workspace_row2_gap_fill(f: &mut ratatui::Frame<'_>, layout: TopBarLayo
         return;
     }
     let fill = std::iter::repeat_n('─', width as usize).collect::<String>();
-    let style = Style::default().fg(theme.muted).bg(theme.background);
+    let style = Style::default().fg(theme.muted).bg(bg_color(theme));
     f.render_widget(
         Paragraph::new(fill).style(style),
         Rect {
@@ -570,7 +582,7 @@ fn render_workspace_row2_tail(f: &mut ratatui::Frame<'_>, layout: TopBarLayout, 
     }
     let y = layout.right_cluster_rule_y;
     let x = workspace_row2_tail_x(layout);
-    let style = Style::default().fg(theme.muted).bg(theme.background);
+    let style = Style::default().fg(theme.muted).bg(bg_color(theme));
     f.render_widget(
         Paragraph::new(WORKSPACE_ROW2_TAIL).style(style),
         Rect {
@@ -588,7 +600,7 @@ fn render_workspace_row2_lead(f: &mut ratatui::Frame<'_>, layout: TopBarLayout, 
     }
     let y = layout.right_cluster_rule_y;
     let x = workspace_row2_lead_x(layout);
-    let style = Style::default().fg(theme.muted).bg(theme.background);
+    let style = Style::default().fg(theme.muted).bg(bg_color(theme));
     f.render_widget(
         Paragraph::new(WORKSPACE_ROW2_LEAD).style(style),
         Rect {
@@ -612,25 +624,25 @@ fn render_commander_frame(
         return;
     }
 
-    let connector_style = Style::default().fg(theme.muted).bg(theme.background);
+    let connector_style = Style::default().fg(theme.muted).bg(bg_color(theme));
     let border_style = Style::default()
         .fg(if commander_focused {
             theme.accent
         } else {
             theme.muted
         })
-        .bg(theme.background);
+        .bg(bg_color(theme));
     let input_style = if commander_focused {
-        Style::default().fg(theme.accent).bg(theme.background)
+        Style::default().fg(theme.accent).bg(bg_color(theme))
     } else {
-        Style::default().fg(theme.foreground).bg(theme.background)
+        Style::default().fg(theme.foreground).bg(bg_color(theme))
     };
     let prompt_style = if commander_focused {
         Style::default()
             .fg(selected_tab_bg(theme))
-            .bg(theme.background)
+            .bg(bg_color(theme))
     } else {
-        Style::default().fg(theme.muted).bg(theme.background)
+        Style::default().fg(theme.muted).bg(bg_color(theme))
     };
 
     let top_row = Rect {
@@ -1118,7 +1130,7 @@ pub(crate) fn render_workspace_sidebar(
     }
 
     f.render_widget(
-        Block::default().style(Style::default().bg(theme.background)),
+        Block::default().style(Style::default().bg(bg_color(theme))),
         sidebar_area,
     );
 
@@ -1268,7 +1280,7 @@ fn render_right_cluster_rule(
         return;
     }
 
-    let rule_style = Style::default().fg(theme.muted).bg(theme.background);
+    let rule_style = Style::default().fg(theme.muted).bg(bg_color(theme));
     let mut line = vec!['─'; w];
     for pipe_x in right_cluster_separator_pipe_columns(cluster, usage_summary) {
         let col = pipe_x.saturating_sub(cluster.x) as usize;
@@ -1313,25 +1325,25 @@ pub(crate) fn render_top_chrome(
     if let Some(usage) = usage_text {
         spans.push(Span::styled(
             RIGHT_CLUSTER_SEP,
-            Style::default().fg(theme.muted).bg(theme.background),
+            Style::default().fg(theme.muted).bg(bg_color(theme)),
         ));
         spans.push(Span::styled(
             usage,
-            Style::default().fg(theme.muted).bg(theme.background),
+            Style::default().fg(theme.muted).bg(bg_color(theme)),
         ));
     }
     spans.push(Span::styled(
         RIGHT_CLUSTER_SEP,
-        Style::default().fg(theme.muted).bg(theme.background),
+        Style::default().fg(theme.muted).bg(bg_color(theme)),
     ));
     spans.push(Span::styled(
         APP_HANDLE,
-        Style::default().fg(theme.muted).bg(theme.background),
+        Style::default().fg(theme.muted).bg(bg_color(theme)),
     ));
     f.render_widget(
         Paragraph::new(Line::from(spans))
             .alignment(Alignment::Left)
-            .style(Style::default().bg(theme.background)),
+            .style(Style::default().bg(bg_color(theme))),
         cluster,
     );
 
@@ -1360,7 +1372,7 @@ pub(crate) fn render_help_modal(
     let block = Block::default()
         .borders(Borders::ALL)
         .title("Shortcuts")
-        .style(Style::default().fg(theme.foreground).bg(theme.background))
+        .style(Style::default().fg(theme.foreground).bg(bg_color(theme)))
         .border_style(Style::default().fg(theme.accent));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -1368,7 +1380,7 @@ pub(crate) fn render_help_modal(
     let close_area = help_close_button_area(area);
     let close_button = Paragraph::new("🗙")
         .alignment(Alignment::Center)
-        .style(Style::default().fg(theme.foreground).bg(theme.background));
+        .style(Style::default().fg(theme.foreground).bg(bg_color(theme)));
     f.render_widget(close_button, close_area);
 
     let debug_area = help_debug_toggle_button_area(area);
@@ -1379,14 +1391,14 @@ pub(crate) fn render_help_modal(
     })
     .alignment(Alignment::Left)
     .style(if debug_containers {
-        Style::default().fg(theme.accent).bg(theme.background)
+        Style::default().fg(theme.accent).bg(bg_color(theme))
     } else {
-        Style::default().fg(theme.muted).bg(theme.background)
+        Style::default().fg(theme.muted).bg(bg_color(theme))
     });
     f.render_widget(debug_button, debug_area);
 
     let theme_line = Paragraph::new(format!("Current theme: {}", theme.name))
-        .style(Style::default().fg(theme.muted).bg(theme.background));
+        .style(Style::default().fg(theme.muted).bg(bg_color(theme)));
     f.render_widget(
         theme_line,
         Rect {
@@ -1418,7 +1430,7 @@ Ctrl+Shift+M: Toggle mouse capture\n\
 Shift+PageUp/PageDown: Scroll by page\n\
 Shift+Home/End: Scroll to top/bottom",
     )
-    .style(Style::default().fg(theme.foreground).bg(theme.background));
+    .style(Style::default().fg(theme.foreground).bg(bg_color(theme)));
     let shortcuts_area = Rect {
         x: inner.x,
         y: inner.y + 3,
@@ -1440,7 +1452,7 @@ pub(crate) fn render_theme_modal(
     let block = Block::default()
         .borders(Borders::ALL)
         .title("Themes")
-        .style(Style::default().fg(theme.foreground).bg(theme.background))
+        .style(Style::default().fg(theme.foreground).bg(bg_color(theme)))
         .border_style(Style::default().fg(theme.accent));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -1475,7 +1487,7 @@ pub(crate) fn render_theme_modal(
     );
 
     let list = Paragraph::new(Text::from(lines))
-        .style(Style::default().fg(theme.foreground).bg(theme.background))
+        .style(Style::default().fg(theme.foreground).bg(bg_color(theme)))
         .wrap(Wrap { trim: false });
     f.render_widget(list, inner);
 }
@@ -1584,13 +1596,13 @@ pub(crate) fn render_new_pane_picker_modal(
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .title("─ New Pane ─")
-        .style(Style::default().fg(theme.foreground).bg(theme.background))
+        .style(Style::default().fg(theme.foreground).bg(bg_color(theme)))
         .border_style(Style::default().fg(theme.accent));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let hint = Paragraph::new("Type name, L/R cursor, U/D agent")
-        .style(Style::default().fg(theme.muted).bg(theme.background));
+        .style(Style::default().fg(theme.muted).bg(bg_color(theme)));
     f.render_widget(
         hint,
         Rect {
@@ -1602,7 +1614,7 @@ pub(crate) fn render_new_pane_picker_modal(
     );
 
     let name_label =
-        Paragraph::new("Name").style(Style::default().fg(theme.foreground).bg(theme.background));
+        Paragraph::new("Name").style(Style::default().fg(theme.foreground).bg(bg_color(theme)));
     f.render_widget(
         name_label,
         Rect {
@@ -1616,7 +1628,7 @@ pub(crate) fn render_new_pane_picker_modal(
     let name_area = new_pane_picker_name_input_area(area);
     let name_block = Block::default()
         .borders(Borders::ALL)
-        .style(Style::default().fg(theme.foreground).bg(theme.background))
+        .style(Style::default().fg(theme.foreground).bg(bg_color(theme)))
         .border_style(if name_error.is_some() {
             Style::default().fg(Color::Red)
         } else {
@@ -1626,9 +1638,9 @@ pub(crate) fn render_new_pane_picker_modal(
     f.render_widget(name_block, name_area);
     f.render_widget(
         Paragraph::new(name.to_string()).style(if name_selected {
-            Style::default().fg(theme.background).bg(theme.accent)
+            Style::default().fg(bg_color(theme)).bg(theme.accent)
         } else {
-            Style::default().fg(theme.foreground).bg(theme.background)
+            Style::default().fg(theme.foreground).bg(bg_color(theme))
         }),
         name_inner,
     );
@@ -1640,7 +1652,7 @@ pub(crate) fn render_new_pane_picker_modal(
             height: 1,
         };
         f.render_widget(
-            Paragraph::new(error).style(Style::default().fg(Color::Red).bg(theme.background)),
+            Paragraph::new(error).style(Style::default().fg(Color::Red).bg(bg_color(theme))),
             error_area,
         );
     }
@@ -1675,7 +1687,7 @@ pub(crate) fn render_new_pane_picker_modal(
 
     f.render_widget(
         Paragraph::new(Text::from(lines))
-            .style(Style::default().fg(theme.foreground).bg(theme.background))
+            .style(Style::default().fg(theme.foreground).bg(bg_color(theme)))
             .wrap(Wrap { trim: false }),
         list_area,
     );
@@ -1709,18 +1721,18 @@ pub(crate) fn render_panel_settings_modal(
     let block = Block::default()
         .borders(Borders::ALL)
         .title("Panel Settings")
-        .style(Style::default().fg(theme.foreground).bg(theme.background))
+        .style(Style::default().fg(theme.foreground).bg(bg_color(theme)))
         .border_style(Style::default().fg(theme.accent));
     f.render_widget(block, area);
 
     let close_area = panel_settings_close_button_area(area);
     let close_button = Paragraph::new("🗙")
         .alignment(Alignment::Center)
-        .style(Style::default().fg(theme.foreground).bg(theme.background));
+        .style(Style::default().fg(theme.foreground).bg(bg_color(theme)));
     f.render_widget(close_button, close_area);
 
     let hint = Paragraph::new("Tab: next field   Esc: cancel   Enter: confirm")
-        .style(Style::default().fg(theme.muted).bg(theme.background));
+        .style(Style::default().fg(theme.muted).bg(bg_color(theme)));
     f.render_widget(
         hint,
         Rect {
@@ -1732,7 +1744,7 @@ pub(crate) fn render_panel_settings_modal(
     );
 
     let name_label =
-        Paragraph::new("Name").style(Style::default().fg(theme.foreground).bg(theme.background));
+        Paragraph::new("Name").style(Style::default().fg(theme.foreground).bg(bg_color(theme)));
     f.render_widget(
         name_label,
         Rect {
@@ -1746,7 +1758,7 @@ pub(crate) fn render_panel_settings_modal(
     let name_area = panel_settings_name_input_area(inner);
     let name_block = Block::default()
         .borders(Borders::ALL)
-        .style(Style::default().fg(theme.foreground).bg(theme.background))
+        .style(Style::default().fg(theme.foreground).bg(bg_color(theme)))
         .border_style(if name_error.is_some() {
             Style::default().fg(Color::Red)
         } else if focus == PanelSettingsFocus::Name {
@@ -1758,12 +1770,12 @@ pub(crate) fn render_panel_settings_modal(
     f.render_widget(name_block, name_area);
     f.render_widget(
         Paragraph::new(name.to_string())
-            .style(Style::default().fg(theme.foreground).bg(theme.background)),
+            .style(Style::default().fg(theme.foreground).bg(bg_color(theme))),
         name_inner,
     );
     if let Some(error) = name_error {
         f.render_widget(
-            Paragraph::new(error).style(Style::default().fg(Color::Red).bg(theme.background)),
+            Paragraph::new(error).style(Style::default().fg(Color::Red).bg(bg_color(theme))),
             Rect {
                 x: inner.x,
                 y: name_area.bottom(),
@@ -1774,7 +1786,7 @@ pub(crate) fn render_panel_settings_modal(
     }
 
     let agent_label =
-        Paragraph::new("Agent").style(Style::default().fg(theme.foreground).bg(theme.background));
+        Paragraph::new("Agent").style(Style::default().fg(theme.foreground).bg(bg_color(theme)));
     f.render_widget(
         agent_label,
         Rect {
@@ -1788,7 +1800,7 @@ pub(crate) fn render_panel_settings_modal(
     let agent_area = panel_settings_agent_list_area(inner);
     let agent_block = Block::default()
         .borders(Borders::ALL)
-        .style(Style::default().fg(theme.foreground).bg(theme.background))
+        .style(Style::default().fg(theme.foreground).bg(bg_color(theme)))
         .border_style(if focus == PanelSettingsFocus::Agent {
             Style::default().fg(theme.accent)
         } else {
@@ -1831,22 +1843,22 @@ pub(crate) fn render_panel_settings_modal(
 
     f.render_widget(
         Paragraph::new(Text::from(lines))
-            .style(Style::default().fg(theme.foreground).bg(theme.background))
+            .style(Style::default().fg(theme.foreground).bg(bg_color(theme)))
             .wrap(Wrap { trim: false }),
         agent_inner,
     );
 
     let cancel = Paragraph::new("[Cancel]")
         .alignment(Alignment::Center)
-        .style(Style::default().fg(theme.muted).bg(theme.background));
+        .style(Style::default().fg(theme.muted).bg(bg_color(theme)));
     f.render_widget(cancel, panel_settings_cancel_button_area(area));
 
     let confirm = Paragraph::new("[Confirm]")
         .alignment(Alignment::Center)
         .style(if focus == PanelSettingsFocus::Confirm {
-            Style::default().fg(theme.accent).bg(theme.background)
+            Style::default().fg(theme.accent).bg(bg_color(theme))
         } else {
-            Style::default().fg(theme.foreground).bg(theme.background)
+            Style::default().fg(theme.foreground).bg(bg_color(theme))
         });
     f.render_widget(confirm, panel_settings_confirm_button_area(area));
 
@@ -1930,13 +1942,13 @@ pub(crate) fn render_workspace_settings_modal(
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .title("─ Workspace ─")
-        .style(Style::default().fg(theme.foreground).bg(theme.background))
+        .style(Style::default().fg(theme.foreground).bg(bg_color(theme)))
         .border_style(Style::default().fg(theme.accent));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let hint = Paragraph::new("Type name, L/R cursor, U/D action")
-        .style(Style::default().fg(theme.muted).bg(theme.background));
+        .style(Style::default().fg(theme.muted).bg(bg_color(theme)));
     f.render_widget(
         hint,
         Rect {
@@ -1948,7 +1960,7 @@ pub(crate) fn render_workspace_settings_modal(
     );
 
     let name_label =
-        Paragraph::new("Name").style(Style::default().fg(theme.foreground).bg(theme.background));
+        Paragraph::new("Name").style(Style::default().fg(theme.foreground).bg(bg_color(theme)));
     f.render_widget(
         name_label,
         Rect {
@@ -1962,7 +1974,7 @@ pub(crate) fn render_workspace_settings_modal(
     let name_area = workspace_settings_name_input_area(area);
     let name_block = Block::default()
         .borders(Borders::ALL)
-        .style(Style::default().fg(theme.foreground).bg(theme.background))
+        .style(Style::default().fg(theme.foreground).bg(bg_color(theme)))
         .border_style(if name_error.is_some() {
             Style::default().fg(Color::Red)
         } else {
@@ -1972,13 +1984,13 @@ pub(crate) fn render_workspace_settings_modal(
     f.render_widget(name_block, name_area);
     f.render_widget(
         Paragraph::new(name.to_string())
-            .style(Style::default().fg(theme.foreground).bg(theme.background)),
+            .style(Style::default().fg(theme.foreground).bg(bg_color(theme))),
         name_inner,
     );
 
     if let Some(error) = name_error {
         f.render_widget(
-            Paragraph::new(error).style(Style::default().fg(Color::Red).bg(theme.background)),
+            Paragraph::new(error).style(Style::default().fg(Color::Red).bg(bg_color(theme))),
             Rect {
                 x: inner.x,
                 y: name_area.bottom(),
@@ -2001,7 +2013,7 @@ pub(crate) fn render_workspace_settings_modal(
     }
     f.render_widget(
         Paragraph::new(Text::from(action_lines))
-            .style(Style::default().fg(theme.foreground).bg(theme.background))
+            .style(Style::default().fg(theme.foreground).bg(bg_color(theme)))
             .wrap(Wrap { trim: false }),
         actions_area,
     );

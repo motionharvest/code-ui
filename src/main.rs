@@ -49,7 +49,7 @@ use ui::{
     commander_input_cursor_position, compute_top_bar_layout, pane_chrome_title_label,
     render_help_modal, render_new_pane_picker_modal, render_panel_settings_modal,
     render_panel_title_chrome, render_theme_modal, render_top_chrome,
-    render_workspace_settings_modal, render_workspace_sidebar,
+    render_workspace_settings_modal, render_workspace_sidebar, bg_color,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -427,10 +427,13 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                 } else {
                     app.theme()
                 };
-                f.render_widget(
-                    Block::default().style(Style::default().bg(theme.background)),
-                    f.size(),
-                );
+                // Only fill background if theme is not transparent (Reset)
+                if theme.background != Color::Reset {
+                    f.render_widget(
+                        Block::default().style(Style::default().bg(theme.background)),
+                        f.size(),
+                    );
+                }
 
                 let mut workspace_pane_ids = Vec::new();
                 app.layout.collect_leaf_ids(&mut workspace_pane_ids);
@@ -555,12 +558,12 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                     } else {
                         theme.muted
                     };
-                    let chrome_style = Style::default().fg(border_color).bg(theme.background);
+                    let chrome_style = Style::default().fg(border_color).bg(bg_color(theme));
 
                     let block = Block::default()
                         .borders(pane_borders(placement.exposed))
                         .border_type(BorderType::Rounded)
-                        .style(Style::default().bg(theme.background))
+                        .style(Style::default().bg(bg_color(theme)))
                         .border_style(chrome_style);
                     f.render_widget(block, pane_area);
                     pane.mark_painted();
@@ -596,7 +599,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                             pane_view_for_render(pane.styled_view(selection), theme, focused);
                         let paragraph = Paragraph::new(pane_view)
                             .wrap(Wrap { trim: false })
-                            .style(Style::default().bg(theme.background));
+                            .style(Style::default().bg(bg_color(theme)));
                         f.render_widget(paragraph, content_area);
 
                         if modal_is_none && focused && !commander_focused {
