@@ -161,6 +161,7 @@ const COMMANDER_FRAME_RIGHT_POST: &str = "│";
 const COMMANDER_FRAME_CHIN: &str = "─╮";
 const WORKSPACE_ROW2_TAIL: &str = "───╯";
 const WORKSPACE_ROW2_TAIL_WIDTH: u16 = 4;
+const COMMANDER_ROW2_TRAILING_MUTED_DASHES: usize = 2;
 const COMMANDER_ROW2_GAP: u16 = 1;
 const COMMANDER_AFTER_ADD_PAD: u16 = 3;
 const COMMANDER_SHIFT_LEFT: u16 = 2;
@@ -675,18 +676,42 @@ fn render_commander_frame(
 
     if frame.height > 1 {
         let bottom_y = frame.y.saturating_add(1);
-        let bottom_width = frame.width as usize;
+        let bottom_x = frame.x.saturating_add(COMMANDER_ROW2_SHIFT_RIGHT);
+        let bottom_render_width = frame.width.saturating_sub(COMMANDER_ROW2_SHIFT_RIGHT);
+        let bottom_width = bottom_render_width as usize;
         if bottom_width >= 2 {
-            let mut bottom = String::with_capacity(bottom_width);
-            bottom.push('╰');
-            bottom.extend(std::iter::repeat_n('─', bottom_width.saturating_sub(2)));
-            bottom.push('╯');
+            let dash_count = bottom_width.saturating_sub(2);
+            let bottom_line = if commander_focused && dash_count > 0 {
+                let muted_dashes = COMMANDER_ROW2_TRAILING_MUTED_DASHES.min(dash_count);
+                let main_dashes = dash_count.saturating_sub(muted_dashes);
+                let mut spans = vec![Span::styled("╰", border_style)];
+                if main_dashes > 0 {
+                    spans.push(Span::styled(
+                        std::iter::repeat_n('─', main_dashes).collect::<String>(),
+                        border_style,
+                    ));
+                }
+                if muted_dashes > 0 {
+                    spans.push(Span::styled(
+                        std::iter::repeat_n('─', muted_dashes).collect::<String>(),
+                        connector_style,
+                    ));
+                }
+                spans.push(Span::styled("╯", connector_style));
+                Line::from(spans)
+            } else {
+                let mut bottom = String::with_capacity(bottom_width);
+                bottom.push('╰');
+                bottom.extend(std::iter::repeat_n('─', dash_count));
+                bottom.push('╯');
+                Line::from(Span::styled(bottom, border_style))
+            };
             f.render_widget(
-                Paragraph::new(bottom).style(border_style),
+                Paragraph::new(bottom_line),
                 Rect {
-                    x: frame.x.saturating_add(COMMANDER_ROW2_SHIFT_RIGHT),
+                    x: bottom_x,
                     y: bottom_y,
-                    width: frame.width,
+                    width: bottom_render_width,
                     height: 1,
                 },
             );
@@ -1144,6 +1169,9 @@ pub(crate) fn render_workspace_sidebar(
         commander_focused,
         commander_input,
     );
+    if commander_focused {
+        render_workspace_row2_tail(f, layout, theme);
+    }
 
     let add_area = workspace_add_button_area(sidebar_area, workspace_names, active_workspace_index);
     if add_area.width > 0 && add_area.height > 0 {
