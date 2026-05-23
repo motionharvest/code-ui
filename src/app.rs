@@ -28,10 +28,10 @@ use crate::{
         panel_settings_agent_list_area, panel_settings_cancel_button_area,
         panel_settings_close_button_area, panel_settings_confirm_button_area,
         panel_settings_modal_area, panel_settings_modal_inner, panel_settings_name_input_area,
-        workspace_add_button_hit, workspace_hit_index, workspace_menu_hit_index,
-        workspace_settings_action_hit_index, workspace_settings_modal_area,
-        workspace_settings_name_input_area, Modal, PanelSettingsFocus, AGENT_PRESETS,
-        COMMANDER_COMMAND, TOP_CHROME_ROWS, WORKSPACE_BAR_HEIGHT, WORKSPACE_SIDEBAR_WIDTH,
+        compute_top_bar_layout, workspace_add_button_hit, workspace_commander_input_hit,
+        workspace_hit_index, workspace_menu_hit_index, workspace_settings_action_hit_index,
+        workspace_settings_modal_area, workspace_settings_name_input_area, Modal,
+        PanelSettingsFocus, AGENT_PRESETS, COMMANDER_COMMAND, TOP_CHROME_ROWS,
     },
     utils::{arrow_key_to_split_side, contains, key_to_bytes, LOGIN_SHELL_SENTINEL},
 };
@@ -533,39 +533,21 @@ impl App {
     }
 
     pub(crate) fn workspace_sidebar_area(size: Rect) -> Rect {
-        let height = WORKSPACE_BAR_HEIGHT.min(size.height);
-        Rect {
-            x: size.x,
-            y: size.y,
-            width: size.width,
-            height,
-        }
-    }
-
-    pub(crate) fn commander_panel_area(size: Rect) -> Rect {
-        let body = Self::body_area(size);
-        let width = WORKSPACE_SIDEBAR_WIDTH.min(body.width.saturating_sub(1));
-        let y = body.y.saturating_add(1);
-        Rect {
-            x: body.x,
-            y,
-            width,
-            height: body.height.saturating_sub(1),
-        }
+        crate::ui::top_bar_area(size)
     }
 
     pub(crate) fn content_area(size: Rect) -> Rect {
-        let body = Self::body_area(size);
-        let commander = Self::commander_panel_area(size);
-        let divider_width = 1;
-        Rect {
-            x: commander.right().saturating_add(divider_width),
-            y: body.y,
-            width: body
-                .width
-                .saturating_sub(commander.width.saturating_add(divider_width)),
-            height: body.height,
-        }
+        Self::body_area(size)
+    }
+
+    fn top_bar_layout(&self, size: Rect, usage_summary: Option<&str>) -> crate::ui::TopBarLayout {
+        let workspace_names = self.workspace_names();
+        compute_top_bar_layout(
+            size,
+            &workspace_names,
+            self.active_workspace_index(),
+            usage_summary,
+        )
     }
 
     pub(crate) fn workspace_names(&self) -> Vec<String> {
@@ -2438,8 +2420,9 @@ impl App {
             return Ok(());
         }
 
+        let top_layout = self.top_bar_layout(size, None);
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            && contains(Self::commander_panel_area(size), mouse.column, mouse.row)
+            && workspace_commander_input_hit(top_layout, mouse.column, mouse.row)
         {
             self.focus_commander_from_sidebar(size);
             self.text_selection = None;
@@ -2447,7 +2430,7 @@ impl App {
         }
 
         if self.commander_focused
-            && contains(Self::commander_panel_area(size), mouse.column, mouse.row)
+            && workspace_commander_input_hit(top_layout, mouse.column, mouse.row)
         {
             match mouse.kind {
                 MouseEventKind::ScrollUp => {
