@@ -1191,39 +1191,58 @@ fn right_cluster_segment_widths(usage_summary: Option<&str>) -> Vec<RightCluster
     segments
 }
 
-fn render_right_cluster_segment_rule(
-    f: &mut ratatui::Frame<'_>,
-    x: u16,
-    width: u16,
-    rule_y: u16,
-    theme: Theme,
-    join_right: bool,
-) {
-    if width == 0 {
-        return;
-    }
-    let rule_style = Style::default().fg(theme.muted).bg(theme.background);
-    let w = width as usize;
-    let mut line = String::with_capacity(w);
-    line.push('╰');
-    if w > 2 {
-        let dash_count = w.saturating_sub(2);
-        if join_right && dash_count > 0 {
-            line.extend(std::iter::repeat_n('─', dash_count.saturating_sub(1)));
-            line.push('┴');
-        } else {
-            line.extend(std::iter::repeat_n('─', dash_count));
+fn right_cluster_separator_pipe_columns(
+    cluster: Rect,
+    usage_summary: Option<&str>,
+) -> Vec<u16> {
+    let segments = right_cluster_segment_widths(usage_summary);
+    let sep_width = RIGHT_CLUSTER_SEP.chars().count() as u16;
+    const PIPE_OFFSET: u16 = 1;
+
+    let mut x = cluster.x;
+    let mut pipes = Vec::new();
+    for (idx, segment) in segments.iter().enumerate() {
+        x = x.saturating_add(segment.width);
+        if idx + 1 < segments.len() {
+            pipes.push(x.saturating_add(PIPE_OFFSET));
+            x = x.saturating_add(sep_width);
         }
     }
-    if !join_right {
-        line.push('╯');
+    pipes
+}
+
+fn render_right_cluster_rule(
+    f: &mut ratatui::Frame<'_>,
+    cluster: Rect,
+    rule_y: u16,
+    theme: Theme,
+    usage_summary: Option<&str>,
+) {
+    if cluster.width == 0 {
+        return;
     }
+
+    let w = cluster.width as usize;
+    if w == 0 {
+        return;
+    }
+
+    let rule_style = Style::default().fg(theme.muted).bg(theme.background);
+    let mut line = vec!['─'; w];
+    line[w - 1] = '╯';
+    for pipe_x in right_cluster_separator_pipe_columns(cluster, usage_summary) {
+        let col = pipe_x.saturating_sub(cluster.x) as usize;
+        if col < w {
+            line[col] = '┴';
+        }
+    }
+
     f.render_widget(
-        Paragraph::new(line).style(rule_style),
+        Paragraph::new(line.into_iter().collect::<String>()).style(rule_style),
         Rect {
-            x,
+            x: cluster.x,
             y: rule_y,
-            width,
+            width: cluster.width,
             height: 1,
         },
     );
@@ -1280,27 +1299,13 @@ pub(crate) fn render_top_chrome(
         return;
     }
 
-    let segments = right_cluster_segment_widths(usage_summary);
-    let sep_width = RIGHT_CLUSTER_SEP.chars().count() as u16;
-    let mut x = cluster.x;
-    for (idx, segment) in segments.iter().enumerate() {
-        if idx > 0 {
-            x = x.saturating_add(sep_width);
-        }
-        let width = segment.width.min(cluster.right().saturating_sub(x));
-        if width == 0 {
-            continue;
-        }
-        render_right_cluster_segment_rule(
-            f,
-            x,
-            width,
-            layout.right_cluster_rule_y,
-            theme,
-            idx + 1 < segments.len(),
-        );
-        x = x.saturating_add(width);
-    }
+    render_right_cluster_rule(
+        f,
+        cluster,
+        layout.right_cluster_rule_y,
+        theme,
+        usage_summary,
+    );
 }
 
 pub(crate) fn render_help_modal(
