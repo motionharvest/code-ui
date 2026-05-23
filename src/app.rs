@@ -22,9 +22,9 @@ use crate::{
     pane::{Pane, PaneMouseEventKind, PaneSelection},
     theme::{load_persisted_theme_index, save_persisted_theme, Theme, THEMES},
     ui::{
-        agent_label_for_command, default_agent_index, help_close_button_area,
+        default_agent_index, help_close_button_area,
         help_debug_toggle_button_area, help_modal_area, new_pane_picker_list_area,
-        new_pane_picker_modal_area, new_pane_picker_name_input_area,
+        new_pane_picker_modal_area, new_pane_picker_name_input_area, pane_chrome_title_label,
         panel_settings_agent_list_area, panel_settings_cancel_button_area,
         panel_settings_close_button_area, panel_settings_confirm_button_area,
         panel_settings_modal_area, panel_settings_modal_inner, panel_settings_name_input_area,
@@ -119,11 +119,50 @@ struct HitTestCache {
     resize_boundaries: Vec<ResizeBoundary>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommanderPhase {
+    Discussing,
+    AwaitingApproval,
+    Executing,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CommanderWorkspacePlan {
+    UseCurrent,
+    CreateNew,
+    SwitchTo(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CommanderPaneAssignment {
+    agent: String,
+    pane_name: String,
+    task: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CommanderPendingPlan {
+    summary: String,
+    objective: String,
+    workspace: CommanderWorkspacePlan,
+    workspace_name: Option<String>,
+    panes: Vec<CommanderPaneAssignment>,
+}
+
 struct CommanderState {
     input: String,
     cursor: usize,
     busy: bool,
+    phase: CommanderPhase,
+    pending_plan: Option<CommanderPendingPlan>,
     history: Vec<String>,
+    /// Wrapped chat lines scrolled up from the bottom of the transcript.
+    chat_offset_from_bottom: usize,
+    chat_pinned_to_bottom: bool,
+    /// Last rendered chat viewport height (wrapped display lines).
+    chat_viewport_lines: u16,
+    /// Total wrapped chat lines from the last render pass.
+    chat_total_lines: usize,
     rx: Option<Receiver<CommanderWorkerResult>>,
 }
 
@@ -139,6 +178,9 @@ struct CommanderWorkerResult {
     close_requests: Vec<String>,
     workspace_switch: Option<String>,
     workspace_create: Option<Option<String>>,
+    proposed_plan: Option<CommanderPendingPlan>,
+    /// When false, Commander only updates the conversation (no pane/workspace actions).
+    execution_allowed: bool,
 }
 
 #[derive(Clone, Default)]
@@ -195,6 +237,8 @@ enum CommanderSlashCommand {
     OpenSettings,
     CreateWorkspace(Option<String>),
     SwitchWorkspace(String),
+    ApprovePlan,
+    CancelPlan,
 }
 
 impl CommanderWorkerResult {
@@ -211,6 +255,8 @@ impl CommanderWorkerResult {
             close_requests: Vec::new(),
             workspace_switch: None,
             workspace_create: None,
+            proposed_plan: None,
+            execution_allowed: true,
         }
     }
 
@@ -441,10 +487,17 @@ impl App {
                 input: String::new(),
                 cursor: 0,
                 busy: false,
+                phase: CommanderPhase::Discussing,
+                pending_plan: None,
                 history: vec![
-                    "Commander ready. Type a request and press Enter.".to_string(),
-                    "Example: \"Send hello to Pane 2\"".to_string(),
+                    "Commander harness ready.".to_string(),
+                    "Describe what you want to build — I'll help shape it into a plan.".to_string(),
+                    "When the plan looks right, reply with /approve to run it.".to_string(),
                 ],
+                chat_offset_from_bottom: 0,
+                chat_pinned_to_bottom: true,
+                chat_viewport_lines: 0,
+                chat_total_lines: 0,
                 rx: None,
             },
             agent_handoffs: HashMap::new(),
@@ -507,11 +560,11 @@ impl App {
         let divider_width = 1;
         Rect {
             x: commander.right().saturating_add(divider_width),
-            y: commander.y,
+            y: body.y,
             width: body
                 .width
                 .saturating_sub(commander.width.saturating_add(divider_width)),
-            height: commander.height,
+            height: body.height,
         }
     }
 
@@ -933,18 +986,21 @@ impl App {
             return Ok(false);
         }
 
+        let workspace_names: Vec<String> = self.workspace_names();
         if let Some(workspace_index) =
-            workspace_menu_hit_index(sidebar, self.workspaces.len(), x, y)
+            workspace_menu_hit_index(sidebar, &workspace_names, self.active_workspace, x, y)
         {
             self.open_workspace_settings_modal(workspace_index);
             return Ok(true);
         }
 
-        if let Some(workspace_index) = workspace_hit_index(sidebar, self.workspaces.len(), x, y) {
+        if let Some(workspace_index) =
+            workspace_hit_index(sidebar, &workspace_names, self.active_workspace, x, y)
+        {
             self.switch_workspace(workspace_index, size);
             return Ok(true);
         }
-        if workspace_add_button_hit(sidebar, self.workspaces.len(), x, y) {
+        if workspace_add_button_hit(sidebar, &workspace_names, self.active_workspace, x, y) {
             self.create_workspace(size)?;
             return Ok(true);
         }
@@ -1927,6 +1983,14 @@ impl App {
 
         if self.focused_pane_is_commander() {
             match key.code {
+                KeyCode::PageUp => {
+                    self.commander_page_up();
+                    return Ok(());
+                }
+                KeyCode::PageDown => {
+                    self.commander_page_down();
+                    return Ok(());
+                }
                 KeyCode::Enter => {
                     self.commander_submit_current_input();
                 }
@@ -2185,13 +2249,23 @@ impl App {
                     mut name_selected,
                     mut agent_index,
                 } => {
-                    let container = self
+                    let (pane_area, anchor_title) = self
                         .pane_placements(Self::content_area(size))
                         .into_iter()
                         .find(|placement| placement.pane_id == pane_id)
-                        .map(|placement| placement.area)
-                        .unwrap_or(Self::content_area(size));
-                    let area = new_pane_picker_modal_area(container);
+                        .and_then(|placement| {
+                            self.panes
+                                .iter()
+                                .find(|pane| pane.id == pane_id)
+                                .map(|pane| {
+                                    (
+                                        placement.area,
+                                        pane_chrome_title_label(&pane.title, &pane.command),
+                                    )
+                                })
+                        })
+                        .unwrap_or_else(|| (Self::content_area(size), "Pane".to_string()));
+                    let area = new_pane_picker_modal_area(pane_area, &anchor_title);
                     let name_area = new_pane_picker_name_input_area(area);
                     let name_inner = ratatui::widgets::Block::default()
                         .borders(ratatui::widgets::Borders::ALL)
@@ -2230,7 +2304,23 @@ impl App {
                     mut agent_index,
                     mut focus,
                 } => {
-                    let area = panel_settings_modal_area(size);
+                    let (pane_area, anchor_title) = self
+                        .pane_placements(Self::content_area(size))
+                        .into_iter()
+                        .find(|placement| placement.pane_id == pane_id)
+                        .and_then(|placement| {
+                            self.panes
+                                .iter()
+                                .find(|pane| pane.id == pane_id)
+                                .map(|pane| {
+                                    (
+                                        placement.area,
+                                        pane_chrome_title_label(&pane.title, &pane.command),
+                                    )
+                                })
+                        })
+                        .unwrap_or_else(|| (Self::content_area(size), "Pane".to_string()));
+                    let area = panel_settings_modal_area(pane_area, &anchor_title);
                     let inner = panel_settings_modal_inner(area);
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                         if contains(
@@ -2356,6 +2446,22 @@ impl App {
             return Ok(());
         }
 
+        if self.commander_focused
+            && contains(Self::commander_panel_area(size), mouse.column, mouse.row)
+        {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.commander_scroll_up();
+                    return Ok(());
+                }
+                MouseEventKind::ScrollDown => {
+                    self.commander_scroll_down();
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+
         let clicked = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
         let down_button = match mouse.kind {
             MouseEventKind::Down(button) => Some(button),
@@ -2364,17 +2470,17 @@ impl App {
         let Some(placement) = self.placement_at(size, mouse.column, mouse.row) else {
             match mouse.kind {
                 MouseEventKind::ScrollUp => {
-                    if !self.focused_pane_is_commander() {
-                        if let Some(pane) = self.focused_pane_mut() {
-                            pane.scroll_up();
-                        }
+                    if self.commander_focused {
+                        self.commander_scroll_up();
+                    } else if let Some(pane) = self.focused_pane_mut() {
+                        pane.scroll_up();
                     }
                 }
                 MouseEventKind::ScrollDown => {
-                    if !self.focused_pane_is_commander() {
-                        if let Some(pane) = self.focused_pane_mut() {
-                            pane.scroll_down();
-                        }
+                    if self.commander_focused {
+                        self.commander_scroll_down();
+                    } else if let Some(pane) = self.focused_pane_mut() {
+                        pane.scroll_down();
                     }
                 }
                 _ => {}
@@ -2390,11 +2496,7 @@ impl App {
         else {
             return Ok(());
         };
-        let pane_title = format!(
-            "{} [{}] ▼",
-            pane_title,
-            agent_label_for_command(&pane_command)
-        );
+        let pane_title = pane_chrome_title_label(&pane_title, &pane_command);
 
         let was_focused = self.focused == placement.pane_id;
 
@@ -2848,6 +2950,103 @@ impl App {
         &self.commander.history
     }
 
+    pub(crate) fn commander_chat_offset_from_bottom(&self) -> usize {
+        self.commander.chat_offset_from_bottom
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn commander_chat_pinned_to_bottom(&self) -> bool {
+        self.commander.chat_pinned_to_bottom
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn commander_scroll_to_top(&mut self) {
+        let viewport = self.commander.chat_viewport_lines.max(1) as usize;
+        let total = self.commander.chat_total_lines;
+        self.commander.chat_offset_from_bottom = total.saturating_sub(viewport);
+        self.commander.chat_pinned_to_bottom = false;
+        self.clamp_commander_chat_scroll();
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn commander_scroll_to_bottom(&mut self) {
+        self.commander.chat_offset_from_bottom = 0;
+        self.commander.chat_pinned_to_bottom = true;
+    }
+
+    pub(crate) fn set_commander_chat_metrics(&mut self, viewport_lines: u16, total_lines: usize) {
+        self.commander.chat_viewport_lines = viewport_lines;
+        self.commander.chat_total_lines = total_lines;
+        self.clamp_commander_chat_scroll();
+    }
+
+    pub(crate) fn commander_scroll_up(&mut self) {
+        self.commander.chat_offset_from_bottom =
+            self.commander.chat_offset_from_bottom.saturating_add(1);
+        self.commander.chat_pinned_to_bottom = false;
+        self.clamp_commander_chat_scroll();
+    }
+
+    pub(crate) fn commander_scroll_down(&mut self) {
+        if self.commander.chat_offset_from_bottom > 0 {
+            self.commander.chat_offset_from_bottom -= 1;
+        }
+        if self.commander.chat_offset_from_bottom == 0 {
+            self.commander.chat_pinned_to_bottom = true;
+        }
+    }
+
+    pub(crate) fn commander_page_up(&mut self) {
+        let step = self.commander.chat_viewport_lines.max(1) as usize;
+        self.commander.chat_offset_from_bottom = self
+            .commander
+            .chat_offset_from_bottom
+            .saturating_add(step);
+        self.commander.chat_pinned_to_bottom = false;
+        self.clamp_commander_chat_scroll();
+    }
+
+    pub(crate) fn commander_page_down(&mut self) {
+        let step = self.commander.chat_viewport_lines.max(1) as usize;
+        self.commander.chat_offset_from_bottom = self
+            .commander
+            .chat_offset_from_bottom
+            .saturating_sub(step);
+        if self.commander.chat_offset_from_bottom == 0 {
+            self.commander.chat_pinned_to_bottom = true;
+        }
+    }
+
+    fn clamp_commander_chat_scroll(&mut self) {
+        let viewport = self.commander.chat_viewport_lines.max(1) as usize;
+        let max_offset = self
+            .commander
+            .chat_total_lines
+            .saturating_sub(viewport);
+        if self.commander.chat_offset_from_bottom > max_offset {
+            self.commander.chat_offset_from_bottom = max_offset;
+        }
+    }
+
+    fn commander_sync_scroll_after_history_change(&mut self) {
+        if self.commander.chat_pinned_to_bottom {
+            self.commander.chat_offset_from_bottom = 0;
+        } else {
+            self.clamp_commander_chat_scroll();
+        }
+    }
+
+    pub(crate) fn commander_phase_label(&self) -> &'static str {
+        if self.commander.busy {
+            return "thinking";
+        }
+        match self.commander.phase {
+            CommanderPhase::Discussing => "planning",
+            CommanderPhase::AwaitingApproval => "awaiting /approve",
+            CommanderPhase::Executing => "executing",
+        }
+    }
+
     fn commander_submit_current_input(&mut self) {
         let user_input = self.commander.input.trim().to_string();
         if user_input.is_empty() || self.commander.busy {
@@ -2861,13 +3060,32 @@ impl App {
             return;
         }
 
-        self.commander.history.clear();
+        if self.commander.phase == CommanderPhase::AwaitingApproval && is_plan_approval(&user_input)
+        {
+            self.commander.input.clear();
+            self.commander.cursor = 0;
+            self.commander
+                .history
+                .push(format!("You: {}", user_input.clone()));
+            self.commander_sync_scroll_after_history_change();
+            self.execute_approved_commander_plan();
+            return;
+        }
+
+        if self.commander.phase == CommanderPhase::AwaitingApproval
+            && is_plan_revision_request(&user_input)
+        {
+            self.commander.phase = CommanderPhase::Discussing;
+            self.commander.pending_plan = None;
+        }
+
         self.commander
             .history
             .push(format!("You: {}", user_input.clone()));
         self.commander
             .history
             .push("Commander: thinking...".to_string());
+        self.commander_sync_scroll_after_history_change();
 
         self.commander.input.clear();
         self.commander.cursor = 0;
@@ -2936,12 +3154,24 @@ impl App {
                 )
             })
             .collect::<Vec<_>>();
+        let phase = self.commander.phase;
+        let pending_plan = self.commander.pending_plan.clone();
+        let conversation = self
+            .commander
+            .history
+            .iter()
+            .filter(|line| *line != "Commander: thinking...")
+            .cloned()
+            .collect::<Vec<_>>();
         let (tx, rx) = mpsc::channel();
         self.commander.rx = Some(rx);
 
         thread::spawn(move || {
-            let result = run_commander_llm(
+            let result = run_commander_harness(
                 user_input,
+                phase,
+                conversation,
+                pending_plan,
                 pane_names,
                 pane_roster,
                 agent_types,
@@ -2951,17 +3181,66 @@ impl App {
         });
     }
 
+    fn execute_approved_commander_plan(&mut self) {
+        let Some(plan) = self.commander.pending_plan.clone() else {
+            self.commander.history.push(
+                "Commander: No plan is waiting for approval. Describe the task first.".to_string(),
+            );
+            self.commander_sync_scroll_after_history_change();
+            self.queue_tts("No plan is waiting for approval.");
+            return;
+        };
+
+        self.commander.busy = true;
+        self.commander.phase = CommanderPhase::Executing;
+        self.commander
+            .history
+            .push("Commander: executing the approved plan...".to_string());
+
+        let steps = self.build_execution_steps_from_plan(&plan);
+        let (_history_notes, speech_notes) = self.execute_commander_steps(steps);
+        self.commander.busy = false;
+        self.commander.phase = CommanderPhase::Discussing;
+        self.commander.pending_plan = None;
+
+        let commander_reply = if speech_notes.is_empty() {
+            format!("Started execution for: {}.", plan.summary)
+        } else {
+            format_commander_execution_reply(&speech_notes)
+        };
+        if let Some(last) = self.commander.history.last_mut() {
+            if last == "Commander: executing the approved plan..." {
+                *last = format!("Commander: {}", commander_reply);
+            } else {
+                self.commander
+                    .history
+                    .push(format!("Commander: {}", commander_reply));
+            }
+        }
+        self.commander_sync_scroll_after_history_change();
+        self.queue_tts(&commander_reply);
+    }
+
     fn handle_commander_slash_command(&mut self, input: &str) -> bool {
         let Some(command) = parse_commander_slash_command(input) else {
             return false;
         };
 
-        self.commander.history.clear();
         self.commander
             .history
             .push(format!("You: {}", input.trim()));
 
         match command {
+            CommanderSlashCommand::ApprovePlan => {
+                self.execute_approved_commander_plan();
+            }
+            CommanderSlashCommand::CancelPlan => {
+                self.commander.pending_plan = None;
+                self.commander.phase = CommanderPhase::Discussing;
+                let note = "Plan cleared. We can keep refining the idea.";
+                self.commander.history.push(format!("Commander: {}", note));
+                self.queue_tts(note);
+            }
             CommanderSlashCommand::OpenTheme => {
                 self.modal = Some(Modal::Theme);
                 self.commander
@@ -2992,6 +3271,7 @@ impl App {
             }
         }
 
+        self.commander_sync_scroll_after_history_change();
         true
     }
 
@@ -3003,13 +3283,39 @@ impl App {
             Ok(result) => {
                 self.commander.rx = None;
                 self.commander.busy = false;
-                let (_executed_notes, speech_notes) =
-                    self.execute_commander_steps(result.into_steps());
-                let commander_reply = if speech_notes.is_empty() {
-                    "Done.".to_string()
-                } else {
-                    format_commander_execution_reply(&speech_notes)
-                };
+
+                if let Some(plan) = result.proposed_plan.clone() {
+                    self.commander.pending_plan = Some(plan);
+                    self.commander.phase = CommanderPhase::AwaitingApproval;
+                } else if result.execution_allowed {
+                    self.commander.pending_plan = None;
+                    if self.commander.phase == CommanderPhase::AwaitingApproval {
+                        self.commander.phase = CommanderPhase::Discussing;
+                    }
+                }
+
+                let mut commander_reply = result
+                    .reply_text
+                    .clone()
+                    .or_else(|| result.speech_text.clone())
+                    .unwrap_or_else(|| "Done.".to_string());
+
+                if result.execution_allowed {
+                    let steps = result.into_steps();
+                    if !steps.is_empty() {
+                        let (_executed_notes, speech_notes) = self.execute_commander_steps(steps);
+                        if !speech_notes.is_empty() {
+                            commander_reply = format_commander_execution_reply(&speech_notes);
+                        }
+                    }
+                }
+
+                if self.commander.phase == CommanderPhase::AwaitingApproval {
+                    commander_reply = format!(
+                        "{commander_reply}\n\nReply /approve when you want me to run this plan."
+                    );
+                }
+
                 self.queue_tts(&commander_reply);
                 if let Some(last) = self.commander.history.last_mut() {
                     if last == "Commander: thinking..." {
@@ -3024,6 +3330,7 @@ impl App {
                         .history
                         .push(format!("Commander: {}", commander_reply));
                 }
+                self.commander_sync_scroll_after_history_change();
                 true
             }
             Err(TryRecvError::Empty) => false,
@@ -3034,10 +3341,73 @@ impl App {
                 self.commander
                     .history
                     .push(format!("Commander: {}", error_line));
+                self.commander_sync_scroll_after_history_change();
                 self.queue_tts(error_line);
                 true
             }
         }
+    }
+
+    fn workspace_has_dedicated_workers(&self) -> bool {
+        self.panes
+            .iter()
+            .any(|pane| pane.command != COMMANDER_COMMAND)
+    }
+
+    fn build_execution_steps_from_plan(
+        &self,
+        plan: &CommanderPendingPlan,
+    ) -> Vec<CommanderExecutionStep> {
+        let mut steps = Vec::new();
+        let workspace = match &plan.workspace {
+            CommanderWorkspacePlan::UseCurrent if !self.workspace_has_dedicated_workers() => {
+                CommanderWorkspacePlan::CreateNew
+            }
+            other => other.clone(),
+        };
+
+        match workspace {
+            CommanderWorkspacePlan::CreateNew => {
+                steps.push(CommanderExecutionStep {
+                    workspace_create: Some(plan.workspace_name.clone()),
+                    ..CommanderExecutionStep::default()
+                });
+            }
+            CommanderWorkspacePlan::SwitchTo(selector) => {
+                steps.push(CommanderExecutionStep {
+                    workspace_switch: Some(selector),
+                    ..CommanderExecutionStep::default()
+                });
+            }
+            CommanderWorkspacePlan::UseCurrent => {}
+        }
+
+        for assignment in &plan.panes {
+            if assignment.task.trim().is_empty() {
+                continue;
+            }
+            steps.push(CommanderExecutionStep {
+                create_requests: vec![(assignment.agent.clone(), 1)],
+                rename_requests: vec![("ref:last".to_string(), assignment.pane_name.clone())],
+                target_name: Some("ref:last".to_string()),
+                payload: Some(assignment.task.clone()),
+                submit_payload: true,
+                speech_text: Some(format!(
+                    "Tasked {} with {}.",
+                    assignment.pane_name, assignment.agent
+                )),
+                ..CommanderExecutionStep::default()
+            });
+        }
+
+        if steps.is_empty() {
+            steps.push(CommanderExecutionStep {
+                reply_text: Some("The approved plan had no executable pane tasks.".to_string()),
+                ..CommanderExecutionStep::default()
+            });
+        }
+
+        steps
     }
 
     fn execute_commander_steps(
@@ -4289,8 +4659,11 @@ impl App {
     }
 }
 
-fn run_commander_llm(
+fn run_commander_harness(
     user_input: String,
+    phase: CommanderPhase,
+    conversation: Vec<String>,
+    pending_plan: Option<CommanderPendingPlan>,
     pane_names: Vec<String>,
     pane_roster: Vec<String>,
     agent_types: Vec<String>,
@@ -4308,50 +4681,56 @@ fn run_commander_llm(
         .collect::<Vec<_>>()
         .join("\n");
     let workspace_list = workspace_roster.join("\n");
+    let transcript = if conversation.is_empty() {
+        "(no prior messages)".to_string()
+    } else {
+        conversation.join("\n")
+    };
+    let pending_plan_block = pending_plan
+        .as_ref()
+        .map(format_pending_plan_for_prompt)
+        .unwrap_or_else(|| "NONE".to_string());
+    let phase_hint = match phase {
+        CommanderPhase::Discussing => {
+            "You are in planning mode. Do not execute pane actions yet."
+        }
+        CommanderPhase::AwaitingApproval => {
+            "A plan is waiting for user approval. Refine it if they ask for changes; do not execute."
+        }
+        CommanderPhase::Executing => "Execution is in progress.",
+    };
 
     let prompt = format!(
-        "You are a command router for a terminal multiplexer.\n\
-         Available pane names (match one exactly):\n{pane_list}\n\
-         Current pane roster with status metadata:\n{pane_status_list}\n\
-         Available pane types for creation (canonical command tokens):\n{agent_list}\n\
+        "You are Commander, an agent harness for a terminal multiplexer.\n\
+         Your job is to have a collaborative planning conversation, then propose a concrete execution plan.\n\
+         Do not create panes, switch workspaces, or send tasks until the user approves with /approve.\n\
+         {phase_hint}\n\n\
+         Available pane names:\n{pane_list}\n\
+         Current pane roster:\n{pane_status_list}\n\
+         Available pane types (canonical tokens):\n{agent_list}\n\
          Available workspaces:\n{workspace_list}\n\
          Speech aliases: codecs/code-ex/codacs => codex, open code/open-code => opencode.\n\n\
-         User request:\n{user_input}\n\n\
-         If the request has multiple parts, dependencies, or sequencing (for example \"do X, then Y\"), decompose it into ordered steps.\n\
-         Return either:\n\
-         1) EXACTLY these 9 lines and nothing else (single-step mode):\n\
-         ACTION=<SEND|TASK|CREATE|CREATE_AND_SEND|CREATE_AND_TASK|RENAME|RENAME_AND_SEND|RENAME_AND_TASK|CLOSE|CLOSE_AND_SEND|CLOSE_AND_TASK|CREATE_AND_RENAME|CREATE_RENAME_AND_SEND|CREATE_RENAME_AND_TASK|CREATE_AND_CLOSE|CREATE_CLOSE_AND_SEND|CREATE_CLOSE_AND_TASK|RENAME_AND_CLOSE|RENAME_CLOSE_AND_SEND|RENAME_CLOSE_AND_TASK|CREATE_RENAME_AND_CLOSE|CREATE_RENAME_CLOSE_AND_SEND|CREATE_RENAME_CLOSE_AND_TASK|SWITCH_WORKSPACE|CREATE_WORKSPACE|REPLY>\n\
-         TARGET=<pane selector or NONE; selectors may be exact pane names, new, all, focused, id:<pane-id>, status:<focused|running|exited|relaunch_failed|worker|new>, or type:<command>>\n\
-         MESSAGE=<text to send to target pane or NONE; it must be the exact text for that target>\n\
-         SPEECH=<short spoken summary for TTS or NONE; summarize the actual result in natural language and avoid task labels/system wording>\n\
-         CREATE=<comma-separated agent:count pairs using canonical type names (e.g. codex:2,opencode:1) or NONE>\n\
-         RENAME=<comma-separated selector=>new name pairs (e.g. focused=>Plan,id:2=>Backend) or NONE>\n\
-         CLOSE=<comma-separated selectors or NONE; selectors may be exact pane names, id:<pane-id>, status:<focused|running|exited|relaunch_failed|commander|worker>, or type:<command>>\n\
-         NEW_WORKSPACE=<workspace name or NONE; use NONE for the default workspace name>\n\
-         WORKSPACE=<workspace selector or NONE; selectors may be exact workspace name, workspace number, next, previous, current>\n\n\
-         2) OR one or more ordered step blocks (multi-step mode), each block with EXACTLY these 11 lines:\n\
-         STEP=<short id>\n\
-         ACTION=<SEND|TASK|CREATE|CREATE_AND_SEND|CREATE_AND_TASK|RENAME|RENAME_AND_SEND|RENAME_AND_TASK|CLOSE|CLOSE_AND_SEND|CLOSE_AND_TASK|CREATE_AND_RENAME|CREATE_RENAME_AND_SEND|CREATE_RENAME_AND_TASK|CREATE_AND_CLOSE|CREATE_CLOSE_AND_SEND|CREATE_CLOSE_AND_TASK|RENAME_AND_CLOSE|RENAME_CLOSE_AND_SEND|RENAME_CLOSE_AND_TASK|CREATE_RENAME_AND_CLOSE|CREATE_RENAME_CLOSE_AND_SEND|CREATE_RENAME_CLOSE_AND_TASK|SWITCH_WORKSPACE|CREATE_WORKSPACE|REPLY>\n\
-         TARGET=<pane selector or NONE; supports ref:<name> and ref:last in addition to normal selectors>\n\
-         MESSAGE=<text or NONE>\n\
-         SPEECH=<short spoken summary for TTS or NONE; summarize the actual result in natural language and avoid task labels/system wording>\n\
-         CREATE=<agent:count list or NONE>\n\
-         RENAME=<selector=>new name list or NONE; selectors can include ref:<name> and ref:last>\n\
-         CLOSE=<selector list or NONE; selectors can include ref:<name> and ref:last>\n\
-         NEW_WORKSPACE=<workspace name or NONE>\n\
-         WORKSPACE=<workspace selector or NONE>\n\
-         SAVE=<reference name for panes created by this step, or NONE>\n\
-         In multi-step mode, put steps in execution order and do not include any text outside the step blocks.\n\
-         If the user asks to rename a pane, put the rename request in RENAME and keep MESSAGE as NONE unless they also asked to send text.\n\
-         If the user asks to switch workspaces, use ACTION=SWITCH_WORKSPACE, put the target workspace in WORKSPACE, and keep MESSAGE as NONE unless they also asked to send text.\n\
-         If the user asks to create a new workspace, use ACTION=CREATE_WORKSPACE, put the requested name in NEW_WORKSPACE or NONE, and keep MESSAGE as NONE unless they also asked to send text.\n\
-         Use ACTION=REPLY when no pane operations are needed and you should answer directly.\n\
-         For ACTION=REPLY, set TARGET=NONE and put the spoken reply in MESSAGE using this style: warm and natural, contractions only, 1-3 words for simple confirmations, one short sentence for status/questions, no formal filler.\n\
-         Use MESSAGE as the exact text for the target pane. Do not wrap it in task instructions, labels, or metadata.\n\
-         If the target is a terminal or shell pane, MESSAGE must be the exact shell command only.\n\
-         Use SPEECH as a concise spoken summary of the actual result. For example, if a terminal was cleared, SPEECH should be \"Terminal cleared.\"; if files were listed, SPEECH should sound like \"Listed the files.\" Keep it general and do not hardcode commands.\n\
-         When ACTION includes CREATE and RENAME together, do not guess future pane names. Use RENAME selector new (single-step mode) or ref:last (multi-step mode) to rename panes created in that same action/step.\n\
-         When ACTION includes CREATE and TASK/SEND together, use TARGET=new unless the user explicitly specifies another target."
+         Conversation so far:\n{transcript}\n\n\
+         Pending plan (if any):\n{pending_plan_block}\n\n\
+         Latest user message:\n{user_input}\n\n\
+         Return EXACTLY one of these formats and nothing else.\n\n\
+         Format A — still clarifying (questions, push the idea forward, no execution):\n\
+         MODE=CONVERSATION\n\
+         REPLY=<warm natural reply; ask focused questions until the deliverable is definitive>\n\n\
+         Format B — plan is ready for approval:\n\
+         MODE=PROPOSE_PLAN\n\
+         REPLY=<present the plan clearly; mention /approve to run>\n\
+         PLAN_SUMMARY=<one line>\n\
+         PLAN_OBJECTIVE=<what will be built or done>\n\
+         WORKSPACE=<CURRENT|CREATE|CREATE:<name>|USE:<workspace selector>>\n\
+         PANES=<pane specs separated by semicolons; each spec is agent@pane_name@task slice>\n\n\
+         Rules:\n\
+         - Use MODE=CONVERSATION while requirements are still fuzzy.\n\
+         - Use MODE=PROPOSE_PLAN only when you can name concrete pane assignments and task slices.\n\
+         - Each pane task slice must be self-contained context for that agent.\n\
+         - Prefer WORKSPACE=CREATE for multi-agent execution unless the user explicitly wants the current workspace.\n\
+         - Split work across panes by distinct slices (research, implementation, tests, docs, etc.).\n\
+         - Do not include ACTION/CREATE/TARGET fields in harness mode."
     );
 
     let output = Command::new("agent")
@@ -4390,21 +4769,219 @@ fn run_commander_llm(
     }
 
     let text = String::from_utf8_lossy(&output.stdout).to_string();
-    if let Some(result) = parse_commander_router_output(&text) {
+    if let Some(result) = parse_commander_harness_output(&text) {
         result
+    } else if let Some(result) = parse_commander_router_output(&text) {
+        CommanderWorkerResult {
+            execution_allowed: false,
+            ..result
+        }
     } else if let Some(reply) = normalize_commander_reply_text(&text) {
-        commander_router_message(reply)
+        commander_harness_message(reply, false)
     } else {
-        commander_router_message("Commander router returned an empty response.".to_string())
+        commander_harness_message(
+            "Commander harness returned an empty response.".to_string(),
+            false,
+        )
+    }
+}
+
+fn commander_harness_message(message: String, execution_allowed: bool) -> CommanderWorkerResult {
+    CommanderWorkerResult {
+        reply_text: Some(message.clone()),
+        speech_text: Some(message),
+        execution_allowed,
+        ..CommanderWorkerResult::empty()
     }
 }
 
 fn commander_router_message(message: String) -> CommanderWorkerResult {
-    CommanderWorkerResult {
-        reply_text: Some(message.clone()),
-        speech_text: Some(message),
-        ..CommanderWorkerResult::empty()
+    commander_harness_message(message, false)
+}
+
+fn format_pending_plan_for_prompt(plan: &CommanderPendingPlan) -> String {
+    let workspace = match &plan.workspace {
+        CommanderWorkspacePlan::UseCurrent => "CURRENT".to_string(),
+        CommanderWorkspacePlan::CreateNew => format!(
+            "CREATE{}",
+            plan.workspace_name
+                .as_ref()
+                .map(|name| format!(":{name}"))
+                .unwrap_or_default()
+        ),
+        CommanderWorkspacePlan::SwitchTo(selector) => format!("USE:{selector}"),
+    };
+    let panes = plan
+        .panes
+        .iter()
+        .map(|pane| {
+            format!(
+                "{}@{}@{}",
+                pane.agent,
+                pane.pane_name,
+                pane.task.replace('@', " ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    format!(
+        "summary={}\nobjective={}\nworkspace={workspace}\npanes={panes}",
+        plan.summary, plan.objective
+    )
+}
+
+fn is_plan_approval(input: &str) -> bool {
+    let normalized = input.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return false;
     }
+    matches!(
+        normalized.as_str(),
+        "/approve"
+            | "/go"
+            | "/execute"
+            | "/run"
+            | "approve"
+            | "approved"
+            | "yes"
+            | "y"
+            | "go"
+            | "go ahead"
+            | "run it"
+            | "run the plan"
+            | "execute"
+            | "execute plan"
+            | "ship it"
+            | "looks good"
+            | "lgtm"
+    ) || normalized.starts_with("yes ")
+        || normalized.starts_with("approve ")
+}
+
+fn is_plan_revision_request(input: &str) -> bool {
+    let normalized = input.trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "/revise" | "/replan" | "/cancel" | "revise" | "replan" | "not yet" | "wait" | "hold"
+    ) || normalized.starts_with("change ")
+        || normalized.starts_with("instead ")
+        || normalized.contains("not ready")
+}
+
+fn parse_commander_harness_output(text: &str) -> Option<CommanderWorkerResult> {
+    let mut mode = None::<String>;
+    let mut reply = None::<String>;
+    let mut plan_summary = None::<String>;
+    let mut plan_objective = None::<String>;
+    let mut workspace = None::<String>;
+    let mut panes = None::<String>;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(value) = trimmed.strip_prefix("MODE=") {
+            mode = Some(value.trim().to_ascii_uppercase());
+        } else if let Some(value) = trimmed.strip_prefix("REPLY=") {
+            reply = Some(value.trim().to_string());
+        } else if let Some(value) = trimmed.strip_prefix("PLAN_SUMMARY=") {
+            plan_summary = Some(value.trim().to_string());
+        } else if let Some(value) = trimmed.strip_prefix("PLAN_OBJECTIVE=") {
+            plan_objective = Some(value.trim().to_string());
+        } else if let Some(value) = trimmed.strip_prefix("WORKSPACE=") {
+            workspace = Some(value.trim().to_string());
+        } else if let Some(value) = trimmed.strip_prefix("PANES=") {
+            panes = Some(value.trim().to_string());
+        }
+    }
+
+    let mode = mode?;
+    let reply_text = reply.as_deref().and_then(normalize_commander_reply_text);
+
+    match mode.as_str() {
+        "CONVERSATION" => Some(CommanderWorkerResult {
+            reply_text: reply_text.clone(),
+            speech_text: reply_text,
+            execution_allowed: false,
+            ..CommanderWorkerResult::empty()
+        }),
+        "PROPOSE_PLAN" => {
+            let summary = plan_summary.filter(|value| !value.is_empty())?;
+            let objective = plan_objective
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| summary.clone());
+            let pane_specs = panes.unwrap_or_default();
+            let assignments = parse_plan_pane_specs(&pane_specs);
+            if assignments.is_empty() {
+                return None;
+            }
+            let (workspace_plan, workspace_name) =
+                parse_plan_workspace(workspace.as_deref().unwrap_or("CREATE"));
+            Some(CommanderWorkerResult {
+                reply_text: reply_text.clone(),
+                speech_text: reply_text,
+                proposed_plan: Some(CommanderPendingPlan {
+                    summary,
+                    objective,
+                    workspace: workspace_plan,
+                    workspace_name,
+                    panes: assignments,
+                }),
+                execution_allowed: false,
+                ..CommanderWorkerResult::empty()
+            })
+        }
+        _ => None,
+    }
+}
+
+fn parse_plan_workspace(value: &str) -> (CommanderWorkspacePlan, Option<String>) {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("CURRENT") {
+        return (CommanderWorkspacePlan::UseCurrent, None);
+    }
+    if trimmed.eq_ignore_ascii_case("CREATE") || trimmed.eq_ignore_ascii_case("NEW") {
+        return (CommanderWorkspacePlan::CreateNew, None);
+    }
+    if let Some(name) = trimmed
+        .strip_prefix("CREATE:")
+        .or_else(|| trimmed.strip_prefix("NEW:"))
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && !name.eq_ignore_ascii_case("NONE"))
+    {
+        return (CommanderWorkspacePlan::CreateNew, Some(name.to_string()));
+    }
+    if let Some(selector) = trimmed
+        .strip_prefix("USE:")
+        .or_else(|| trimmed.strip_prefix("SWITCH:"))
+        .map(str::trim)
+        .filter(|selector| !selector.is_empty())
+    {
+        return (CommanderWorkspacePlan::SwitchTo(selector.to_string()), None);
+    }
+    (CommanderWorkspacePlan::SwitchTo(trimmed.to_string()), None)
+}
+
+fn parse_plan_pane_specs(value: &str) -> Vec<CommanderPaneAssignment> {
+    value
+        .split(';')
+        .filter_map(|chunk| {
+            let trimmed = chunk.trim();
+            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+                return None;
+            }
+            let mut parts = trimmed.splitn(3, '@');
+            let agent = parts.next()?.trim();
+            let pane_name = parts.next()?.trim();
+            let task = parts.next()?.trim();
+            if agent.is_empty() || pane_name.is_empty() || task.is_empty() {
+                return None;
+            }
+            Some(CommanderPaneAssignment {
+                agent: agent.to_string(),
+                pane_name: pane_name.to_string(),
+                task: task.to_string(),
+            })
+        })
+        .collect()
 }
 
 fn parse_commander_router_output(text: &str) -> Option<CommanderWorkerResult> {
@@ -4504,6 +5081,8 @@ fn parse_commander_router_output(text: &str) -> Option<CommanderWorkerResult> {
         close_requests,
         workspace_switch,
         workspace_create,
+        proposed_plan: None,
+        execution_allowed: true,
     })
 }
 
@@ -4878,6 +5457,8 @@ fn parse_commander_slash_command(input: &str) -> Option<CommanderSlashCommand> {
     }
 
     match normalized.as_str() {
+        "approve" | "go" | "execute" | "run" => Some(CommanderSlashCommand::ApprovePlan),
+        "cancel" | "revise" | "replan" => Some(CommanderSlashCommand::CancelPlan),
         "theme" => Some(CommanderSlashCommand::OpenTheme),
         "settings" => Some(CommanderSlashCommand::OpenSettings),
         "new workspace" | "create workspace" | "workspace new" => {
@@ -4896,6 +5477,71 @@ fn parse_commander_slash_command(input: &str) -> Option<CommanderSlashCommand> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn commander_scroll_test_app() -> App {
+        App {
+            panes: Vec::new(),
+            workspaces: vec![WorkspaceState {
+                name: "Workspace 1".to_string(),
+                layout: Node::Leaf { pane_id: 0 },
+                focused: 0,
+                maximized_pane: None,
+            }],
+            active_workspace: 0,
+            layout: Node::Leaf { pane_id: 0 },
+            focused: 0,
+            maximized_pane: None,
+            next_pane_id: 1,
+            running: true,
+            reload_requested: false,
+            modal: None,
+            drag_resize: None,
+            drag_swap: None,
+            drag_pane_mouse: None,
+            text_selection: None,
+            theme_index: 0,
+            default_agent_index: default_agent_index(),
+            theme_preview_index: 0,
+            debug_container_boxes: false,
+            mouse_capture_enabled: true,
+            commander_focused: true,
+            sidebar_workspace_focused: None,
+            sidebar_add_button_focused: false,
+            commander: CommanderState {
+                input: String::new(),
+                cursor: 0,
+                busy: false,
+                phase: CommanderPhase::Discussing,
+                pending_plan: None,
+                history: Vec::new(),
+                chat_offset_from_bottom: 0,
+                chat_pinned_to_bottom: true,
+                chat_viewport_lines: 0,
+                chat_total_lines: 0,
+                rx: None,
+            },
+            agent_handoffs: std::collections::HashMap::new(),
+            commander_palette_video: CommanderPaletteVideoState {
+                child: None,
+                rx: None,
+                parser: vt100::Parser::new(1, 1, 0),
+                frame_text: String::new(),
+                rows: 0,
+                cols: 0,
+            },
+            tts: TtsState {
+                tx: None,
+                event_rx: None,
+            },
+            last_terminal_size: Rect {
+                x: 0,
+                y: 0,
+                width: 120,
+                height: 40,
+            },
+            hit_test_cache: None,
+        }
+    }
     use crate::ui::agent_command_for_input;
 
     #[test]
@@ -4975,7 +5621,64 @@ mod tests {
     }
 
     #[test]
+    fn commander_chat_scroll_pins_to_bottom_and_clamps() {
+        let mut app = commander_scroll_test_app();
+        app.set_commander_chat_metrics(10, 100);
+        app.commander_scroll_to_top();
+        assert_eq!(app.commander_chat_offset_from_bottom(), 90);
+        assert!(!app.commander_chat_pinned_to_bottom());
+
+        app.commander_scroll_to_bottom();
+        assert_eq!(app.commander_chat_offset_from_bottom(), 0);
+        assert!(app.commander_chat_pinned_to_bottom());
+
+        app.commander_page_up();
+        assert_eq!(app.commander_chat_offset_from_bottom(), 10);
+        assert!(!app.commander_chat_pinned_to_bottom());
+
+        app.commander_page_down();
+        assert_eq!(app.commander_chat_offset_from_bottom(), 0);
+        assert!(app.commander_chat_pinned_to_bottom());
+
+        app.commander_scroll_up();
+        app.commander_scroll_up();
+        assert_eq!(app.commander_chat_offset_from_bottom(), 2);
+        app.commander_scroll_down();
+        assert_eq!(app.commander_chat_offset_from_bottom(), 1);
+        app.commander_scroll_down();
+        assert_eq!(app.commander_chat_offset_from_bottom(), 0);
+        assert!(app.commander_chat_pinned_to_bottom());
+    }
+
+    #[test]
+    fn commander_chat_scroll_follows_new_history_when_pinned() {
+        let mut app = commander_scroll_test_app();
+        app.set_commander_chat_metrics(5, 20);
+        app.commander_scroll_up();
+        assert_eq!(app.commander_chat_offset_from_bottom(), 1);
+        assert!(!app.commander_chat_pinned_to_bottom());
+
+        app.commander.history.push("You: hello".to_string());
+        app.commander_sync_scroll_after_history_change();
+        assert_eq!(app.commander_chat_offset_from_bottom(), 1);
+
+        app.commander_scroll_to_bottom();
+        app.commander.history.push("Commander: hi".to_string());
+        app.commander_sync_scroll_after_history_change();
+        assert_eq!(app.commander_chat_offset_from_bottom(), 0);
+        assert!(app.commander_chat_pinned_to_bottom());
+    }
+
+    #[test]
     fn commander_slash_commands_parse() {
+        assert!(matches!(
+            parse_commander_slash_command("/approve"),
+            Some(CommanderSlashCommand::ApprovePlan)
+        ));
+        assert!(matches!(
+            parse_commander_slash_command("/cancel"),
+            Some(CommanderSlashCommand::CancelPlan)
+        ));
         assert!(matches!(
             parse_commander_slash_command("/theme"),
             Some(CommanderSlashCommand::OpenTheme)
@@ -5067,6 +5770,46 @@ mod tests {
             Some("Research")
         );
         assert!(result.target_name.is_none());
+    }
+
+    #[test]
+    fn commander_harness_parses_conversation_mode() {
+        let result = parse_commander_harness_output(
+            "MODE=CONVERSATION\nREPLY=What should the first milestone be?",
+        )
+        .expect("expected harness result");
+        assert!(!result.execution_allowed);
+        assert_eq!(
+            result.reply_text.as_deref(),
+            Some("What should the first milestone be?")
+        );
+        assert!(result.proposed_plan.is_none());
+    }
+
+    #[test]
+    fn commander_harness_parses_proposed_plan() {
+        let result = parse_commander_harness_output(
+            "MODE=PROPOSE_PLAN\n\
+             REPLY=Here is the plan.\n\
+             PLAN_SUMMARY=Build auth flow\n\
+             PLAN_OBJECTIVE=Implement login and session handling\n\
+             WORKSPACE=CREATE:Auth Sprint\n\
+             PANES=codex@Plan@Design API contract;opencode@Build@Implement handlers",
+        )
+        .expect("expected harness result");
+        let plan = result.proposed_plan.expect("expected plan");
+        assert_eq!(plan.summary, "Build auth flow");
+        assert_eq!(plan.panes.len(), 2);
+        assert!(matches!(plan.workspace, CommanderWorkspacePlan::CreateNew));
+        assert_eq!(plan.workspace_name.as_deref(), Some("Auth Sprint"));
+        assert!(!result.execution_allowed);
+    }
+
+    #[test]
+    fn plan_approval_phrases_are_detected() {
+        assert!(is_plan_approval("/approve"));
+        assert!(is_plan_approval("looks good"));
+        assert!(!is_plan_approval("maybe later"));
     }
 
     #[test]

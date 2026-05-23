@@ -37,21 +37,19 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span, Text},
+    text::{Line, Text},
     widgets::{Block, BorderType, Borders, Paragraph, Wrap},
     Frame, Terminal,
 };
 
 use app::{App, MousePointerShape};
-use layout::{
-    pane_borders, pane_inner_area, pane_title_bar_area, pane_title_chrome_reserve, pane_title_y,
-    PANE_TITLE_LEFT_PADDING,
-};
+use layout::{pane_borders, pane_inner_area, ExposedSides};
 use theme::Theme;
 use ui::{
-    agent_label_for_command, render_help_modal, render_new_pane_picker_modal,
-    render_panel_settings_modal, render_theme_modal, render_top_chrome,
-    render_workspace_settings_modal, render_workspace_sidebar, truncate_to_width,
+    commander_chrome_title_label, pane_chrome_title_label, render_help_modal,
+    render_new_pane_picker_modal, render_panel_settings_modal, render_panel_title_chrome,
+    render_theme_modal, render_top_chrome, render_workspace_settings_modal,
+    render_workspace_sidebar,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -552,118 +550,23 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                     f.render_widget(block, pane_area);
                     pane.mark_painted();
 
-                    let title_bar = pane_title_bar_area(pane_area);
-                    let title_y = pane_title_y(pane_area);
-                    if title_y < pane_area.bottom() {
-                        let title_bar_width = title_bar.width;
-                        if title_bar_width > PANE_TITLE_LEFT_PADDING {
-                            let usage_badge = format_pane_usage_badge(
-                                pane_usage
-                                    .get(&placement.pane_id)
-                                    .copied()
-                                    .unwrap_or_default(),
-                            );
-                            let pane_type = agent_label_for_command(&pane.command);
-                            let title = format!("{} [{}] ▼", pane.title, pane_type);
-                            let title_max = title_bar_width
-                                .saturating_sub(pane_title_chrome_reserve(pane_area.width))
-                                .saturating_sub(PANE_TITLE_LEFT_PADDING + 7)
-                                as usize;
-                            let title_slot_w = title_bar_width;
-                            let title_body = truncate_to_width(&title, title_max);
-                            let usage_max = title_slot_w.saturating_sub(7) as usize;
-                            let usage_body = truncate_to_width(&usage_badge, usage_max);
-                            let top_label_prefix = format!("╭─┐ {}", title_body);
-                            let bottom_prefix = "│ └ ";
-                            let bottom_after_usage = " ";
-                            let top_corner_col = top_label_prefix.chars().count() + 2;
-                            let bottom_corner_col = bottom_prefix.chars().count()
-                                + usage_body.chars().count()
-                                + bottom_after_usage.chars().count()
-                                + 1;
-                            let top_corner_padding =
-                                bottom_corner_col.saturating_sub(top_corner_col);
-                            let top_prefix =
-                                format!("{top_label_prefix}{} ┌", " ".repeat(top_corner_padding));
-                            let top_min_len = top_prefix.chars().count() + 2;
-                            let bottom_min_len = bottom_prefix.chars().count()
-                                + usage_body.chars().count()
-                                + bottom_after_usage.chars().count()
-                                + 1;
-                            let target_len = top_min_len.max(bottom_min_len);
-                            let top_dash_count =
-                                target_len.saturating_sub(top_prefix.chars().count());
-                            let bottom_dash_count = target_len.saturating_sub(bottom_min_len + 2);
-                            let title_text = format!("{top_prefix}{}", "─".repeat(top_dash_count));
-                            f.render_widget(
-                                Paragraph::new(title_text)
-                                    .alignment(Alignment::Left)
-                                    .style(chrome_style),
-                                Rect {
-                                    x: title_bar.x,
-                                    y: title_y,
-                                    width: title_slot_w,
-                                    height: 1,
-                                },
-                            );
-
-                            if title_y.saturating_add(1) < pane_area.bottom() {
-                                let usage_line = Line::from(vec![
-                                    Span::styled(bottom_prefix, chrome_style),
-                                    Span::styled(
-                                        usage_body,
-                                        Style::default().fg(theme.muted).bg(theme.background),
-                                    ),
-                                    Span::styled(
-                                        format!(
-                                            "{bottom_after_usage}{}┘",
-                                            "─".repeat(bottom_dash_count)
-                                        ),
-                                        chrome_style,
-                                    ),
-                                ]);
-                                f.render_widget(
-                                    Paragraph::new(usage_line)
-                                        .alignment(Alignment::Left)
-                                        .style(chrome_style),
-                                    Rect {
-                                        x: title_bar.x,
-                                        y: title_y.saturating_add(1),
-                                        width: title_slot_w,
-                                        height: 1,
-                                    },
-                                );
-                            }
-                        }
-
-                        let maximize_icon = if is_maximized { "🗗" } else { "⛶" };
-                        let controls_top = format!("─┐ {maximize_icon}  🗙 ┌─╮");
-                        let controls_bottom = " └──────┘ │";
-                        let controls_width = controls_top.chars().count() as u16;
-                        if pane_area.width >= controls_width {
-                            let controls_x = pane_area.right().saturating_sub(controls_width);
-                            f.render_widget(
-                                Paragraph::new(controls_top).style(chrome_style),
-                                Rect {
-                                    x: controls_x,
-                                    y: title_y,
-                                    width: controls_width,
-                                    height: 1,
-                                },
-                            );
-                            if title_y.saturating_add(1) < pane_area.bottom() {
-                                f.render_widget(
-                                    Paragraph::new(controls_bottom).style(chrome_style),
-                                    Rect {
-                                        x: controls_x,
-                                        y: title_y.saturating_add(1),
-                                        width: controls_width,
-                                        height: 1,
-                                    },
-                                );
-                            }
-                        }
-                    }
+                    let usage_badge = format_pane_usage_badge(
+                        pane_usage
+                            .get(&placement.pane_id)
+                            .copied()
+                            .unwrap_or_default(),
+                    );
+                    let title = pane_chrome_title_label(&pane.title, &pane.command);
+                    render_panel_title_chrome(
+                        f,
+                        pane_area,
+                        &title,
+                        &usage_badge,
+                        chrome_style,
+                        theme,
+                        true,
+                        is_maximized,
+                    );
 
                     let inner = pane_inner_area(pane_area, placement.exposed);
                     if inner.width > 0 && inner.height > 0 {
@@ -706,16 +609,30 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                             agent_index,
                             ..
                         } => {
-                            let container = app
+                            let (pane_area, anchor_title) = app
                                 .pane_placements(App::content_area(f.size()))
                                 .into_iter()
                                 .find(|placement| placement.pane_id == *pane_id)
-                                .map(|placement| placement.area)
-                                .unwrap_or(App::content_area(f.size()));
+                                .and_then(|placement| {
+                                    app.panes
+                                        .iter()
+                                        .find(|pane| pane.id == *pane_id)
+                                        .map(|pane| {
+                                            (
+                                                placement.area,
+                                                pane_chrome_title_label(&pane.title, &pane.command),
+                                            )
+                                        })
+                                })
+                                .unwrap_or_else(|| {
+                                    let area = App::content_area(f.size());
+                                    (area, "Pane".to_string())
+                                });
                             let availability = app.agent_availability_for_pane(*pane_id);
                             render_new_pane_picker_modal(
                                 f,
-                                container,
+                                pane_area,
+                                &anchor_title,
                                 theme,
                                 name,
                                 name_error.as_deref(),
@@ -733,10 +650,30 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                             focus,
                             ..
                         } => {
+                            let (pane_area, anchor_title) = app
+                                .pane_placements(App::content_area(f.size()))
+                                .into_iter()
+                                .find(|placement| placement.pane_id == *pane_id)
+                                .and_then(|placement| {
+                                    app.panes
+                                        .iter()
+                                        .find(|pane| pane.id == *pane_id)
+                                        .map(|pane| {
+                                            (
+                                                placement.area,
+                                                pane_chrome_title_label(&pane.title, &pane.command),
+                                            )
+                                        })
+                                })
+                                .unwrap_or_else(|| {
+                                    let area = App::content_area(f.size());
+                                    (area, "Pane".to_string())
+                                });
                             let availability = app.agent_availability_for_pane(*pane_id);
                             render_panel_settings_modal(
                                 f,
-                                f.size(),
+                                pane_area,
+                                &anchor_title,
                                 theme,
                                 name,
                                 name_error.as_deref(),
@@ -894,58 +831,62 @@ fn render_commander_sidebar_panel(
         return;
     }
 
-    let commander_style = if app.commander_focused() {
-        Style::default().fg(theme.accent).bg(theme.background)
-    } else {
-        Style::default().fg(theme.muted).bg(theme.background)
-    };
-    f.render_widget(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(commander_style)
-            .style(Style::default().bg(theme.background)),
-        commander_area,
-    );
-
-    let inner = Block::default().borders(Borders::ALL).inner(commander_area);
-    let inner = Rect {
-        x: inner.x.saturating_add(1),
-        y: inner.y.saturating_add(1),
-        width: inner.width.saturating_sub(2),
-        height: inner.height.saturating_sub(2),
-    };
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-
-    let status = if app.commander_busy() {
-        "thinking..."
-    } else {
-        "ready"
-    };
-    let header_label = if status == "ready" {
-        "Commander"
-    } else {
-        status
-    };
-    let header_fg = if app.commander_focused() {
+    let focused = app.commander_focused();
+    let border_color = if focused {
         theme.accent
     } else {
         theme.muted
     };
-    let header = Paragraph::new(format!(" {} ", header_label))
-        .alignment(Alignment::Left)
-        .style(Style::default().fg(header_fg).bg(theme.background));
+    let chrome_style = Style::default().fg(border_color).bg(theme.background);
     f.render_widget(
-        header,
-        Rect {
-            x: commander_area.x.saturating_add(1),
-            y: commander_area.y,
-            width: commander_area.width.saturating_sub(2),
-            height: 1,
+        Block::default()
+            .borders(pane_borders(ExposedSides {
+                top: true,
+                bottom: true,
+                left: true,
+                right: true,
+            }))
+            .border_type(BorderType::Rounded)
+            .style(Style::default().bg(theme.background))
+            .border_style(chrome_style),
+        commander_area,
+    );
+
+    let header_label = if app.commander_busy() {
+        "thinking..."
+    } else {
+        app.commander_phase_label()
+    };
+    let scroll_label = if app.commander_chat_pinned_to_bottom() {
+        ""
+    } else {
+        " • scrollback"
+    };
+    let subtitle = format!("{header_label}{scroll_label}");
+    render_panel_title_chrome(
+        f,
+        commander_area,
+        &commander_chrome_title_label(),
+        &subtitle,
+        chrome_style,
+        theme,
+        false,
+        false,
+    );
+
+    let inner = pane_inner_area(
+        commander_area,
+        ExposedSides {
+            top: true,
+            bottom: true,
+            left: true,
+            right: true,
         },
     );
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
     let content_height = inner.height;
     let commander_input = app.commander_input();
     let clamped_cursor = app.commander_cursor().min(commander_input.chars().count());
@@ -998,7 +939,15 @@ fn render_commander_sidebar_panel(
                 },
             );
         }
-        render_commander_chat_overlay(f, chat_area, app.commander_history(), theme);
+        let chat_lines = build_commander_chat_lines(app.commander_history(), chat_area.width, theme);
+        app.set_commander_chat_metrics(chat_area.height, chat_lines.len());
+        render_commander_chat_overlay(
+            f,
+            chat_area,
+            &chat_lines,
+            app.commander_chat_offset_from_bottom(),
+            theme,
+        );
     }
 
     let input_area = Rect {
@@ -1811,14 +1760,25 @@ struct ChatRenderLine {
     is_tail: bool,
 }
 
-fn render_commander_chat_overlay(f: &mut Frame<'_>, area: Rect, history: &[String], theme: Theme) {
+fn render_commander_chat_overlay(
+    f: &mut Frame<'_>,
+    area: Rect,
+    lines: &[ChatRenderLine],
+    scroll_offset_from_bottom: usize,
+    theme: Theme,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let lines = build_commander_chat_lines(history, area.width, theme);
     let max_lines = area.height as usize;
-    let start = lines.len().saturating_sub(max_lines);
-    let visible = lines.into_iter().skip(start).collect::<Vec<_>>();
+    let end = lines.len().saturating_sub(scroll_offset_from_bottom);
+    let start = end.saturating_sub(max_lines);
+    let visible = lines
+        .iter()
+        .skip(start)
+        .take(max_lines)
+        .cloned()
+        .collect::<Vec<_>>();
 
     for (row, line) in visible.into_iter().enumerate() {
         let y = area.y.saturating_add(row as u16);

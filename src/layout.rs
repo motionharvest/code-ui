@@ -133,6 +133,43 @@ pub(crate) fn pane_inner_area(area: Rect, _exposed: ExposedSides) -> Rect {
     }
 }
 
+/// Position a modal directly under the pane title bar, aligned with the title text.
+pub(crate) fn pane_combobox_dropdown_area(
+    pane_area: Rect,
+    anchor_title: &str,
+    modal_width: u16,
+    modal_height: u16,
+) -> Rect {
+    if pane_area.width == 0 || pane_area.height == 0 {
+        return pane_area;
+    }
+
+    let title_hit = pane_title_hit_area(pane_area, anchor_title);
+    let anchor_x = title_hit
+        .map(|area| area.x)
+        .unwrap_or_else(|| pane_area.x.saturating_add(1 + PANE_TITLE_LEFT_PADDING));
+    let anchor_width = title_hit.map(|area| area.width).unwrap_or(modal_width);
+
+    let width = modal_width.max(anchor_width).min(pane_area.width);
+    let max_height = pane_area
+        .height
+        .saturating_sub(PANE_TITLE_BAR_HEIGHT.min(pane_area.height));
+    let height = modal_height.min(max_height).max(1);
+
+    let y = pane_area
+        .y
+        .saturating_add(PANE_TITLE_BAR_HEIGHT.min(pane_area.height));
+    let x = anchor_x.min(pane_area.right().saturating_sub(width));
+    let y = y.min(pane_area.bottom().saturating_sub(height));
+
+    Rect {
+        x,
+        y,
+        width,
+        height,
+    }
+}
+
 pub(crate) fn pane_title_hit_area(area: Rect, title: &str) -> Option<Rect> {
     let title_y = pane_title_y(area);
     if area.width <= 2 || area.height <= PANE_TITLE_BAR_HEIGHT {

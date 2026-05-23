@@ -6,10 +6,150 @@ use ratatui::{
 };
 
 use crate::{
+    layout::pane_combobox_dropdown_area,
     theme::Theme,
     theme::THEMES,
     utils::{contains, LOGIN_SHELL_SENTINEL},
 };
+
+pub(crate) fn pane_chrome_title_label(pane_title: &str, command: &str) -> String {
+    format!("{} [{}] ▼", pane_title, agent_label_for_command(command))
+}
+
+pub(crate) fn commander_chrome_title_label() -> String {
+    "Commander [harness]".to_string()
+}
+
+/// Two-row title bar chrome shared by workspace panes and the Commander panel.
+pub(crate) fn render_panel_title_chrome(
+    f: &mut ratatui::Frame<'_>,
+    panel_area: Rect,
+    title: &str,
+    subtitle: &str,
+    chrome_style: Style,
+    theme: Theme,
+    show_window_controls: bool,
+    is_maximized: bool,
+) {
+    use crate::layout::{
+        pane_title_bar_area, pane_title_chrome_reserve, pane_title_y, PANE_TITLE_LEFT_PADDING,
+    };
+
+    let title_bar = pane_title_bar_area(panel_area);
+    let title_y = pane_title_y(panel_area);
+    if title_y >= panel_area.bottom() {
+        return;
+    }
+
+    let title_bar_width = title_bar.width;
+    if title_bar_width <= PANE_TITLE_LEFT_PADDING {
+        return;
+    }
+
+    let chrome_reserve = if show_window_controls {
+        pane_title_chrome_reserve(panel_area.width)
+    } else {
+        0
+    };
+    let title_max = title_bar_width
+        .saturating_sub(chrome_reserve)
+        .saturating_sub(PANE_TITLE_LEFT_PADDING + 7)
+        as usize;
+    let title_slot_w = title_bar_width;
+    let title_body = truncate_to_width(title, title_max);
+    let usage_max = title_slot_w.saturating_sub(7) as usize;
+    let usage_body = truncate_to_width(subtitle, usage_max);
+    let top_label_prefix = format!("╭─┐ {}", title_body);
+    let bottom_prefix = "│ └ ";
+    let bottom_after_usage = " ";
+    let top_corner_col = top_label_prefix.chars().count() + 2;
+    let bottom_corner_col = bottom_prefix.chars().count()
+        + usage_body.chars().count()
+        + bottom_after_usage.chars().count()
+        + 1;
+    let top_corner_padding = bottom_corner_col.saturating_sub(top_corner_col);
+    let top_prefix = format!("{top_label_prefix}{} ┌", " ".repeat(top_corner_padding));
+    let top_min_len = top_prefix.chars().count() + 2;
+    let bottom_min_len = bottom_prefix.chars().count()
+        + usage_body.chars().count()
+        + bottom_after_usage.chars().count()
+        + 1;
+    let target_len = top_min_len.max(bottom_min_len);
+    let top_dash_count = target_len.saturating_sub(top_prefix.chars().count());
+    let bottom_dash_count = target_len.saturating_sub(bottom_min_len + 2);
+    let title_text = format!("{top_prefix}{}", "─".repeat(top_dash_count));
+    f.render_widget(
+        Paragraph::new(title_text)
+            .alignment(Alignment::Left)
+            .style(chrome_style),
+        Rect {
+            x: title_bar.x,
+            y: title_y,
+            width: title_slot_w,
+            height: 1,
+        },
+    );
+
+    if title_y.saturating_add(1) < panel_area.bottom() {
+        let usage_line = Line::from(vec![
+            Span::styled(bottom_prefix, chrome_style),
+            Span::styled(
+                usage_body,
+                Style::default().fg(theme.muted).bg(theme.background),
+            ),
+            Span::styled(
+                format!(
+                    "{bottom_after_usage}{}┘",
+                    "─".repeat(bottom_dash_count)
+                ),
+                chrome_style,
+            ),
+        ]);
+        f.render_widget(
+            Paragraph::new(usage_line)
+                .alignment(Alignment::Left)
+                .style(chrome_style),
+            Rect {
+                x: title_bar.x,
+                y: title_y.saturating_add(1),
+                width: title_slot_w,
+                height: 1,
+            },
+        );
+    }
+
+    if !show_window_controls {
+        return;
+    }
+
+    let maximize_icon = if is_maximized { "🗗" } else { "⛶" };
+    let controls_top = format!("─┐ {maximize_icon}  🗙 ┌─╮");
+    let controls_bottom = " └──────┘ │";
+    let controls_width = controls_top.chars().count() as u16;
+    if panel_area.width >= controls_width {
+        let controls_x = panel_area.right().saturating_sub(controls_width);
+        f.render_widget(
+            Paragraph::new(controls_top).style(chrome_style),
+            Rect {
+                x: controls_x,
+                y: title_y,
+                width: controls_width,
+                height: 1,
+            },
+        );
+        if title_y.saturating_add(1) < panel_area.bottom() {
+            f.render_widget(
+                Paragraph::new(controls_bottom).style(chrome_style),
+                Rect {
+                    x: controls_x,
+                    y: title_y.saturating_add(1),
+                    width: controls_width,
+                    height: 1,
+                },
+            );
+        }
+    }
+}
 
 pub(crate) const COMMANDER_COMMAND: &str = "commander";
 pub(crate) const TOP_CHROME_ROWS: u16 = 2;
@@ -20,9 +160,26 @@ const APP_VERSION: &str = "0.0.2";
 const APP_HANDLE: &str = "@motionharvest";
 const WORKSPACE_ENTRY_MARGIN_X: u16 = 1;
 const WORKSPACE_ENTRY_MARGIN_TOP: u16 = 0;
-const WORKSPACE_ENTRY_HEIGHT: u16 = 2;
+const WORKSPACE_ENTRY_HEIGHT: u16 = 1;
 const WORKSPACE_ENTRY_GAP: u16 = 1;
-const WORKSPACE_TAB_WIDTH: u16 = 18;
+const WORKSPACE_TAB_SIDE_PADDING: u16 = 1;
+const WORKSPACE_TAB_TITLE_MENU_GAP: u16 = 1;
+const WORKSPACE_TAB_MENU_COLUMNS: u16 = 1;
+const WORKSPACE_TAB_ADD_BUTTON_WIDTH: u16 = 3;
+
+fn workspace_tab_chrome_columns(show_menu: bool) -> u16 {
+    let mut chrome = WORKSPACE_TAB_SIDE_PADDING.saturating_mul(2);
+    if show_menu {
+        chrome = chrome
+            .saturating_add(WORKSPACE_TAB_TITLE_MENU_GAP)
+            .saturating_add(WORKSPACE_TAB_MENU_COLUMNS);
+    }
+    chrome
+}
+
+fn workspace_tab_shows_menu(index: usize, active_workspace_index: usize) -> bool {
+    index == active_workspace_index
+}
 const COMMANDER_TAB_WIDTH: u16 = WORKSPACE_SIDEBAR_WIDTH;
 
 fn commander_panel_width(sidebar_area: Rect) -> u16 {
@@ -73,8 +230,196 @@ fn selected_tab_style(theme: Theme) -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
-fn deselected_tab_style(theme: Theme) -> Style {
-    Style::default().fg(theme.background).bg(theme.muted)
+fn inactive_workspace_tab_style(theme: Theme, keyboard_focused: bool) -> Style {
+    let mut style = Style::default().fg(theme.accent).bg(theme.background);
+    if keyboard_focused {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    style
+}
+
+fn workspace_tab_rule_style(theme: Theme) -> Style {
+    Style::default().fg(theme.muted).bg(theme.background)
+}
+
+fn workspace_tabs_start_x(sidebar_area: Rect) -> u16 {
+    sidebar_area
+        .x
+        .saturating_add(commander_panel_width(sidebar_area))
+        .saturating_add(1)
+        .min(sidebar_area.right())
+}
+
+pub(crate) fn workspace_tab_width(name: &str, show_menu: bool) -> u16 {
+    workspace_tab_chrome_columns(show_menu).saturating_add(name.chars().count() as u16)
+}
+
+fn workspace_tab_title_columns(tab_width: u16, show_menu: bool) -> u16 {
+    tab_width.saturating_sub(workspace_tab_chrome_columns(show_menu))
+}
+
+fn workspace_item_x(
+    sidebar_area: Rect,
+    workspace_names: &[String],
+    index: usize,
+    active_workspace_index: usize,
+) -> u16 {
+    let mut x = workspace_tabs_start_x(sidebar_area);
+    for (idx, name) in workspace_names.iter().take(index).enumerate() {
+        let show_menu = workspace_tab_shows_menu(idx, active_workspace_index);
+        x = x
+            .saturating_add(workspace_tab_width(name, show_menu))
+            .saturating_add(WORKSPACE_ENTRY_GAP);
+    }
+    x
+}
+
+fn workspace_tab_divider_columns(
+    sidebar_area: Rect,
+    workspace_names: &[String],
+    active_workspace_index: usize,
+) -> Vec<u16> {
+    let mut xs = Vec::new();
+    for idx in 0..workspace_names.len().saturating_sub(1) {
+        let left = workspace_item_area(sidebar_area, workspace_names, idx, active_workspace_index);
+        let right =
+            workspace_item_area(sidebar_area, workspace_names, idx + 1, active_workspace_index);
+        let gap_x = left.right();
+        if right.x > gap_x {
+            xs.push(gap_x);
+        }
+    }
+    xs
+}
+
+fn active_tab_left_corner_x(active_tab: Rect, active_is_leftmost: bool) -> Option<u16> {
+    if active_is_leftmost {
+        None
+    } else {
+        Some(active_tab.x.saturating_sub(1))
+    }
+}
+
+fn workspace_tab_rule_char(
+    x: u16,
+    active_tab: Rect,
+    active_is_leftmost: bool,
+    active_is_rightmost: bool,
+    tab_dividers: &[u16],
+) -> char {
+    if active_tab_left_corner_x(active_tab, active_is_leftmost) == Some(x) {
+        return '┘';
+    }
+    if !active_is_rightmost && x == active_tab.right() {
+        return '└';
+    }
+    if x >= active_tab.x && x < active_tab.right() {
+        return '▀';
+    }
+    if tab_dividers.contains(&x) {
+        return '┴';
+    }
+    '─'
+}
+
+fn workspace_tab_rule_span_style(ch: char, theme: Theme) -> Style {
+    if ch == '▀' {
+        Style::default()
+            .fg(selected_tab_bg(theme))
+            .bg(theme.background)
+    } else {
+        workspace_tab_rule_style(theme)
+    }
+}
+
+fn render_workspace_tab_chrome(
+    f: &mut ratatui::Frame<'_>,
+    sidebar_area: Rect,
+    theme: Theme,
+    workspace_names: &[String],
+    active_workspace_index: usize,
+    divider_x: u16,
+) {
+    if sidebar_area.height < 2 || workspace_names.is_empty() {
+        return;
+    }
+
+    let rule_y = sidebar_area.bottom().saturating_sub(1);
+    let active_tab =
+        workspace_item_area(sidebar_area, workspace_names, active_workspace_index, active_workspace_index);
+    let tab_row_style = Style::default().fg(theme.muted).bg(theme.background);
+
+    if divider_x >= sidebar_area.x && divider_x < sidebar_area.right() {
+        for y in [sidebar_area.y, rule_y] {
+            f.render_widget(
+                Paragraph::new("│")
+                    .alignment(Alignment::Left)
+                    .style(tab_row_style),
+                Rect {
+                    x: divider_x,
+                    y,
+                    width: 1,
+                    height: 1,
+                },
+            );
+        }
+    }
+
+    for idx in 0..workspace_names.len().saturating_sub(1) {
+        let left = workspace_item_area(sidebar_area, workspace_names, idx, active_workspace_index);
+        let right =
+            workspace_item_area(sidebar_area, workspace_names, idx + 1, active_workspace_index);
+        let gap_x = left.right();
+        let gap_width = right.x.saturating_sub(gap_x);
+        if gap_width == 0 {
+            continue;
+        }
+        f.render_widget(
+            Paragraph::new("│")
+                .alignment(Alignment::Left)
+                .style(tab_row_style),
+            Rect {
+                x: gap_x,
+                y: sidebar_area.y,
+                width: 1.min(gap_width),
+                height: 1,
+            },
+        );
+    }
+
+    let first_workspace_x =
+        workspace_item_area(sidebar_area, workspace_names, 0, active_workspace_index).x;
+    let rule_width = sidebar_area.right().saturating_sub(first_workspace_x);
+    if rule_width == 0 {
+        return;
+    }
+
+    let tab_dividers =
+        workspace_tab_divider_columns(sidebar_area, workspace_names, active_workspace_index);
+    let active_is_leftmost = active_workspace_index == 0;
+    let active_is_rightmost = active_workspace_index + 1 == workspace_names.len();
+    let mut spans = Vec::with_capacity(rule_width as usize);
+    for offset in 0..rule_width {
+        let x = first_workspace_x.saturating_add(offset);
+        let ch = workspace_tab_rule_char(
+            x,
+            active_tab,
+            active_is_leftmost,
+            active_is_rightmost,
+            &tab_dividers,
+        );
+        let style = workspace_tab_rule_span_style(ch, theme);
+        spans.push(Span::styled(ch.to_string(), style));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(spans)),
+        Rect {
+            x: first_workspace_x,
+            y: rule_y,
+            width: rule_width,
+            height: 1,
+        },
+    );
 }
 
 /// Truncate to a maximum number of terminal cells (counted as Unicode scalar
@@ -283,23 +628,24 @@ pub(crate) fn help_debug_toggle_button_area(area: Rect) -> Rect {
     }
 }
 
-pub(crate) fn workspace_item_area(sidebar_area: Rect, index: usize) -> Rect {
-    let first_workspace_x = sidebar_area
-        .x
-        .saturating_add(commander_panel_width(sidebar_area))
-        .saturating_add(1)
-        .min(sidebar_area.right());
-    let x = first_workspace_x.saturating_add(
-        (index as u16).saturating_mul(WORKSPACE_TAB_WIDTH.saturating_add(WORKSPACE_ENTRY_GAP)),
-    );
+pub(crate) fn workspace_item_area(
+    sidebar_area: Rect,
+    workspace_names: &[String],
+    index: usize,
+    active_workspace_index: usize,
+) -> Rect {
+    let x = workspace_item_x(sidebar_area, workspace_names, index, active_workspace_index);
+    let desired = if index < workspace_names.len() {
+        let show_menu = workspace_tab_shows_menu(index, active_workspace_index);
+        workspace_tab_width(&workspace_names[index], show_menu)
+    } else {
+        WORKSPACE_TAB_ADD_BUTTON_WIDTH
+    };
+    let max_width = sidebar_area.right().saturating_sub(x);
     Rect {
         x,
         y: sidebar_area.y.saturating_add(WORKSPACE_ENTRY_MARGIN_TOP),
-        width: WORKSPACE_TAB_WIDTH.min(
-            sidebar_area
-                .width
-                .saturating_sub(x.saturating_sub(sidebar_area.x)),
-        ),
+        width: desired.min(max_width),
         height: WORKSPACE_ENTRY_HEIGHT.min(
             sidebar_area
                 .height
@@ -308,50 +654,110 @@ pub(crate) fn workspace_item_area(sidebar_area: Rect, index: usize) -> Rect {
     }
 }
 
-pub(crate) fn workspace_add_button_area(sidebar_area: Rect, workspace_count: usize) -> Rect {
-    let mut area = workspace_item_area(sidebar_area, workspace_count);
-    area.width = 3.min(area.width);
+pub(crate) fn workspace_add_button_area(
+    sidebar_area: Rect,
+    workspace_names: &[String],
+    active_workspace_index: usize,
+) -> Rect {
+    let mut area = workspace_item_area(
+        sidebar_area,
+        workspace_names,
+        workspace_names.len(),
+        active_workspace_index,
+    );
+    area.width = WORKSPACE_TAB_ADD_BUTTON_WIDTH.min(area.width);
     area.y = area.y.saturating_add(area.height.saturating_sub(1));
     area.height = 1.min(area.height);
     area
 }
 
-pub(crate) fn workspace_menu_button_area(sidebar_area: Rect, index: usize) -> Rect {
-    let item = workspace_item_area(sidebar_area, index);
+pub(crate) fn workspace_menu_button_area(
+    sidebar_area: Rect,
+    workspace_names: &[String],
+    index: usize,
+    active_workspace_index: usize,
+) -> Rect {
+    let item = workspace_item_area(sidebar_area, workspace_names, index, active_workspace_index);
+    let menu_offset = WORKSPACE_TAB_SIDE_PADDING.saturating_add(WORKSPACE_TAB_MENU_COLUMNS);
     Rect {
-        x: item.right().saturating_sub(1),
+        x: item.right().saturating_sub(menu_offset),
         y: item.y,
-        width: 1.min(item.width),
+        width: WORKSPACE_TAB_MENU_COLUMNS.min(item.width),
         height: 1.min(item.height),
     }
 }
 
+pub(crate) fn workspace_tab_hit_area(
+    sidebar_area: Rect,
+    workspace_names: &[String],
+    index: usize,
+    active_workspace_index: usize,
+) -> Rect {
+    let mut area = workspace_item_area(sidebar_area, workspace_names, index, active_workspace_index);
+    area.height = sidebar_area.height.min(2).max(area.height);
+    if index > 0 {
+        area.x = area.x.saturating_sub(1);
+        area.width = area.width.saturating_add(1);
+    }
+    area.width = area
+        .width
+        .min(sidebar_area.right().saturating_sub(area.x));
+    area
+}
+
 pub(crate) fn workspace_hit_index(
     sidebar_area: Rect,
-    workspace_count: usize,
+    workspace_names: &[String],
+    active_workspace_index: usize,
     x: u16,
     y: u16,
 ) -> Option<usize> {
-    (0..workspace_count).find(|idx| contains(workspace_item_area(sidebar_area, *idx), x, y))
+    (0..workspace_names.len()).rposition(|idx| {
+        contains(
+            workspace_tab_hit_area(
+                sidebar_area,
+                workspace_names,
+                idx,
+                active_workspace_index,
+            ),
+            x,
+            y,
+        )
+    })
 }
 
 pub(crate) fn workspace_menu_hit_index(
     sidebar_area: Rect,
-    workspace_count: usize,
+    workspace_names: &[String],
+    active_workspace_index: usize,
     x: u16,
     y: u16,
 ) -> Option<usize> {
-    (0..workspace_count).find(|idx| contains(workspace_menu_button_area(sidebar_area, *idx), x, y))
+    if active_workspace_index >= workspace_names.len() {
+        return None;
+    }
+    contains(
+        workspace_menu_button_area(
+            sidebar_area,
+            workspace_names,
+            active_workspace_index,
+            active_workspace_index,
+        ),
+        x,
+        y,
+    )
+    .then_some(active_workspace_index)
 }
 
 pub(crate) fn workspace_add_button_hit(
     sidebar_area: Rect,
-    workspace_count: usize,
+    workspace_names: &[String],
+    active_workspace_index: usize,
     x: u16,
     y: u16,
 ) -> bool {
     contains(
-        workspace_add_button_area(sidebar_area, workspace_count),
+        workspace_add_button_area(sidebar_area, workspace_names, active_workspace_index),
         x,
         y,
     )
@@ -362,7 +768,7 @@ pub(crate) fn render_workspace_sidebar(
     sidebar_area: Rect,
     theme: Theme,
     workspace_names: &[String],
-    workspace_summaries: &[String],
+    _workspace_summaries: &[String],
     active_workspace_index: usize,
     _commander_selected: bool,
     sidebar_workspace_selected_index: Option<usize>,
@@ -383,64 +789,67 @@ pub(crate) fn render_workspace_sidebar(
     );
 
     for (idx, name) in workspace_names.iter().enumerate() {
-        let item_area = workspace_item_area(sidebar_area, idx);
+        let item_area =
+            workspace_item_area(sidebar_area, workspace_names, idx, active_workspace_index);
         if item_area.width == 0 || item_area.height == 0 {
             continue;
         }
         let active = idx == active_workspace_index;
         let keyboard_selected = sidebar_workspace_selected_index == Some(idx);
-        let style = if active || keyboard_selected {
+        let style = if active {
             selected_tab_style(theme)
         } else {
-            deselected_tab_style(theme)
+            inactive_workspace_tab_style(theme, keyboard_selected)
         };
-        let summary_style = Style::default()
-            .fg(theme.background)
-            .bg(style.bg.unwrap_or(theme.muted));
-        f.render_widget(Block::default().style(style), item_area);
-        let label_width = item_area.width.saturating_sub(2) as usize;
-        let label = truncate_to_width(name, label_width);
+        if active {
+            f.render_widget(Block::default().style(style), item_area);
+        }
+        let menu_area =
+            workspace_menu_button_area(sidebar_area, workspace_names, idx, active_workspace_index);
+        let title_columns = workspace_tab_title_columns(item_area.width, active);
+        let label = truncate_to_width(name, title_columns as usize);
         f.render_widget(
-            Paragraph::new(format!(" {} ", label))
+            Paragraph::new(label)
                 .alignment(Alignment::Left)
                 .style(style),
             Rect {
-                x: item_area.x,
+                x: item_area.x.saturating_add(WORKSPACE_TAB_SIDE_PADDING),
                 y: item_area.y,
-                width: item_area.width,
+                width: title_columns,
                 height: 1,
             },
         );
-        if item_area.height >= 2 {
-            let summary = workspace_summaries
-                .get(idx)
-                .map(|s| s.as_str())
-                .unwrap_or("");
-            let summary_text = truncate_to_width(summary, label_width);
+        if active && menu_area.width > 0 && menu_area.height > 0 {
             f.render_widget(
-                Paragraph::new(format!(" {} ", summary_text))
-                    .alignment(Alignment::Left)
-                    .style(summary_style),
-                Rect {
-                    x: item_area.x,
-                    y: item_area.y.saturating_add(1),
-                    width: item_area.width,
-                    height: 1,
-                },
+                Paragraph::new("⋮")
+                    .alignment(Alignment::Center)
+                    .style(style),
+                menu_area,
             );
         }
     }
 
-    let add_area = workspace_add_button_area(sidebar_area, workspace_names.len());
+    render_workspace_tab_chrome(
+        f,
+        sidebar_area,
+        theme,
+        workspace_names,
+        active_workspace_index,
+        divider_x,
+    );
+
+    let add_area = workspace_add_button_area(sidebar_area, workspace_names, active_workspace_index);
     if add_area.width > 0 && add_area.height > 0 {
         let style = if sidebar_add_button_selected {
             selected_tab_style(theme)
         } else {
-            deselected_tab_style(theme)
+            inactive_workspace_tab_style(theme, false)
         };
-        f.render_widget(Block::default().style(style), add_area);
+        if sidebar_add_button_selected {
+            f.render_widget(Block::default().style(style), add_area);
+        }
         f.render_widget(
-            Paragraph::new(" + ")
+            Paragraph::new(" +")
                 .alignment(Alignment::Left)
                 .style(style),
             Rect {
@@ -450,21 +859,6 @@ pub(crate) fn render_workspace_sidebar(
                 height: 1,
             },
         );
-        let rule_width = sidebar_area.right().saturating_sub(add_area.right());
-        if rule_width > 0 {
-            let line_area = Rect {
-                x: add_area.right(),
-                y: add_area.y,
-                width: rule_width,
-                height: 1,
-            };
-            f.render_widget(
-                Paragraph::new("─".repeat(rule_width as usize))
-                    .alignment(Alignment::Left)
-                    .style(Style::default().fg(theme.muted).bg(theme.background)),
-                line_area,
-            );
-        }
     }
 
     let full_size = f.size();
@@ -724,26 +1118,10 @@ pub(crate) fn render_theme_modal(
     f.render_widget(list, inner);
 }
 
-pub(crate) fn panel_settings_modal_area(size: Rect) -> Rect {
-    let desired_width = size.width.saturating_mul(60).saturating_div(100);
-    let desired_height = size.height.saturating_mul(80).saturating_div(100);
-    let width = if size.width < 40 {
-        size.width
-    } else {
-        desired_width.max(40).min(size.width)
-    };
-    let height = if size.height < 16 {
-        size.height
-    } else {
-        desired_height.max(16).min(size.height)
-    };
-
-    Rect {
-        x: size.x + (size.width.saturating_sub(width)) / 2,
-        y: size.y + (size.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    }
+pub(crate) fn panel_settings_modal_area(pane_area: Rect, anchor_title: &str) -> Rect {
+    let width = 40.min(pane_area.width);
+    let height = 16.min(pane_area.height);
+    pane_combobox_dropdown_area(pane_area, anchor_title, width, height)
 }
 
 /// Content rectangle inside the modal frame (must match `render_panel_settings_modal`).
@@ -799,15 +1177,10 @@ pub(crate) fn panel_settings_confirm_button_area(area: Rect) -> Rect {
     }
 }
 
-pub(crate) fn new_pane_picker_modal_area(container: Rect) -> Rect {
-    let width = 26.min(container.width);
-    let height = (AGENT_PRESETS.len() as u16 + 9).min(container.height);
-    Rect {
-        x: container.x + (container.width.saturating_sub(width)) / 2,
-        y: container.y + (container.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    }
+pub(crate) fn new_pane_picker_modal_area(pane_area: Rect, anchor_title: &str) -> Rect {
+    let width = 26.min(pane_area.width);
+    let height = (AGENT_PRESETS.len() as u16 + 9).min(pane_area.height);
+    pane_combobox_dropdown_area(pane_area, anchor_title, width, height)
 }
 
 pub(crate) fn new_pane_picker_name_input_area(area: Rect) -> Rect {
@@ -832,7 +1205,8 @@ pub(crate) fn new_pane_picker_list_area(area: Rect) -> Rect {
 
 pub(crate) fn render_new_pane_picker_modal(
     f: &mut ratatui::Frame<'_>,
-    container: Rect,
+    pane_area: Rect,
+    anchor_title: &str,
     theme: Theme,
     name: &str,
     name_error: Option<&str>,
@@ -841,7 +1215,7 @@ pub(crate) fn render_new_pane_picker_modal(
     agent_index: usize,
     agent_available: &[bool],
 ) {
-    let area = new_pane_picker_modal_area(container);
+    let area = new_pane_picker_modal_area(pane_area, anchor_title);
     f.render_widget(Clear, area);
 
     let block = Block::default()
@@ -957,7 +1331,8 @@ pub(crate) fn render_new_pane_picker_modal(
 
 pub(crate) fn render_panel_settings_modal(
     f: &mut ratatui::Frame<'_>,
-    size: Rect,
+    pane_area: Rect,
+    anchor_title: &str,
     theme: Theme,
     name: &str,
     name_error: Option<&str>,
@@ -965,7 +1340,7 @@ pub(crate) fn render_panel_settings_modal(
     focus: PanelSettingsFocus,
     agent_available: &[bool],
 ) {
-    let area = panel_settings_modal_area(size);
+    let area = panel_settings_modal_area(pane_area, anchor_title);
     f.render_widget(Clear, area);
 
     let inner = panel_settings_modal_inner(area);
