@@ -5536,6 +5536,7 @@ mod tests {
                 height: 40,
             },
             hit_test_cache: None,
+            last_quit_key_press: None,
         }
     }
     use crate::ui::agent_command_for_input;

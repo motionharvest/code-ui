@@ -1,4 +1,5 @@
 mod app;
+mod git_status;
 mod layout;
 mod pane;
 mod theme;
@@ -43,6 +44,7 @@ use ratatui::{
 };
 
 use app::{App, MousePointerShape};
+use git_status::GitStatusCache;
 use layout::{pane_borders, pane_inner_area};
 use theme::Theme;
 use ui::{
@@ -408,6 +410,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
     app.resize(last_size.height, last_size.width);
     // Force an initial paint.
     let mut dirty = true;
+    let mut git_cache = GitStatusCache::new(Duration::from_secs(2));
 
     while app.running {
         let size = terminal.size()?;
@@ -574,12 +577,14 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                             .copied()
                             .unwrap_or_default(),
                     );
+                    let git_summary = git_cache.summary_for_pane(pane);
                     let title = pane_chrome_title_label(&pane.title, &pane.command);
                     render_panel_title_chrome(
                         f,
                         pane_area,
                         &title,
                         &usage_badge,
+                        git_summary.as_ref(),
                         chrome_style,
                         theme,
                         true,
@@ -811,7 +816,7 @@ fn set_mouse_pointer_shape(out: &mut impl io::Write, shape: MousePointerShape) -
 
 fn render_pane_swap_drop_overlay(f: &mut Frame<'_>, area: Rect, theme: Theme, style: Style) {
     f.render_widget(
-        Paragraph::new("").style(Style::default().fg(theme.foreground).bg(theme.title_bar)),
+        Paragraph::new("").style(Style::default().fg(theme.foreground).bg(bg_color(theme))),
         area,
     );
 
@@ -819,7 +824,7 @@ fn render_pane_swap_drop_overlay(f: &mut Frame<'_>, area: Rect, theme: Theme, st
         Block::default()
             .borders(Borders::ALL)
             .border_style(style)
-            .style(Style::default().bg(theme.title_bar)),
+            .style(Style::default().bg(bg_color(theme))),
         area,
     );
 
@@ -833,7 +838,7 @@ fn render_pane_swap_drop_overlay(f: &mut Frame<'_>, area: Rect, theme: Theme, st
     f.render_widget(
         Paragraph::new("Drop to swap")
             .alignment(Alignment::Center)
-            .style(Style::default().fg(theme.foreground).bg(theme.title_bar)),
+            .style(Style::default().fg(theme.foreground).bg(bg_color(theme))),
         message_area,
     );
 }
@@ -1709,7 +1714,7 @@ fn recolor_color(color: Color, theme: Theme, mode: PaneColorMode, is_foreground:
             if is_foreground {
                 theme.muted
             } else {
-                theme.background
+                Color::Reset
             }
         }
         PaneColorMode::Palette => match color {
@@ -1858,11 +1863,11 @@ mod tests {
     fn test_theme() -> Theme {
         Theme {
             name: "Test",
-            background: Color::Rgb(20, 20, 24),
+            background: Color::Reset,
             foreground: Color::Rgb(220, 220, 230),
             muted: Color::Rgb(120, 120, 130),
             accent: Color::Rgb(80, 140, 220),
-            title_bar: Color::Rgb(190, 160, 90),
+            title_bar: Color::Reset,
             passthrough: false,
             palette: TEST_PALETTE,
         }
@@ -1887,17 +1892,17 @@ mod tests {
 
         let rendered = monochrome_text(text, theme);
         assert_eq!(rendered.style.fg, Some(theme.muted));
-        assert_eq!(rendered.style.bg, Some(theme.background));
+        assert_eq!(rendered.style.bg, Some(Color::Reset));
         assert_eq!(rendered.lines[0].style.fg, Some(theme.muted));
-        assert_eq!(rendered.lines[0].style.bg, Some(theme.background));
+        assert_eq!(rendered.lines[0].style.bg, Some(Color::Reset));
         assert_eq!(rendered.lines[0].spans[0].style.fg, Some(theme.muted));
-        assert_eq!(rendered.lines[0].spans[0].style.bg, Some(theme.background));
+        assert_eq!(rendered.lines[0].spans[0].style.bg, Some(Color::Reset));
         assert!(rendered.lines[0].spans[0]
             .style
             .add_modifier
             .contains(Modifier::BOLD));
         assert_eq!(rendered.lines[0].spans[1].style.fg, Some(theme.muted));
-        assert_eq!(rendered.lines[0].spans[1].style.bg, Some(theme.background));
+        assert_eq!(rendered.lines[0].spans[1].style.bg, Some(Color::Reset));
         assert!(rendered.lines[0].spans[1]
             .style
             .add_modifier

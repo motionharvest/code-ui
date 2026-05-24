@@ -280,6 +280,27 @@ impl Pane {
         Ok(())
     }
 
+    pub(crate) fn tmux_pane_path(&self) -> Option<std::path::PathBuf> {
+        let output = Command::new("tmux")
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                &self.tmux_session,
+                "#{pane_current_path}",
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if path.is_empty() {
+            return None;
+        }
+        Some(std::path::PathBuf::from(path))
+    }
+
     fn replay_tmux_history(&mut self) {
         let Ok(output) = Command::new("tmux")
             .args([

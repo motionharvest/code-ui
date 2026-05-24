@@ -5,17 +5,41 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
 };
 
-/// Returns the background color to use - Reset for transparency passthrough
-pub(crate) fn bg_color(theme: Theme) -> Color {
-    theme.background
+/// UI surfaces always use Reset so the terminal background shows through.
+pub(crate) fn bg_color(_theme: Theme) -> Color {
+    Color::Reset
 }
 
 use crate::{
+    git_status::{truncate_git_badge_body, GitSummary},
     layout::pane_combobox_dropdown_area,
     theme::Theme,
     theme::THEMES,
     utils::{contains, LOGIN_SHELL_SENTINEL},
 };
+
+fn render_git_badge(
+    f: &mut ratatui::Frame<'_>,
+    area: Rect,
+    summary: &GitSummary,
+    theme: Theme,
+) {
+    if area.width == 0 {
+        return;
+    }
+
+    let body = truncate_git_badge_body(summary, area.width as usize);
+    if body.is_empty() {
+        return;
+    }
+
+    f.render_widget(
+        Paragraph::new(body)
+            .alignment(Alignment::Left)
+            .style(Style::default().fg(theme.muted).bg(bg_color(theme))),
+        area,
+    );
+}
 
 pub(crate) fn pane_chrome_title_label(pane_title: &str, command: &str) -> String {
     format!("{} [{}] ▼", pane_title, agent_label_for_command(command))
@@ -27,6 +51,7 @@ pub(crate) fn render_panel_title_chrome(
     panel_area: Rect,
     title: &str,
     subtitle: &str,
+    git_summary: Option<&GitSummary>,
     chrome_style: Style,
     theme: Theme,
     show_window_controls: bool,
@@ -60,19 +85,20 @@ pub(crate) fn render_panel_title_chrome(
     let title_body = truncate_to_width(title, title_max);
     let usage_max = title_slot_w.saturating_sub(7) as usize;
     let usage_body = truncate_to_width(subtitle, usage_max);
+    let usage_len = usage_body.chars().count();
     let top_label_prefix = format!("╭─┐ {}", title_body);
     let bottom_prefix = "│ └ ";
     let bottom_after_usage = " ";
     let top_corner_col = top_label_prefix.chars().count() + 2;
     let bottom_corner_col = bottom_prefix.chars().count()
-        + usage_body.chars().count()
+        + usage_len
         + bottom_after_usage.chars().count()
         + 1;
     let top_corner_padding = bottom_corner_col.saturating_sub(top_corner_col);
     let top_prefix = format!("{top_label_prefix}{} ┌", " ".repeat(top_corner_padding));
     let top_min_len = top_prefix.chars().count() + 2;
     let bottom_min_len = bottom_prefix.chars().count()
-        + usage_body.chars().count()
+        + usage_len
         + bottom_after_usage.chars().count()
         + 1;
     let target_len = top_min_len.max(bottom_min_len);
@@ -117,6 +143,33 @@ pub(crate) fn render_panel_title_chrome(
                 height: 1,
             },
         );
+
+        let bottom_closed_len = bottom_prefix.chars().count()
+            + usage_len
+            + bottom_after_usage.chars().count()
+            + bottom_dash_count
+            + 1;
+        let trailing_start = title_bar
+            .x
+            .saturating_add(bottom_closed_len as u16)
+            .saturating_add(1);
+        let trailing_end = title_bar.right().saturating_sub(chrome_reserve);
+        let trailing_width = trailing_end.saturating_sub(trailing_start);
+        if trailing_width > 0 {
+            if let Some(summary) = git_summary {
+                render_git_badge(
+                    f,
+                    Rect {
+                        x: trailing_start,
+                        y: title_y.saturating_add(1),
+                        width: trailing_width,
+                        height: 1,
+                    },
+                    summary,
+                    theme,
+                );
+            }
+        }
     }
 
     if !show_window_controls {
@@ -338,24 +391,38 @@ fn color_contrast_delta(a: Color, b: Color) -> Option<u16> {
     Some(ar.abs_diff(br) as u16 + ag.abs_diff(bg) as u16 + ab.abs_diff(bb) as u16)
 }
 
+fn theme_surface_color(theme: Theme) -> Color {
+    theme
+        .palette
+        .first()
+        .copied()
+        .filter(|color| *color != Color::Reset)
+        .unwrap_or(theme.foreground)
+}
+
 fn selected_tab_bg(theme: Theme) -> Color {
     let candidate = theme.palette.get(14).copied().unwrap_or(theme.accent);
-    match color_contrast_delta(candidate, theme.background) {
-        Some(delta) if delta >= 180 => candidate,
+    match color_contrast_delta(candidate, theme_surface_color(theme)) {
+        Some(delta) if delta >= 120 => candidate,
         _ => theme.accent,
+    }
+}
+
+fn selected_tab_fg(theme: Theme, tab_bg: Color) -> Color {
+    let surface = theme.palette.first().copied().unwrap_or(Color::Reset);
+    if surface != Color::Reset {
+        return surface;
+    }
+    match color_to_rgb(tab_bg) {
+        Some((r, g, b)) if u16::from(r) + u16::from(g) + u16::from(b) > 382 => Color::Black,
+        _ => Color::White,
     }
 }
 
 fn selected_tab_style(theme: Theme) -> Style {
     let bg = selected_tab_bg(theme);
-    // When transparent, use Reset for foreground to not override terminal colors
-    let fg = if theme.background == Color::Reset {
-        Color::Reset
-    } else {
-        theme.background
-    };
     Style::default()
-        .fg(fg)
+        .fg(selected_tab_fg(theme, bg))
         .bg(bg)
         .add_modifier(Modifier::BOLD)
 }
