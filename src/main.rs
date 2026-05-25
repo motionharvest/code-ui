@@ -331,7 +331,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
 
                     let block = Block::default()
                         .borders(pane_borders(placement.exposed))
-                        .border_type(BorderType::Rounded)
+                        .border_type(BorderType::Plain)
                         .style(Style::default().bg(bg_color(theme)))
                         .border_style(chrome_style);
                     f.render_widget(block, pane_area);

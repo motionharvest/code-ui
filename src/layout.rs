@@ -87,13 +87,12 @@ const RATIO_HALF: u16 = RATIO_SCALE / 2;
 pub(crate) const PANE_INNER_MARGIN: u16 = 1;
 // Two rows of title text/chrome on the pane's top edge.
 pub(crate) const PANE_TITLE_BAR_HEIGHT: u16 = 2;
-/// Extra left padding before the title glyphs.
-pub(crate) const PANE_TITLE_LEFT_PADDING: u16 = 1;
+/// Columns before title text: corner marker plus one padding cell.
+pub(crate) const PANE_TITLE_TEXT_PADDING: u16 = 1;
+pub(crate) const PANE_TITLE_LEFT_PADDING: u16 = 1 + PANE_TITLE_TEXT_PADDING;
 
 pub(crate) fn pane_borders(_exposed: ExposedSides) -> Borders {
-    // The pane uses a normal rounded frame on all sides; the title is rendered
-    // as a cutout in the top border row.
-    Borders::ALL
+    Borders::RIGHT
 }
 
 pub(crate) fn pane_title_y(area: Rect) -> u16 {
@@ -123,15 +122,16 @@ pub(crate) fn pane_title_chrome_reserve(pane_area_width: u16) -> u16 {
 }
 
 pub(crate) fn pane_inner_area(area: Rect, _exposed: ExposedSides) -> Rect {
-    let inset = 1 + PANE_INNER_MARGIN;
+    let left_inset = PANE_INNER_MARGIN;
+    let right_inset = 1 + PANE_INNER_MARGIN;
     let top_chrome = PANE_TITLE_BAR_HEIGHT + PANE_INNER_MARGIN;
     Rect {
-        x: area.x.saturating_add(inset),
+        x: area.x.saturating_add(left_inset),
         y: area.y.saturating_add(top_chrome),
-        width: area.width.saturating_sub(inset.saturating_mul(2)),
+        width: area.width.saturating_sub(left_inset.saturating_add(right_inset)),
         height: area
             .height
-            .saturating_sub(top_chrome + 1 + PANE_INNER_MARGIN),
+            .saturating_sub(top_chrome.saturating_add(PANE_INNER_MARGIN)),
     }
 }
 
@@ -174,11 +174,11 @@ pub(crate) fn pane_combobox_dropdown_area(
 
 pub(crate) fn pane_title_hit_area(area: Rect, title: &str) -> Option<Rect> {
     let title_y = pane_title_y(area);
-    if area.width <= 2 || area.height <= PANE_TITLE_BAR_HEIGHT {
+    if area.width <= 1 || area.height <= PANE_TITLE_BAR_HEIGHT {
         return None;
     }
 
-    let bar_width = area.width.saturating_sub(2);
+    let bar_width = area.width.saturating_sub(1);
     if bar_width == 0 {
         return None;
     }
@@ -192,14 +192,23 @@ pub(crate) fn pane_title_hit_area(area: Rect, title: &str) -> Option<Rect> {
         return None;
     }
 
-    let title_max = available.saturating_sub(PANE_TITLE_LEFT_PADDING + 1) as usize;
+    let text_area_width = available.saturating_sub(PANE_TITLE_LEFT_PADDING);
+    if text_area_width <= PANE_TITLE_TEXT_PADDING.saturating_mul(2) {
+        return None;
+    }
+
+    let title_max = text_area_width
+        .saturating_sub(PANE_TITLE_TEXT_PADDING.saturating_mul(2)) as usize;
     let rendered_title = truncate_to_width(title, title_max);
-    let title_width = rendered_title.chars().count() as u16 + 2;
+    let title_width = rendered_title
+        .chars()
+        .count()
+        .saturating_add(PANE_TITLE_TEXT_PADDING as usize * 2) as u16;
 
     Some(Rect {
-        x: area.x.saturating_add(1 + PANE_TITLE_LEFT_PADDING),
+        x: area.x.saturating_add(PANE_TITLE_LEFT_PADDING),
         y: title_y,
-        width: title_width.min(available),
+        width: title_width.min(text_area_width),
         height: 1,
     })
 }

@@ -35,124 +35,130 @@ pub(crate) fn render_panel_title_chrome(
 ) {
     use crate::layout::{
         pane_title_bar_area, pane_title_chrome_reserve, pane_title_y, PANE_TITLE_LEFT_PADDING,
+        PANE_TITLE_TEXT_PADDING,
     };
 
     let title_bar = pane_title_bar_area(panel_area);
     let title_y = pane_title_y(panel_area);
-    if title_y >= panel_area.bottom() {
-        return;
-    }
-
     let title_bar_width = title_bar.width;
-    if title_bar_width <= PANE_TITLE_LEFT_PADDING {
-        return;
-    }
 
-    let chrome_reserve = if show_window_controls {
-        pane_title_chrome_reserve(panel_area.width)
-    } else {
-        0
-    };
-    let title_max = title_bar_width
-        .saturating_sub(chrome_reserve)
-        .saturating_sub(PANE_TITLE_LEFT_PADDING + 7)
-        as usize;
-    let title_slot_w = title_bar_width;
-    let title_body = truncate_to_width(title, title_max);
-    let git_max = title_slot_w.saturating_sub(7) as usize;
-    let git_body = git_summary
-        .map(|summary| truncate_git_badge_body(summary, git_max))
-        .unwrap_or_default();
-    let git_len = git_body.chars().count();
-    let top_label_prefix = format!("╭─┐ {}", title_body);
-    let bottom_prefix = "│ └ ";
-    let bottom_after_git = " ";
-    let top_corner_col = top_label_prefix.chars().count() + 2;
-    let bottom_corner_col = bottom_prefix.chars().count()
-        + git_len
-        + bottom_after_git.chars().count()
-        + 1;
-    let top_corner_padding = bottom_corner_col.saturating_sub(top_corner_col);
-    let top_prefix = format!("{top_label_prefix}{} ┌", " ".repeat(top_corner_padding));
-    let top_min_len = top_prefix.chars().count() + 2;
-    let bottom_min_len = bottom_prefix.chars().count()
-        + git_len
-        + bottom_after_git.chars().count()
-        + 1;
-    let target_len = top_min_len.max(bottom_min_len);
-    let top_dash_count = target_len.saturating_sub(top_prefix.chars().count());
-    let bottom_dash_count = target_len.saturating_sub(bottom_min_len + 2);
-    let title_text = format!("{top_prefix}{}", "─".repeat(top_dash_count));
-    f.render_widget(
-        Paragraph::new(title_text)
-            .alignment(Alignment::Left)
-            .style(chrome_style),
-        Rect {
-            x: title_bar.x,
-            y: title_y,
-            width: title_slot_w,
-            height: 1,
-        },
-    );
+    if title_y < panel_area.bottom() && title_bar_width > PANE_TITLE_LEFT_PADDING {
+        let chrome_reserve = if show_window_controls {
+            pane_title_chrome_reserve(panel_area.width)
+        } else {
+            0
+        };
+        let text_x = title_bar.x.saturating_add(PANE_TITLE_LEFT_PADDING);
+        let text_width = title_bar_width
+            .saturating_sub(PANE_TITLE_LEFT_PADDING)
+            .saturating_sub(chrome_reserve);
 
-    if title_y.saturating_add(1) < panel_area.bottom() {
-        let git_line = Line::from(vec![
-            Span::styled(bottom_prefix, chrome_style),
-            Span::styled(
-                git_body,
-                Style::default().fg(theme.muted).bg(bg_color(theme)),
-            ),
-            Span::styled(
-                format!(
-                    "{bottom_after_git}{}┘",
-                    "─".repeat(bottom_dash_count)
-                ),
-                chrome_style,
-            ),
-        ]);
-        f.render_widget(
-            Paragraph::new(git_line)
-                .alignment(Alignment::Left)
-                .style(chrome_style),
-            Rect {
-                x: title_bar.x,
-                y: title_y.saturating_add(1),
-                width: title_slot_w,
-                height: 1,
-            },
-        );
-    }
-
-    if !show_window_controls {
-        return;
-    }
-
-    let maximize_icon = if is_maximized { "🗗" } else { "⛶" };
-    let controls_top = format!("─┐ {maximize_icon}  🗙 ┌─╮");
-    let controls_bottom = " └──────┘ │";
-    let controls_width = controls_top.chars().count() as u16;
-    if panel_area.width >= controls_width {
-        let controls_x = panel_area.right().saturating_sub(controls_width);
-        f.render_widget(
-            Paragraph::new(controls_top).style(chrome_style),
-            Rect {
-                x: controls_x,
-                y: title_y,
-                width: controls_width,
-                height: 1,
-            },
-        );
-        if title_y.saturating_add(1) < panel_area.bottom() {
+        if text_width > PANE_TITLE_TEXT_PADDING.saturating_mul(2) {
             f.render_widget(
-                Paragraph::new(controls_bottom).style(chrome_style),
+                Paragraph::new("►")
+                    .alignment(Alignment::Left)
+                    .style(chrome_style),
                 Rect {
-                    x: controls_x,
-                    y: title_y.saturating_add(1),
-                    width: controls_width,
+                    x: title_bar.x,
+                    y: title_y,
+                    width: 1,
                     height: 1,
                 },
             );
+
+            let title_max = text_width
+                .saturating_sub(PANE_TITLE_TEXT_PADDING.saturating_mul(2)) as usize;
+            let title_body = truncate_to_width(title, title_max);
+            let title_text = format!(" {title_body} ");
+            let title_rule_start = title_text
+                .chars()
+                .enumerate()
+                .filter(|(_, ch)| *ch == ']')
+                .map(|(col, _)| col + 1)
+                .last()
+                .map(|col| text_x.saturating_add(col as u16))
+                .unwrap_or_else(|| text_x.saturating_add(title_text.chars().count() as u16));
+            f.render_widget(
+                Paragraph::new(title_text)
+                    .alignment(Alignment::Left)
+                    .style(chrome_style),
+                Rect {
+                    x: text_x,
+                    y: title_y,
+                    width: text_width,
+                    height: 1,
+                },
+            );
+
+            if title_y.saturating_add(1) < panel_area.bottom() {
+                let git_body = git_summary
+                    .map(|summary| truncate_git_badge_body(summary, title_max))
+                    .unwrap_or_default();
+                if !git_body.is_empty() {
+                    let git_text = format!(" {git_body} ");
+                    f.render_widget(
+                        Paragraph::new(git_text)
+                            .alignment(Alignment::Left)
+                            .style(Style::default().fg(theme.muted).bg(bg_color(theme))),
+                        Rect {
+                            x: text_x,
+                            y: title_y.saturating_add(1),
+                            width: text_width,
+                            height: 1,
+                        },
+                    );
+                }
+            }
+
+            if show_window_controls {
+                let maximize_icon = if is_maximized { "🗗" } else { "⛶" };
+                let controls_top = format!("{maximize_icon}  🗙");
+                let controls_width = controls_top.chars().count() as u16;
+                if panel_area.width >= controls_width.saturating_add(PANE_TITLE_LEFT_PADDING) {
+                    let controls_x = panel_area
+                        .right()
+                        .saturating_sub(controls_width.saturating_add(1));
+                    let bar_start = title_rule_start;
+                    let bar_width = controls_x.saturating_sub(bar_start);
+                    if bar_width > 0 {
+                        f.render_widget(
+                            Paragraph::new("─".repeat(bar_width as usize))
+                                .alignment(Alignment::Left)
+                                .style(chrome_style),
+                            Rect {
+                                x: bar_start,
+                                y: title_y,
+                                width: bar_width,
+                                height: 1,
+                            },
+                        );
+                    }
+                    f.render_widget(
+                        Paragraph::new(controls_top).style(chrome_style),
+                        Rect {
+                            x: controls_x,
+                            y: title_y,
+                            width: controls_width,
+                            height: 1,
+                        },
+                    );
+                }
+            }
         }
+    }
+
+    if panel_area.width > 0 && panel_area.height > 0 {
+        f.render_widget(
+            Paragraph::new("◿")
+                .alignment(Alignment::Left)
+                .style(chrome_style),
+            Rect {
+                x: panel_area.right().saturating_sub(1),
+                y: panel_area.bottom().saturating_sub(1),
+                width: 1,
+                height: 1,
+            },
+        );
     }
 }
 

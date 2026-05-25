@@ -69,6 +69,7 @@ pub(crate) struct App {
     last_terminal_size: Rect,
     hit_test_cache: Option<HitTestCache>,
     last_quit_key_press: Option<Instant>,
+    pending_layout_persist: bool,
 }
 
 #[derive(Clone)]
@@ -526,6 +527,7 @@ impl App {
             },
             hit_test_cache: None,
             last_quit_key_press: None,
+            pending_layout_persist: false,
         };
         app.rebuild_hit_test_cache();
         Ok(app)
@@ -643,6 +645,20 @@ impl App {
                 pane.resize(content_rows, content_cols);
             }
         }
+        if self.drag_resize.is_none() {
+            self.rebuild_hit_test_cache();
+        }
+    }
+
+    fn flush_pending_layout_persist(&mut self) {
+        if self.pending_layout_persist {
+            self.persist_layout();
+            self.pending_layout_persist = false;
+        }
+    }
+
+    fn finish_drag_resize(&mut self) {
+        self.flush_pending_layout_persist();
         self.rebuild_hit_test_cache();
     }
 
@@ -2159,6 +2175,9 @@ impl App {
         }
 
         if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+            if self.drag_resize.is_some() {
+                self.finish_drag_resize();
+            }
             self.drag_resize = None;
         }
 
@@ -4550,7 +4569,7 @@ impl App {
         };
 
         if ok {
-            self.persist_layout();
+            self.pending_layout_persist = true;
             self.resize(size.height, size.width);
         }
         Ok(())
@@ -5495,6 +5514,7 @@ mod tests {
             },
             hit_test_cache: None,
             last_quit_key_press: None,
+            pending_layout_persist: false,
         }
     }
     use crate::ui::agent_command_for_input;
