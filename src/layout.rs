@@ -87,9 +87,9 @@ const RATIO_HALF: u16 = RATIO_SCALE / 2;
 pub(crate) const PANE_INNER_MARGIN: u16 = 1;
 // Two rows of title text/chrome on the pane's top edge.
 pub(crate) const PANE_TITLE_BAR_HEIGHT: u16 = 2;
-/// Columns before title text: corner marker plus one padding cell.
 pub(crate) const PANE_TITLE_TEXT_PADDING: u16 = 1;
-pub(crate) const PANE_TITLE_LEFT_PADDING: u16 = 1 + PANE_TITLE_TEXT_PADDING;
+/// Columns before title text: corner marker; leading title padding is in the rendered label.
+pub(crate) const PANE_TITLE_LEFT_PADDING: u16 = 1;
 pub(crate) const PANE_CONTROLS_PADDING: u16 = 1;
 const PANE_CONTROL_ICON_COLUMNS: u16 = 1;
 const PANE_CONTROLS_CORNER_COLUMNS: u16 = 1;
@@ -192,14 +192,12 @@ pub(crate) fn pane_title_chrome_reserve(pane_area_width: u16) -> u16 {
 pub(crate) fn pane_inner_area(area: Rect, _exposed: ExposedSides) -> Rect {
     let left_inset = PANE_INNER_MARGIN;
     let right_inset = 1 + PANE_INNER_MARGIN;
-    let top_chrome = PANE_TITLE_BAR_HEIGHT + PANE_INNER_MARGIN;
+    let top_chrome = PANE_TITLE_BAR_HEIGHT;
     Rect {
         x: area.x.saturating_add(left_inset),
         y: area.y.saturating_add(top_chrome),
         width: area.width.saturating_sub(left_inset.saturating_add(right_inset)),
-        height: area
-            .height
-            .saturating_sub(top_chrome.saturating_add(PANE_INNER_MARGIN)),
+        height: area.height.saturating_sub(top_chrome),
     }
 }
 

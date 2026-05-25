@@ -75,7 +75,7 @@ pub(crate) fn render_panel_title_chrome(
                 .chars()
                 .enumerate()
                 .filter(|(_, ch)| *ch == ']')
-                .map(|(col, _)| col + 1)
+                .map(|(col, _)| col + 2)
                 .last()
                 .map(|col| text_x.saturating_add(col as u16))
                 .unwrap_or_else(|| text_x.saturating_add(title_text.chars().count() as u16));
