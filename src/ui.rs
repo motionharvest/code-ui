@@ -29,7 +29,9 @@ pub(crate) fn render_panel_title_chrome(
     title: &str,
     folder_name: Option<&str>,
     git_summary: Option<&GitSummary>,
-    chrome_style: Style,
+    title_row_style: Style,
+    title_row_selected: bool,
+    edge_style: Style,
     theme: Theme,
     show_window_controls: bool,
     is_maximized: bool,
@@ -57,10 +59,13 @@ pub(crate) fn render_panel_title_chrome(
             .saturating_sub(chrome_reserve);
 
         if text_width > PANE_TITLE_TEXT_PADDING.saturating_mul(2) {
+            let rule_glyph = if title_row_selected { '═' } else { '─' };
+            let corner_glyph = if title_row_selected { '╕' } else { '┐' };
+
             f.render_widget(
-                Paragraph::new("─")
+                Paragraph::new(rule_glyph.to_string())
                     .alignment(Alignment::Left)
-                    .style(chrome_style),
+                    .style(title_row_style),
                 Rect {
                     x: title_bar.x,
                     y: title_y,
@@ -84,7 +89,7 @@ pub(crate) fn render_panel_title_chrome(
             f.render_widget(
                 Paragraph::new(title_text)
                     .alignment(Alignment::Left)
-                    .style(chrome_style),
+                    .style(title_row_style),
                 Rect {
                     x: text_x,
                     y: title_y,
@@ -121,18 +126,18 @@ pub(crate) fn render_panel_title_chrome(
                     let maximize_icon = if is_maximized { "🗗" } else { "⛶" };
                     let pad = " ".repeat(PANE_CONTROLS_PADDING as usize);
                     let controls_text = if show_right_edge {
-                        format!("{pad}{maximize_icon}{pad}🗙{pad}")
+                        format!("{pad}{maximize_icon}{pad}✕{pad}")
                     } else {
-                        format!("{pad}{maximize_icon}{pad}🗙")
+                        format!("{pad}{maximize_icon}{pad}✕")
                     };
 
                     let bar_start = title_rule_start;
                     let bar_width = icons_area.x.saturating_sub(bar_start);
                     if bar_width > 0 {
                         f.render_widget(
-                            Paragraph::new("─".repeat(bar_width as usize))
+                            Paragraph::new(rule_glyph.to_string().repeat(bar_width as usize))
                                 .alignment(Alignment::Left)
-                                .style(chrome_style),
+                                .style(title_row_style),
                             Rect {
                                 x: bar_start,
                                 y: title_y,
@@ -142,7 +147,7 @@ pub(crate) fn render_panel_title_chrome(
                         );
                     }
                     f.render_widget(
-                        Paragraph::new(controls_text).style(chrome_style),
+                        Paragraph::new(controls_text).style(title_row_style),
                         Rect {
                             x: icons_area.x,
                             y: icons_area.y,
@@ -154,9 +159,9 @@ pub(crate) fn render_panel_title_chrome(
                         pane_title_top_right_corner_area(panel_area, show_right_edge)
                     {
                         f.render_widget(
-                            Paragraph::new("┐")
+                            Paragraph::new(corner_glyph.to_string())
                                 .alignment(Alignment::Left)
-                                .style(chrome_style),
+                                .style(title_row_style),
                             corner_area,
                         );
                     }
@@ -169,7 +174,7 @@ pub(crate) fn render_panel_title_chrome(
         f.render_widget(
             Paragraph::new("│")
                 .alignment(Alignment::Left)
-                .style(chrome_style),
+                .style(edge_style),
             Rect {
                 x: panel_area.right().saturating_sub(1),
                 y: panel_area.bottom().saturating_sub(1),
@@ -1071,7 +1076,7 @@ pub(crate) fn render_help_modal(
     f.render_widget(block, area);
 
     let close_area = help_close_button_area(area);
-    let close_button = Paragraph::new("🗙")
+    let close_button = Paragraph::new("✕")
         .alignment(Alignment::Center)
         .style(Style::default().fg(theme.foreground).bg(bg_color(theme)));
     f.render_widget(close_button, close_area);
@@ -1419,7 +1424,7 @@ pub(crate) fn render_panel_settings_modal(
     f.render_widget(block, area);
 
     let close_area = panel_settings_close_button_area(area);
-    let close_button = Paragraph::new("🗙")
+    let close_button = Paragraph::new("✕")
         .alignment(Alignment::Center)
         .style(Style::default().fg(theme.foreground).bg(bg_color(theme)));
     f.render_widget(close_button, close_area);

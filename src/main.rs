@@ -322,18 +322,22 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         continue;
                     }
 
-                    let border_color = if focused || in_resize_preview || in_swap_preview {
+                    let title_row_selected =
+                        focused || in_resize_preview || in_swap_preview;
+                    let title_row_color = if title_row_selected {
                         theme.accent
                     } else {
                         theme.muted
                     };
-                    let chrome_style = Style::default().fg(border_color).bg(bg_color(theme));
+                    let title_row_style =
+                        Style::default().fg(title_row_color).bg(bg_color(theme));
+                    let edge_style = Style::default().fg(theme.muted).bg(bg_color(theme));
 
                     let block = Block::default()
                         .borders(pane_borders(placement.exposed))
                         .border_type(BorderType::Plain)
                         .style(Style::default().bg(bg_color(theme)))
-                        .border_style(chrome_style);
+                        .border_style(edge_style);
                     f.render_widget(block, pane_area);
                     pane.mark_painted();
 
@@ -346,7 +350,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         &title,
                         folder_name.as_deref(),
                         git_summary.as_ref(),
-                        chrome_style,
+                        title_row_style,
+                        title_row_selected,
+                        edge_style,
                         theme,
                         true,
                         is_maximized,
@@ -356,7 +362,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                     let inner = pane_inner_area(pane_area, placement.exposed);
                     if inner.width > 0 && inner.height > 0 {
                         if in_swap_preview {
-                            render_pane_swap_drop_overlay(f, inner, theme, chrome_style);
+                            render_pane_swap_drop_overlay(f, inner, theme, title_row_style);
                             continue;
                         }
 
