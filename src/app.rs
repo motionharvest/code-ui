@@ -28,8 +28,8 @@ use crate::{
     theme::{load_persisted_theme_index, save_persisted_theme, Theme, THEMES},
     ui::{
         default_agent_index, help_close_button_area,
-        help_debug_toggle_button_area, help_modal_area, new_pane_picker_list_area,
-        new_pane_picker_modal_area, new_pane_picker_name_input_area, pane_chrome_title_label,
+        help_debug_toggle_button_area, help_modal_area, new_pane_picker_layout,
+        new_pane_picker_modal_area, pane_chrome_title_label,
         panel_settings_agent_list_area, panel_settings_cancel_button_area,
         panel_settings_close_button_area, panel_settings_confirm_button_area,
         panel_settings_modal_area, panel_settings_modal_inner, panel_settings_name_input_area,
@@ -37,7 +37,7 @@ use crate::{
         workspace_hit_index, workspace_menu_hit_index, workspace_settings_action_hit_index,
         workspace_settings_modal_area, workspace_settings_name_input_area, Modal,
         PanelSettingsFocus, WorktreePickerFocus, AGENT_PRESETS, COMMANDER_COMMAND, TOP_CHROME_ROWS,
-        worktree_picker_branch_input_area, worktree_picker_delete_confirm_action_hit_index,
+        worktree_picker_branch_layout, worktree_picker_delete_confirm_action_hit_index,
         worktree_picker_delete_hit_index, worktree_picker_item_count, worktree_picker_list_hit_index,
         worktree_picker_modal_area,
     },
@@ -2574,12 +2574,12 @@ impl App {
                                 })
                         })
                         .unwrap_or_else(|| (Self::content_area(size), "Pane".to_string()));
-                    let area = new_pane_picker_modal_area(pane_area, &anchor_title);
-                    let name_area = new_pane_picker_name_input_area(area);
+                    let area = new_pane_picker_modal_area(pane_area, &anchor_title, size);
+                    let layout = new_pane_picker_layout(area);
                     let name_inner = ratatui::widgets::Block::default()
                         .borders(ratatui::widgets::Borders::ALL)
-                        .inner(name_area);
-                    let list_area = new_pane_picker_list_area(area);
+                        .inner(layout.name_input);
+                    let list_area = layout.list;
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                         if contains(list_area, mouse.column, mouse.row) {
                             let selected = mouse.row.saturating_sub(list_area.y) as usize;
@@ -2629,7 +2629,7 @@ impl App {
                                 })
                         })
                         .unwrap_or_else(|| (Self::content_area(size), "Pane".to_string()));
-                    let area = panel_settings_modal_area(pane_area, &anchor_title);
+                    let area = panel_settings_modal_area(pane_area, &anchor_title, size);
                     let inner = panel_settings_modal_inner(area);
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                         if contains(
@@ -2757,6 +2757,7 @@ impl App {
                         .unwrap_or_else(|| (Self::content_area(size), ()));
                     let area = worktree_picker_modal_area(
                         pane_area,
+                        size,
                         &folder_name,
                         &git_summary,
                         &entries,
@@ -2817,7 +2818,7 @@ impl App {
                                 }
                             }
                             WorktreePickerFocus::BranchName => {
-                                let name_area = worktree_picker_branch_input_area(area);
+                                let (_, _, name_area) = worktree_picker_branch_layout(area);
                                 let name_inner = ratatui::widgets::Block::default()
                                     .borders(ratatui::widgets::Borders::ALL)
                                     .inner(name_area);

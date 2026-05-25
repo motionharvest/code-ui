@@ -11,6 +11,38 @@ use crate::{
     ui::{truncate_to_width, AGENT_PRESETS},
 };
 
+/// Clamp a rect so it does not extend past the terminal frame.
+pub(crate) fn clip_rect_to_frame(area: Rect, frame: Rect) -> Rect {
+    if area.width == 0
+        || area.height == 0
+        || area.x >= frame.right()
+        || area.y >= frame.bottom()
+    {
+        return Rect {
+            x: area.x,
+            y: area.y,
+            width: 0,
+            height: 0,
+        };
+    }
+
+    let right = area.right().min(frame.right());
+    let bottom = area.bottom().min(frame.bottom());
+    Rect {
+        x: area.x,
+        y: area.y,
+        width: right.saturating_sub(area.x),
+        height: bottom.saturating_sub(area.y),
+    }
+}
+
+/// Vertical space below the pane title bar available for a dropdown.
+pub(crate) fn pane_dropdown_max_height(pane_area: Rect) -> u16 {
+    pane_area
+        .height
+        .saturating_sub(PANE_TITLE_BAR_HEIGHT.min(pane_area.height))
+}
+
 #[derive(Clone, Copy, Default)]
 pub(crate) struct ExposedSides {
     pub(crate) top: bool,
@@ -280,6 +312,7 @@ pub(crate) fn pane_subtitle_hit_area(
 /// Position a modal directly under the pane subtitle (git folder badge).
 pub(crate) fn pane_subtitle_combobox_dropdown_area(
     pane_area: Rect,
+    frame: Rect,
     folder_name: &str,
     git_summary: Option<&GitSummary>,
     modal_width: u16,
@@ -296,9 +329,7 @@ pub(crate) fn pane_subtitle_combobox_dropdown_area(
     let anchor_width = subtitle_hit.map(|area| area.width).unwrap_or(modal_width);
 
     let width = modal_width.max(anchor_width).min(pane_area.width);
-    let max_height = pane_area
-        .height
-        .saturating_sub(PANE_TITLE_BAR_HEIGHT.min(pane_area.height));
+    let max_height = pane_dropdown_max_height(pane_area);
     let height = modal_height.min(max_height).max(1);
 
     let y = pane_area
@@ -307,17 +338,21 @@ pub(crate) fn pane_subtitle_combobox_dropdown_area(
     let x = anchor_x.min(pane_area.right().saturating_sub(width));
     let y = y.min(pane_area.bottom().saturating_sub(height));
 
-    Rect {
-        x,
-        y,
-        width,
-        height,
-    }
+    clip_rect_to_frame(
+        Rect {
+            x,
+            y,
+            width,
+            height,
+        },
+        frame,
+    )
 }
 
 /// Position a modal directly under the pane title bar, aligned with the title text.
 pub(crate) fn pane_combobox_dropdown_area(
     pane_area: Rect,
+    frame: Rect,
     anchor_title: &str,
     modal_width: u16,
     modal_height: u16,
@@ -333,9 +368,7 @@ pub(crate) fn pane_combobox_dropdown_area(
     let anchor_width = title_hit.map(|area| area.width).unwrap_or(modal_width);
 
     let width = modal_width.max(anchor_width).min(pane_area.width);
-    let max_height = pane_area
-        .height
-        .saturating_sub(PANE_TITLE_BAR_HEIGHT.min(pane_area.height));
+    let max_height = pane_dropdown_max_height(pane_area);
     let height = modal_height.min(max_height).max(1);
 
     let y = pane_area
@@ -344,12 +377,15 @@ pub(crate) fn pane_combobox_dropdown_area(
     let x = anchor_x.min(pane_area.right().saturating_sub(width));
     let y = y.min(pane_area.bottom().saturating_sub(height));
 
-    Rect {
-        x,
-        y,
-        width,
-        height,
-    }
+    clip_rect_to_frame(
+        Rect {
+            x,
+            y,
+            width,
+            height,
+        },
+        frame,
+    )
 }
 
 pub(crate) fn pane_title_hit_area(area: Rect, title: &str, show_right_edge: bool) -> Option<Rect> {
@@ -1753,6 +1789,23 @@ mod tests {
         };
         let close = pane_close_button_area(area, false).expect("close button area");
         assert_eq!(close.x, area.right().saturating_sub(1));
+    }
+
+    #[test]
+    fn dropdown_clips_to_frame_when_pane_extends_past_terminal_bottom() {
+        let frame = Rect::new(0, 0, 80, 37);
+        let pane_area = Rect::new(0, 26, 80, 11);
+        let desired_height = 15;
+        let area = pane_combobox_dropdown_area(
+            pane_area,
+            frame,
+            "Pane [Terminal]",
+            26,
+            desired_height,
+        );
+        assert!(area.bottom() <= frame.bottom());
+        assert!(area.height <= pane_dropdown_max_height(pane_area));
+        assert!(area.height < desired_height);
     }
 
     #[test]

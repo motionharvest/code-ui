@@ -752,9 +752,17 @@ impl Pane {
             return self.build_styled_view(Some(selection));
         }
 
+        let (screen_rows, _) = self.parser.screen().size();
+        if usize::from(screen_rows) != usize::from(self.rows) {
+            self.view_dirty = true;
+        }
+
         if !self.view_dirty {
             if let Some(cached) = &self.cached_view {
-                return cached.clone();
+                if cached.lines.len() == usize::from(self.rows) {
+                    return cached.clone();
+                }
+                self.view_dirty = true;
             }
         }
         let text = self.build_styled_view(None);
@@ -788,6 +796,7 @@ impl Pane {
     fn build_styled_view(&self, selection: Option<PaneSelection>) -> Text<'static> {
         let screen = self.parser.screen();
         let (rows, cols) = screen.size();
+        let rows = rows.min(self.rows);
         let normalized = selection.map(normalized_selection);
         let mut lines = Vec::with_capacity(usize::from(rows));
 
@@ -847,6 +856,11 @@ impl Pane {
 
     pub(crate) fn cursor_position_in(&self, area: Rect) -> Option<(u16, u16)> {
         let (col, row) = self.cursor_cell()?;
+        if area.width == 0 || area.height == 0 {
+            return None;
+        }
+        let col = col.min(area.width.saturating_sub(1));
+        let row = row.min(area.height.saturating_sub(1));
         Some((area.x + col, area.y + row))
     }
 

@@ -35,13 +35,13 @@ use ratatui::{
     layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Text},
-    widgets::{Block, BorderType, Borders, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Paragraph},
     Frame, Terminal,
 };
 
 use app::{App, MousePointerShape};
 use git_status::GitStatusCache;
-use layout::{pane_borders, pane_inner_area};
+use layout::{clip_rect_to_frame, pane_borders, pane_inner_area};
 use theme::Theme;
 use ui::{
     commander_input_cursor_position, compute_top_bar_layout, pane_chrome_title_label,
@@ -363,14 +363,16 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                             continue;
                         }
 
-                        let content_area = inner;
+                        let content_area = clip_rect_to_frame(inner, f.size());
 
                         let pane_view =
                             pane_view_for_render(pane.styled_view(selection), theme, focused);
-                        let paragraph = Paragraph::new(pane_view)
-                            .wrap(Wrap { trim: false })
-                            .style(Style::default().bg(bg_color(theme)));
-                        f.render_widget(paragraph, content_area);
+                        render_pane_text(
+                            f,
+                            pane_view,
+                            content_area,
+                            Style::default().bg(bg_color(theme)),
+                        );
 
                         if modal_is_none && focused && !commander_focused {
                             if let Some((x, y)) = pane.cursor_position_in(content_area) {
@@ -653,6 +655,25 @@ fn render_pane_swap_drop_overlay(f: &mut Frame<'_>, area: Rect, theme: Theme, st
     );
 }
 
+
+/// Render terminal text one row at a time. A single multi-line `Paragraph` can
+/// write past the bottom of the frame when the rect is taller than the remaining
+/// space or ratatui expands wrapped rows.
+fn render_pane_text(f: &mut Frame<'_>, text: Text<'static>, area: Rect, style: Style) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let max_rows = area.height as usize;
+    for (row, line) in text.lines.into_iter().enumerate().take(max_rows) {
+        let row_area = Rect {
+            x: area.x,
+            y: area.y.saturating_add(row as u16),
+            width: area.width,
+            height: 1,
+        };
+        f.render_widget(Paragraph::new(line).style(style), row_area);
+    }
+}
 
 fn pane_view_for_render(view: Text<'static>, theme: Theme, focused: bool) -> Text<'static> {
     if theme.passthrough {
@@ -976,6 +997,50 @@ mod tests {
             .spans
             .iter()
             .all(|span| span.style.bg.is_none()));
+    }
+
+    #[test]
+    fn render_pane_text_fills_exact_height_without_panicking() {
+        use ratatui::backend::TestBackend;
+
+        let height = 37u16;
+        let width = 209u16;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let lines: Vec<Line<'_>> = (0..height)
+            .map(|row| Line::from(format!("row {row}")))
+            .collect();
+        let text = Text::from(lines);
+
+        terminal
+            .draw(|frame| {
+                render_pane_text(
+                    frame,
+                    text,
+                    Rect::new(0, 0, width, height),
+                    Style::default(),
+                );
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn render_pane_text_clips_rect_that_extends_past_frame_bottom() {
+        use ratatui::backend::TestBackend;
+
+        let frame = Rect::new(0, 0, 209, 37);
+        let area = Rect::new(0, 1, 209, 37);
+        let lines: Vec<Line<'_>> = (0..37)
+            .map(|row| Line::from(format!("row {row}")))
+            .collect();
+        let text = Text::from(lines);
+        let mut terminal = Terminal::new(TestBackend::new(frame.width, frame.height)).unwrap();
+
+        terminal
+            .draw(|f| {
+                let clipped = clip_rect_to_frame(area, f.size());
+                render_pane_text(f, text, clipped, Style::default());
+            })
+            .unwrap();
     }
 
     #[test]

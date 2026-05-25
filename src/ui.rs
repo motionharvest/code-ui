@@ -13,7 +13,10 @@ pub(crate) fn bg_color(_theme: Theme) -> Color {
 use crate::{
     git_status::{format_worktree_changes, truncate_pane_subtitle_body, GitSummary},
     git_worktree::{worktree_is_deletable, WorktreeInfo},
-    layout::{pane_combobox_dropdown_area, pane_subtitle_combobox_dropdown_area},
+    layout::{
+        clip_rect_to_frame, pane_combobox_dropdown_area, pane_dropdown_max_height,
+        pane_subtitle_combobox_dropdown_area,
+    },
     theme::Theme,
     theme::THEMES,
     utils::{contains, LOGIN_SHELL_SENTINEL},
@@ -570,6 +573,60 @@ pub(crate) fn workspace_commander_input_hit(layout: TopBarLayout, x: u16, y: u16
 
 /// Truncate to a maximum number of terminal cells (counted as Unicode scalar
 /// values, matching ratatui's default monospace assumption).
+fn place_row(inner: Rect, y: u16, height: u16) -> (Rect, u16) {
+    if height == 0 || y >= inner.bottom() {
+        return (
+            Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: 0,
+            },
+            y,
+        );
+    }
+    let row_height = height.min(inner.bottom().saturating_sub(y));
+    (
+        Rect {
+            x: inner.x,
+            y,
+            width: inner.width,
+            height: row_height,
+        },
+        y.saturating_add(row_height),
+    )
+}
+
+/// Render list lines one row at a time so content cannot paint past `area`.
+pub(crate) fn render_lines_in_area(
+    f: &mut ratatui::Frame<'_>,
+    area: Rect,
+    lines: Vec<Line<'static>>,
+    style: Style,
+    frame: Rect,
+) {
+    let area = clip_rect_to_frame(area, frame);
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let max_rows = area.height as usize;
+    for (row, line) in lines.into_iter().enumerate().take(max_rows) {
+        let row_area = clip_rect_to_frame(
+            Rect {
+                x: area.x,
+                y: area.y.saturating_add(row as u16),
+                width: area.width,
+                height: 1,
+            },
+            frame,
+        );
+        if row_area.height == 0 {
+            break;
+        }
+        f.render_widget(Paragraph::new(line).style(style), row_area);
+    }
+}
+
 pub(crate) fn truncate_to_width(text: &str, width: usize) -> String {
     if text.chars().count() <= width {
         return text.to_string();
@@ -1215,10 +1272,10 @@ pub(crate) fn render_theme_modal(
     f.render_widget(list, inner);
 }
 
-pub(crate) fn panel_settings_modal_area(pane_area: Rect, anchor_title: &str) -> Rect {
+pub(crate) fn panel_settings_modal_area(pane_area: Rect, anchor_title: &str, frame: Rect) -> Rect {
     let width = 40.min(pane_area.width);
-    let height = 16.min(pane_area.height);
-    pane_combobox_dropdown_area(pane_area, anchor_title, width, height)
+    let height = 16.min(pane_dropdown_max_height(pane_area));
+    pane_combobox_dropdown_area(pane_area, frame, anchor_title, width, height)
 }
 
 /// Content rectangle inside the modal frame (must match `render_panel_settings_modal`).
@@ -1274,29 +1331,42 @@ pub(crate) fn panel_settings_confirm_button_area(area: Rect) -> Rect {
     }
 }
 
-pub(crate) fn new_pane_picker_modal_area(pane_area: Rect, anchor_title: &str) -> Rect {
+pub(crate) struct NewPanePickerLayout {
+    pub hint: Rect,
+    pub name_label: Rect,
+    pub name_input: Rect,
+    pub list: Rect,
+}
+
+pub(crate) fn new_pane_picker_modal_area(
+    pane_area: Rect,
+    anchor_title: &str,
+    frame: Rect,
+) -> Rect {
     let width = 26.min(pane_area.width);
-    let height = (AGENT_PRESETS.len() as u16 + 9).min(pane_area.height);
-    pane_combobox_dropdown_area(pane_area, anchor_title, width, height)
+    let desired = AGENT_PRESETS.len() as u16 + 9;
+    let height = desired.min(pane_dropdown_max_height(pane_area)).max(1);
+    pane_combobox_dropdown_area(pane_area, frame, anchor_title, width, height)
 }
 
-pub(crate) fn new_pane_picker_name_input_area(area: Rect) -> Rect {
-    let inner = Block::default().borders(Borders::ALL).inner(area);
-    Rect {
-        x: inner.x,
-        y: inner.y + 2,
-        width: inner.width,
-        height: 3,
-    }
-}
-
-pub(crate) fn new_pane_picker_list_area(area: Rect) -> Rect {
-    let inner = Block::default().borders(Borders::ALL).inner(area);
-    Rect {
-        x: inner.x,
-        y: inner.y + 6,
-        width: inner.width,
-        height: AGENT_PRESETS.len() as u16,
+pub(crate) fn new_pane_picker_layout(modal_area: Rect) -> NewPanePickerLayout {
+    let inner = Block::default()
+        .borders(Borders::ALL)
+        .title("─ New Pane ─")
+        .inner(modal_area);
+    let y = inner.y;
+    let (hint, y) = place_row(inner, y, 1);
+    let (name_label, y) = place_row(inner, y, 1);
+    let remaining = inner.bottom().saturating_sub(y);
+    let list_min = 1;
+    let name_h = 3.min(remaining.saturating_sub(list_min));
+    let (name_input, y) = place_row(inner, y, name_h);
+    let (list, _) = place_row(inner, y, inner.bottom().saturating_sub(y));
+    NewPanePickerLayout {
+        hint,
+        name_label,
+        name_input,
+        list,
     }
 }
 
@@ -1312,7 +1382,8 @@ pub(crate) fn render_new_pane_picker_modal(
     agent_index: usize,
     agent_available: &[bool],
 ) {
-    let area = new_pane_picker_modal_area(pane_area, anchor_title);
+    let frame = f.size();
+    let area = new_pane_picker_modal_area(pane_area, anchor_title, frame);
     f.render_widget(Clear, area);
 
     let block = Block::default()
@@ -1321,66 +1392,50 @@ pub(crate) fn render_new_pane_picker_modal(
         .title("─ New Pane ─")
         .style(Style::default().fg(theme.foreground).bg(bg_color(theme)))
         .border_style(Style::default().fg(theme.accent));
-    let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let hint = Paragraph::new("Type name, L/R cursor, U/D agent")
-        .style(Style::default().fg(theme.muted).bg(bg_color(theme)));
-    f.render_widget(
-        hint,
-        Rect {
-            x: inner.x,
-            y: inner.y,
-            width: inner.width,
-            height: 1,
-        },
-    );
+    let layout = new_pane_picker_layout(area);
+    let list_style = Style::default().fg(theme.foreground).bg(bg_color(theme));
 
-    let name_label =
-        Paragraph::new("Name").style(Style::default().fg(theme.foreground).bg(bg_color(theme)));
-    f.render_widget(
-        name_label,
-        Rect {
-            x: inner.x,
-            y: inner.y + 1,
-            width: inner.width,
-            height: 1,
-        },
-    );
-
-    let name_area = new_pane_picker_name_input_area(area);
-    let name_block = Block::default()
-        .borders(Borders::ALL)
-        .style(Style::default().fg(theme.foreground).bg(bg_color(theme)))
-        .border_style(if name_error.is_some() {
-            Style::default().fg(Color::Red)
-        } else {
-            Style::default().fg(theme.accent)
-        });
-    let name_inner = name_block.inner(name_area);
-    f.render_widget(name_block, name_area);
-    f.render_widget(
-        Paragraph::new(name.to_string()).style(if name_selected {
-            Style::default().fg(bg_color(theme)).bg(theme.accent)
-        } else {
-            Style::default().fg(theme.foreground).bg(bg_color(theme))
-        }),
-        name_inner,
-    );
-    if let Some(error) = name_error {
-        let error_area = Rect {
-            x: inner.x,
-            y: name_area.bottom(),
-            width: inner.width,
-            height: 1,
-        };
+    if layout.hint.height > 0 {
         f.render_widget(
-            Paragraph::new(error).style(Style::default().fg(Color::Red).bg(bg_color(theme))),
-            error_area,
+            Paragraph::new("Type name, L/R cursor, U/D agent")
+                .style(Style::default().fg(theme.muted).bg(bg_color(theme))),
+            clip_rect_to_frame(layout.hint, frame),
         );
     }
 
-    let list_area = new_pane_picker_list_area(area);
+    if layout.name_label.height > 0 {
+        f.render_widget(
+            Paragraph::new("Name").style(Style::default().fg(theme.foreground).bg(bg_color(theme))),
+            clip_rect_to_frame(layout.name_label, frame),
+        );
+    }
+
+    let name_area = clip_rect_to_frame(layout.name_input, frame);
+    let mut name_inner = Rect::default();
+    if name_area.height > 0 {
+        let name_block = Block::default()
+            .borders(Borders::ALL)
+            .style(Style::default().fg(theme.foreground).bg(bg_color(theme)))
+            .border_style(if name_error.is_some() {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default().fg(theme.accent)
+            });
+        name_inner = name_block.inner(name_area);
+        f.render_widget(name_block, name_area);
+        f.render_widget(
+            Paragraph::new(name.to_string()).style(if name_selected {
+                Style::default().fg(bg_color(theme)).bg(theme.accent)
+            } else {
+                Style::default().fg(theme.foreground).bg(bg_color(theme))
+            }),
+            clip_rect_to_frame(name_inner, frame),
+        );
+    }
+
+    let list_area = clip_rect_to_frame(layout.list, frame);
     let mut lines: Vec<Line<'static>> = Vec::new();
     for (idx, preset) in AGENT_PRESETS.iter().enumerate() {
         let available = agent_available.get(idx).copied().unwrap_or(true);
@@ -1408,22 +1463,19 @@ pub(crate) fn render_new_pane_picker_modal(
         )]));
     }
 
-    f.render_widget(
-        Paragraph::new(Text::from(lines))
-            .style(Style::default().fg(theme.foreground).bg(bg_color(theme)))
-            .wrap(Wrap { trim: false }),
-        list_area,
-    );
+    render_lines_in_area(f, list_area, lines, list_style, frame);
 
-    let clamped_cursor = if name_selected {
-        name.chars().count()
-    } else {
-        cursor.min(name.chars().count())
-    };
-    let cursor_x = name_inner
-        .x
-        .saturating_add(clamped_cursor.min(name_inner.width.saturating_sub(1) as usize) as u16);
-    f.set_cursor(cursor_x, name_inner.y);
+    if name_inner.height > 0 {
+        let clamped_cursor = if name_selected {
+            name.chars().count()
+        } else {
+            cursor.min(name.chars().count())
+        };
+        let cursor_x = name_inner.x.saturating_add(
+            clamped_cursor.min(name_inner.width.saturating_sub(1) as usize) as u16,
+        );
+        f.set_cursor(cursor_x, name_inner.y);
+    }
 }
 
 pub(crate) fn render_panel_settings_modal(
@@ -1437,7 +1489,8 @@ pub(crate) fn render_panel_settings_modal(
     focus: PanelSettingsFocus,
     agent_available: &[bool],
 ) {
-    let area = panel_settings_modal_area(pane_area, anchor_title);
+    let frame = f.size();
+    let area = panel_settings_modal_area(pane_area, anchor_title, frame);
     f.render_widget(Clear, area);
 
     let inner = panel_settings_modal_inner(area);
@@ -1779,6 +1832,7 @@ pub(crate) fn worktree_picker_modal_height(
 
 pub(crate) fn worktree_picker_modal_area(
     pane_area: Rect,
+    frame: Rect,
     folder_name: &str,
     git_summary: &GitSummary,
     entries: &[WorktreeInfo],
@@ -1786,28 +1840,38 @@ pub(crate) fn worktree_picker_modal_area(
     focus: WorktreePickerFocus,
 ) -> Rect {
     let width = worktree_picker_modal_width(entries, entry_summaries).min(pane_area.width);
-    let height = worktree_picker_modal_height(entries, focus).min(pane_area.height);
-    pane_subtitle_combobox_dropdown_area(pane_area, folder_name, Some(git_summary), width, height)
+    let height = worktree_picker_modal_height(entries, focus)
+        .min(pane_dropdown_max_height(pane_area));
+    pane_subtitle_combobox_dropdown_area(
+        pane_area,
+        frame,
+        folder_name,
+        Some(git_summary),
+        width,
+        height,
+    )
 }
 
-pub(crate) fn worktree_picker_list_area(modal_area: Rect, entries: &[WorktreeInfo]) -> Rect {
-    let inner = Block::default().borders(Borders::ALL).inner(modal_area);
-    Rect {
-        x: inner.x,
-        y: inner.y + 1,
-        width: inner.width,
-        height: worktree_picker_item_count(entries) as u16,
-    }
+fn worktree_picker_inner(modal_area: Rect, title: &str) -> Rect {
+    Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .inner(modal_area)
 }
 
-pub(crate) fn worktree_picker_branch_input_area(modal_area: Rect) -> Rect {
-    let inner = Block::default().borders(Borders::ALL).inner(modal_area);
-    Rect {
-        x: inner.x,
-        y: inner.y + 3,
-        width: inner.width,
-        height: 3,
-    }
+pub(crate) fn worktree_picker_list_area(modal_area: Rect) -> Rect {
+    let inner = worktree_picker_inner(modal_area, "─ Worktrees ─");
+    inner
+}
+
+pub(crate) fn worktree_picker_branch_layout(modal_area: Rect) -> (Rect, Rect, Rect) {
+    let inner = worktree_picker_inner(modal_area, "─ New Worktree ─");
+    let y = inner.y;
+    let (hint, y) = place_row(inner, y, 1);
+    let (label, y) = place_row(inner, y, 1);
+    let remaining = inner.bottom().saturating_sub(y);
+    let (name_input, _) = place_row(inner, y, 3.min(remaining));
+    (hint, label, name_input)
 }
 
 pub(crate) fn worktree_picker_list_hit_index(
@@ -1816,7 +1880,7 @@ pub(crate) fn worktree_picker_list_hit_index(
     x: u16,
     y: u16,
 ) -> Option<usize> {
-    let list_area = worktree_picker_list_area(modal_area, entries);
+    let list_area = worktree_picker_list_area(modal_area);
     if !contains(list_area, x, y) {
         return None;
     }
@@ -1832,7 +1896,7 @@ pub(crate) fn worktree_picker_delete_hit_index(
     x: u16,
     y: u16,
 ) -> Option<usize> {
-    let list_area = worktree_picker_list_area(modal_area, entries);
+    let list_area = worktree_picker_list_area(modal_area);
     if !contains(list_area, x, y) {
         return None;
     }
@@ -1859,14 +1923,12 @@ pub(crate) fn worktree_picker_delete_hit_index(
     }
 }
 
-pub(crate) fn worktree_picker_delete_confirm_action_area(modal_area: Rect) -> Rect {
-    let inner = Block::default().borders(Borders::ALL).inner(modal_area);
-    Rect {
-        x: inner.x,
-        y: inner.y + 3,
-        width: inner.width,
-        height: 2,
-    }
+pub(crate) fn worktree_picker_delete_confirm_layout(modal_area: Rect) -> (Rect, Rect) {
+    let inner = worktree_picker_inner(modal_area, "─ Delete Worktree ─");
+    let y = inner.y;
+    let (message, y) = place_row(inner, y, 2.min(inner.height));
+    let (actions, _) = place_row(inner, y, inner.bottom().saturating_sub(y));
+    (message, actions)
 }
 
 pub(crate) fn worktree_picker_delete_confirm_action_hit_index(
@@ -1874,7 +1936,7 @@ pub(crate) fn worktree_picker_delete_confirm_action_hit_index(
     x: u16,
     y: u16,
 ) -> Option<usize> {
-    let action_area = worktree_picker_delete_confirm_action_area(modal_area);
+    let (_, action_area) = worktree_picker_delete_confirm_layout(modal_area);
     if !contains(action_area, x, y) {
         return None;
     }
@@ -1948,8 +2010,10 @@ pub(crate) fn render_worktree_picker_modal(
     branch_error: Option<&str>,
     cursor: usize,
 ) {
+    let frame = f.size();
     let area = worktree_picker_modal_area(
         pane_area,
+        frame,
         folder_name,
         git_summary,
         entries,
@@ -1979,12 +2043,13 @@ pub(crate) fn render_worktree_picker_modal(
         .title(title)
         .style(Style::default().fg(theme.foreground).bg(bg_color(theme)))
         .border_style(Style::default().fg(border_color));
-    let inner = block.inner(area);
     f.render_widget(block, area);
+
+    let list_style = Style::default().fg(theme.foreground).bg(bg_color(theme));
 
     match focus {
         WorktreePickerFocus::List | WorktreePickerFocus::DeleteButton => {
-            let list_area = worktree_picker_list_area(area, entries);
+            let list_area = clip_rect_to_frame(worktree_picker_list_area(area), frame);
             let item_count = worktree_picker_item_count(entries);
             let selected = selected_index.min(item_count.saturating_sub(1));
             let mut lines = Vec::new();
@@ -2046,73 +2111,53 @@ pub(crate) fn render_worktree_picker_modal(
                 lines.push(Line::from(spans));
             }
 
-            f.render_widget(
-                Paragraph::new(Text::from(lines))
-                    .style(Style::default().fg(theme.foreground).bg(bg_color(theme)))
-                    .wrap(Wrap { trim: false }),
-                list_area,
-            );
+            render_lines_in_area(f, list_area, lines, list_style, frame);
         }
         WorktreePickerFocus::BranchName => {
-            let hint = Paragraph::new("Enter: create   Esc: back")
-                .style(Style::default().fg(theme.muted).bg(bg_color(theme)));
-            f.render_widget(
-                hint,
-                Rect {
-                    x: inner.x,
-                    y: inner.y,
-                    width: inner.width,
-                    height: 1,
-                },
-            );
-
-            let label = Paragraph::new("Branch")
-                .style(Style::default().fg(theme.foreground).bg(bg_color(theme)));
-            f.render_widget(
-                label,
-                Rect {
-                    x: inner.x,
-                    y: inner.y + 1,
-                    width: inner.width,
-                    height: 1,
-                },
-            );
-
-            let name_area = worktree_picker_branch_input_area(area);
-            let name_block = Block::default()
-                .borders(Borders::ALL)
-                .style(Style::default().fg(theme.foreground).bg(bg_color(theme)))
-                .border_style(if branch_error.is_some() {
-                    Style::default().fg(Color::Red)
-                } else {
-                    Style::default().fg(theme.accent)
-                });
-            let name_inner = name_block.inner(name_area);
-            f.render_widget(name_block, name_area);
-            f.render_widget(
-                Paragraph::new(branch_name.to_string())
-                    .style(Style::default().fg(theme.foreground).bg(bg_color(theme))),
-                name_inner,
-            );
-
-            if let Some(error) = branch_error {
+            let (hint, label, name_area) = worktree_picker_branch_layout(area);
+            if hint.height > 0 {
                 f.render_widget(
-                    Paragraph::new(error).style(Style::default().fg(Color::Red).bg(bg_color(theme))),
-                    Rect {
-                        x: inner.x,
-                        y: name_area.bottom(),
-                        width: inner.width,
-                        height: 1,
-                    },
+                    Paragraph::new("Enter: create   Esc: back")
+                        .style(Style::default().fg(theme.muted).bg(bg_color(theme))),
+                    clip_rect_to_frame(hint, frame),
+                );
+            }
+            if label.height > 0 {
+                f.render_widget(
+                    Paragraph::new("Branch")
+                        .style(Style::default().fg(theme.foreground).bg(bg_color(theme))),
+                    clip_rect_to_frame(label, frame),
                 );
             }
 
-            let cursor_x = name_inner.x.saturating_add(
-                cursor
-                    .min(name_inner.width.saturating_sub(1) as usize)
-                    as u16,
-            );
-            f.set_cursor(cursor_x, name_inner.y);
+            let name_area = clip_rect_to_frame(name_area, frame);
+            let mut name_inner = Rect::default();
+            if name_area.height > 0 {
+                let name_block = Block::default()
+                    .borders(Borders::ALL)
+                    .style(Style::default().fg(theme.foreground).bg(bg_color(theme)))
+                    .border_style(if branch_error.is_some() {
+                        Style::default().fg(Color::Red)
+                    } else {
+                        Style::default().fg(theme.accent)
+                    });
+                name_inner = name_block.inner(name_area);
+                f.render_widget(name_block, name_area);
+                f.render_widget(
+                    Paragraph::new(branch_name.to_string())
+                        .style(Style::default().fg(theme.foreground).bg(bg_color(theme))),
+                    clip_rect_to_frame(name_inner, frame),
+                );
+            }
+
+            if name_inner.height > 0 {
+                let cursor_x = name_inner.x.saturating_add(
+                    cursor
+                        .min(name_inner.width.saturating_sub(1) as usize)
+                        as u16,
+                );
+                f.set_cursor(cursor_x, name_inner.y);
+            }
         }
         WorktreePickerFocus::DeleteConfirm => {
             let entry = delete_target_index.and_then(|idx| entries.get(idx));
@@ -2131,16 +2176,18 @@ pub(crate) fn render_worktree_picker_modal(
             } else {
                 "Delete this worktree?".to_string()
             };
-            f.render_widget(
-                Paragraph::new(message)
-                    .style(Style::default().fg(theme.foreground).bg(bg_color(theme)))
-                    .wrap(Wrap { trim: false }),
-                Rect {
-                    x: inner.x,
-                    y: inner.y,
-                    width: inner.width,
-                    height: 2,
-                },
+            let (message_area, action_area) = worktree_picker_delete_confirm_layout(area);
+            let message_area = clip_rect_to_frame(message_area, frame);
+            let message_lines: Vec<Line<'static>> = message
+                .lines()
+                .map(|line| Line::from(line.to_string()))
+                .collect();
+            render_lines_in_area(
+                f,
+                message_area,
+                message_lines,
+                Style::default().fg(theme.foreground).bg(bg_color(theme)),
+                frame,
             );
 
             let delete_label = if has_changes {
@@ -2150,7 +2197,7 @@ pub(crate) fn render_worktree_picker_modal(
             };
             let actions = [delete_label, "Cancel"];
             let selected = delete_action_index.min(1);
-            let action_area = worktree_picker_delete_confirm_action_area(area);
+            let action_area = clip_rect_to_frame(action_area, frame);
             let mut action_lines = Vec::new();
             for (idx, label) in actions.iter().enumerate() {
                 let is_selected = idx == selected;
@@ -2175,12 +2222,7 @@ pub(crate) fn render_worktree_picker_modal(
                     style,
                 )]));
             }
-            f.render_widget(
-                Paragraph::new(Text::from(action_lines))
-                    .style(Style::default().fg(theme.foreground).bg(bg_color(theme)))
-                    .wrap(Wrap { trim: false }),
-                action_area,
-            );
+            render_lines_in_area(f, action_area, action_lines, list_style, frame);
         }
     }
 }
