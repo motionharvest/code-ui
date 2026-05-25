@@ -25,6 +25,10 @@ use ratatui::{
 };
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
+/// Match tmux `history-limit` and `capture-pane` replay depth.
+const TMUX_HISTORY_LIMIT: &str = "50000";
+const TMUX_HISTORY_LIMIT_USIZE: usize = 50_000;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PaneMouseEventKind {
     Down,
@@ -94,6 +98,7 @@ impl Pane {
         last_command: Option<String>,
         rows: u16,
         cols: u16,
+        initial_scroll_offset: Option<usize>,
     ) -> anyhow::Result<Self> {
         let command: String = command.into();
         // What we actually run inside the persistent tmux session: the resume
@@ -145,7 +150,7 @@ impl Pane {
                     agent_binary,
                     exited: false,
                     relaunch_failed: false,
-                    parser: vt100::Parser::new(rows, cols, 2000),
+                    parser: vt100::Parser::new(rows, cols, TMUX_HISTORY_LIMIT_USIZE),
                     writer,
                     rx,
                     child,
@@ -163,6 +168,14 @@ impl Pane {
                 };
                 pane.replay_tmux_history();
                 pane.sync_scrollback();
+                if let Some(offset) = initial_scroll_offset.filter(|offset| *offset > 0) {
+                    let clamped = offset.min(pane.scrollback_max);
+                    if clamped > 0 {
+                        pane.scrollback = clamped;
+                        pane.parser.set_scrollback(clamped);
+                    }
+                    restore_tmux_scroll_position(&pane.tmux_session, offset);
+                }
                 Ok(pane)
             }
         }
@@ -267,6 +280,7 @@ impl Pane {
             None,
             self.rows.max(1),
             self.cols.max(1),
+            None,
         )?;
         new.command = command;
         new.resume_command = resume_command;
@@ -301,14 +315,21 @@ impl Pane {
         Some(std::path::PathBuf::from(path))
     }
 
+    /// Scroll offset to persist: local vt100 viewport plus tmux copy-mode position.
+    pub(crate) fn persisted_scroll_offset(&self) -> usize {
+        self.scrollback.max(read_tmux_scroll_position(&self.tmux_session))
+    }
+
     fn replay_tmux_history(&mut self) {
+        let start = format!("-{TMUX_HISTORY_LIMIT}");
         let Ok(output) = Command::new("tmux")
             .args([
                 "capture-pane",
                 "-p",
                 "-e",
+                "-J",
                 "-S",
-                "-2000",
+                &start,
                 "-t",
                 &self.tmux_session,
             ])
@@ -614,7 +635,7 @@ impl Pane {
         self.parser.set_scrollback(self.scrollback);
     }
 
-    pub(crate) fn scroll_by(&mut self, delta: isize) {
+    pub(crate) fn scroll_by(&mut self, delta: isize) -> bool {
         let next = if delta.is_negative() {
             self.scrollback.saturating_sub((-delta) as usize)
         } else {
@@ -625,40 +646,93 @@ impl Pane {
             self.scrollback = new_scrollback;
             self.parser.set_scrollback(self.scrollback);
             self.view_dirty = true;
+            return true;
         }
+        false
     }
 
-    pub(crate) fn scroll_up(&mut self) {
-        self.scroll_by(1);
+    pub(crate) fn scroll_up(&mut self) -> bool {
+        if self.scroll_by(1) {
+            return true;
+        }
+        self.tmux_scroll_lines(1, TmuxScrollDirection::Up)
     }
 
-    pub(crate) fn scroll_down(&mut self) {
-        self.scroll_by(-1);
+    pub(crate) fn scroll_down(&mut self) -> bool {
+        if self.scroll_by(-1) {
+            return true;
+        }
+        self.tmux_scroll_lines(1, TmuxScrollDirection::Down)
     }
 
-    pub(crate) fn page_up(&mut self) {
-        self.scroll_by(self.rows.max(1) as isize);
+    pub(crate) fn page_up(&mut self) -> bool {
+        let lines = self.rows.max(1) as usize;
+        if self.scroll_by(lines as isize) {
+            return true;
+        }
+        self.tmux_scroll_lines(lines, TmuxScrollDirection::Up)
     }
 
-    pub(crate) fn page_down(&mut self) {
-        self.scroll_by(-(self.rows.max(1) as isize));
+    pub(crate) fn page_down(&mut self) -> bool {
+        let lines = self.rows.max(1) as usize;
+        if self.scroll_by(-(lines as isize)) {
+            return true;
+        }
+        self.tmux_scroll_lines(lines, TmuxScrollDirection::Down)
     }
 
-    pub(crate) fn scroll_top(&mut self) {
-        let target = self.scrollback_max;
-        if target != self.scrollback {
-            self.scrollback = target;
+    pub(crate) fn scroll_top(&mut self) -> bool {
+        if self.scrollback_max > 0 && self.scrollback < self.scrollback_max {
+            self.scrollback = self.scrollback_max;
             self.parser.set_scrollback(self.scrollback);
             self.view_dirty = true;
+            return true;
         }
+        self.tmux_scroll_to_history_edge(true)
     }
 
-    pub(crate) fn scroll_bottom(&mut self) {
-        if self.scrollback != 0 {
+    pub(crate) fn scroll_bottom(&mut self) -> bool {
+        let mut changed = false;
+        if self.scrollback > 0 {
             self.scrollback = 0;
             self.parser.set_scrollback(self.scrollback);
             self.view_dirty = true;
+            changed = true;
         }
+        changed | self.tmux_scroll_to_history_edge(false)
+    }
+
+    fn tmux_scroll_lines(&mut self, lines: usize, direction: TmuxScrollDirection) -> bool {
+        if lines == 0 {
+            return false;
+        }
+        if !tmux_enter_copy_mode(&self.tmux_session) {
+            return false;
+        }
+        let command = match direction {
+            TmuxScrollDirection::Up => "scroll-up",
+            TmuxScrollDirection::Down => "scroll-down",
+        };
+        if !tmux_send_keys_x(
+            &self.tmux_session,
+            &["-N", &lines.to_string(), command],
+        ) {
+            return false;
+        }
+        self.view_dirty = true;
+        true
+    }
+
+    fn tmux_scroll_to_history_edge(&mut self, top: bool) -> bool {
+        if !tmux_enter_copy_mode(&self.tmux_session) {
+            return false;
+        }
+        let command = if top { "history-top" } else { "history-bottom" };
+        if !tmux_send_keys_x(&self.tmux_session, &[command]) {
+            return false;
+        }
+        self.view_dirty = true;
+        true
     }
 
     /// Returns the rendered terminal contents as a styled `Text`. The result is
@@ -885,6 +959,85 @@ fn pump_pty_output(mut reader: File, tx: mpsc::Sender<Vec<u8>>) {
     }
 }
 
+#[derive(Clone, Copy)]
+enum TmuxScrollDirection {
+    Up,
+    Down,
+}
+
+fn tmux_target(session: &str) -> String {
+    session.to_string()
+}
+
+fn tmux_run(args: &[&str]) -> bool {
+    Command::new("tmux")
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn tmux_enter_copy_mode(session: &str) -> bool {
+    tmux_run(&["copy-mode", "-t", &tmux_target(session)])
+}
+
+fn tmux_send_keys_x(session: &str, command_args: &[&str]) -> bool {
+    let target = tmux_target(session);
+    let mut args = vec!["send-keys", "-t", target.as_str(), "-X"];
+    args.extend_from_slice(command_args);
+    tmux_run(&args)
+}
+
+fn read_tmux_scroll_position(session: &str) -> usize {
+    let target = tmux_target(session);
+    let Ok(output) = Command::new("tmux")
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            target.as_str(),
+            "-F",
+            "#{scroll_position}",
+        ])
+        .output()
+    else {
+        return 0;
+    };
+    if !output.status.success() {
+        return 0;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0)
+}
+
+fn restore_tmux_scroll_position(session: &str, offset: usize) {
+    if offset == 0 {
+        return;
+    }
+    if !tmux_enter_copy_mode(session) {
+        return;
+    }
+    let _ = tmux_send_keys_x(session, &["-N", &offset.to_string(), "scroll-up"]);
+}
+
+fn configure_tmux_session(session: &str) {
+    for (option, value) in [
+        ("status", "off"),
+        ("history-limit", TMUX_HISTORY_LIMIT),
+        ("mouse", "on"),
+    ] {
+        let _ = Command::new("tmux")
+            .args(["set-option", "-t", session, option, value])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 fn ensure_tmux_session(session: &str, command: &str) -> anyhow::Result<()> {
     let has_session = Command::new("tmux")
         .args(["has-session", "-t", session])
@@ -904,13 +1057,7 @@ fn ensure_tmux_session(session: &str, command: &str) -> anyhow::Result<()> {
         }
     }
 
-    // The embedded tmux client is never shown directly to the user, so the
-    // status bar is pure noise inside pane captures and initial redraws.
-    let _ = Command::new("tmux")
-        .args(["set-option", "-t", session, "status", "off"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    configure_tmux_session(session);
     Ok(())
 }
 

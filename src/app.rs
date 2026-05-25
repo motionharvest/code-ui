@@ -433,6 +433,9 @@ impl App {
                 let last_command = persisted
                     .as_ref()
                     .and_then(|state| state.last_commands.get(&id).cloned());
+                let initial_scroll_offset = persisted
+                    .as_ref()
+                    .and_then(|state| state.scroll_offsets.get(&id).copied());
                 Pane::new(
                     id,
                     title,
@@ -441,6 +444,7 @@ impl App {
                     last_command,
                     content_rows,
                     content_cols,
+                    initial_scroll_offset,
                 )
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -868,6 +872,7 @@ impl App {
             None,
             1,
             1,
+            None,
         )?);
 
         self.workspaces.push(WorkspaceState {
@@ -1401,7 +1406,7 @@ impl App {
 
         // Changing the agent of a pane discards any prior session state.
         self.panes[pos].terminate_session();
-        self.panes[pos] = Pane::new(pane_id, name, command, None, None, rows, cols)?;
+        self.panes[pos] = Pane::new(pane_id, name, command, None, None, rows, cols, None)?;
         self.focus_pane(pane_id);
         self.persist_layout();
         Ok(())
@@ -2588,9 +2593,7 @@ impl App {
                     let Some((x, y)) = Self::pane_mouse_cell(inner, mouse.column, mouse.row) else {
                         return Ok(());
                     };
-                    let before = pane.scrollback;
-                    pane.scroll_up();
-                    if pane.scrollback == before {
+                    if !pane.scroll_up() {
                         let _ = pane.send_mouse_wheel(true, x, y)?;
                     }
                 }
@@ -2604,9 +2607,7 @@ impl App {
                     let Some((x, y)) = Self::pane_mouse_cell(inner, mouse.column, mouse.row) else {
                         return Ok(());
                     };
-                    let before = pane.scrollback;
-                    pane.scroll_down();
-                    if pane.scrollback == before {
+                    if !pane.scroll_down() {
                         let _ = pane.send_mouse_wheel(false, x, y)?;
                     }
                 }
@@ -2658,7 +2659,7 @@ impl App {
 
         let title = format!("Pane {}", new_id + 1);
         self.panes
-            .push(Pane::new(new_id, title, command, None, None, 1, 1)?);
+            .push(Pane::new(new_id, title, command, None, None, 1, 1, None)?);
 
         if self.layout.split_leaf(pane_id, side, new_id) {
             self.resize(terminal_size.height, terminal_size.width);
@@ -2774,6 +2775,7 @@ impl App {
             None,
             1,
             1,
+            None,
         )?);
 
         let upper = std::mem::replace(&mut self.layout, Node::Leaf { pane_id: new_id });

@@ -44,6 +44,8 @@ pub(crate) struct PersistedLayout {
     pub(crate) resume_commands: BTreeMap<usize, String>,
     /// Most recent submitted command per pane.
     pub(crate) last_commands: BTreeMap<usize, String>,
+    /// Viewport scroll offset per pane (lines up from live bottom).
+    pub(crate) scroll_offsets: BTreeMap<usize, usize>,
 }
 
 pub(crate) struct Placement {
@@ -984,6 +986,7 @@ pub(crate) fn load_persisted_layout() -> Option<PersistedLayout> {
     let mut commands = BTreeMap::new();
     let mut resume_commands = BTreeMap::new();
     let mut last_commands = BTreeMap::new();
+    let mut scroll_offsets = BTreeMap::new();
 
     for line in content.lines() {
         let line = line.trim();
@@ -1074,6 +1077,19 @@ pub(crate) fn load_persisted_layout() -> Option<PersistedLayout> {
                     last_commands.insert(pane_id, command);
                 }
             }
+        } else if let Some(value) = line.strip_prefix("scroll=") {
+            let Some((id, offset_value)) = value.split_once(':') else {
+                continue;
+            };
+            let Ok(pane_id) = id.trim().parse() else {
+                continue;
+            };
+            let Ok(offset) = offset_value.trim().parse::<usize>() else {
+                continue;
+            };
+            if offset > 0 {
+                scroll_offsets.insert(pane_id, offset);
+            }
         }
     }
 
@@ -1130,6 +1146,7 @@ pub(crate) fn load_persisted_layout() -> Option<PersistedLayout> {
         commands,
         resume_commands,
         last_commands,
+        scroll_offsets,
     })
 }
 
@@ -1208,6 +1225,10 @@ pub(crate) fn save_persisted_layout(
                     encode_persisted_text(last_command)
                 ));
             }
+        }
+        let scroll_offset = pane.persisted_scroll_offset();
+        if scroll_offset > 0 {
+            content.push_str(&format!("scroll={}:{scroll_offset}\n", pane.id));
         }
     }
 
