@@ -9,8 +9,9 @@ mod utils;
 
 use std::{
     env,
-    io,
+    io::{self, Write},
     process::Command,
+    sync::OnceLock,
     time::Duration,
 };
 
@@ -52,6 +53,7 @@ use ui::{
 };
 
 fn main() -> anyhow::Result<()> {
+    install_terminal_cleanup();
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(
@@ -64,6 +66,7 @@ fn main() -> anyhow::Result<()> {
         stdout,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
     );
+    let _terminal_guard = TerminalGuard;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -96,16 +99,48 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) {
+static TERMINAL_CLEANUP: OnceLock<()> = OnceLock::new();
+
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        restore_terminal_state();
+    }
+}
+
+fn install_terminal_cleanup() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal_state();
+        default_hook(info);
+    }));
+}
+
+/// Restore the outer terminal even when the TUI exits abnormally. Without
+/// this, mouse tracking stays enabled and the shell prints raw sequences like
+/// `35;109;25M` for every mouse move.
+fn restore_terminal_state() {
+    if TERMINAL_CLEANUP.set(()).is_err() {
+        return;
+    }
+
+    let mut stdout = io::stdout();
     let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags,);
-    let _ = set_mouse_pointer_shape(terminal.backend_mut(), MousePointerShape::Default);
+    let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+    let _ = set_mouse_pointer_shape(&mut stdout, MousePointerShape::Default);
     let _ = execute!(
-        terminal.backend_mut(),
+        stdout,
         LeaveAlternateScreen,
         DisableMouseCapture,
-        DisableBracketedPaste
+        DisableBracketedPaste,
+        Show,
     );
+    let _ = stdout.flush();
+}
+
+fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) {
+    restore_terminal_state();
     let _ = terminal.show_cursor();
 }
 
