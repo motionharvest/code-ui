@@ -15,8 +15,8 @@ pub(crate) struct GitSummary {
     pub on_github: bool,
 }
 
-/// Nerd Font: nf-fa-github
-pub(crate) const NF_GITHUB: char = '\u{f113}';
+/// Nerd Font: nf-md-file_tree
+pub(crate) const NF_TREE: char = '\u{e21c}';
 /// Nerd Font: nf-fa-git_branch
 pub(crate) const NF_GIT_BRANCH: char = '\u{f126}';
 
@@ -26,12 +26,13 @@ impl GitSummary {
     }
 }
 
-pub(crate) fn git_badge_body(summary: &GitSummary) -> String {
-    let mut body = String::from(" on ");
-    if summary.on_github {
-        body.push(NF_GITHUB);
-        body.push(' ');
-    }
+pub(crate) fn folder_badge_body(folder_name: &str) -> String {
+    format!("{NF_TREE} {folder_name}")
+}
+
+pub(crate) fn git_badge_body(folder_name: &str, summary: &GitSummary) -> String {
+    let mut body = folder_badge_body(folder_name);
+    body.push(' ');
     body.push(NF_GIT_BRANCH);
     body.push(' ');
     body.push_str(&summary.branch);
@@ -41,11 +42,19 @@ pub(crate) fn git_badge_body(summary: &GitSummary) -> String {
     body
 }
 
-pub(crate) fn truncate_git_badge_body(summary: &GitSummary, max_cols: usize) -> String {
-    if max_cols == 0 {
+pub(crate) fn truncate_pane_subtitle_body(
+    folder_name: &str,
+    summary: Option<&GitSummary>,
+    max_cols: usize,
+) -> String {
+    if max_cols == 0 || folder_name.is_empty() {
         return String::new();
     }
-    truncate_to_chars(&git_badge_body(summary), max_cols)
+    let body = match summary {
+        Some(summary) => git_badge_body(folder_name, summary),
+        None => folder_badge_body(folder_name),
+    };
+    truncate_to_chars(&body, max_cols)
 }
 
 fn truncate_to_chars(text: &str, max_cols: usize) -> String {
@@ -174,6 +183,14 @@ impl GitStatusCache {
         self.summary_for_path(&path)
     }
 
+    pub(crate) fn folder_name_for_pane(&mut self, pane: &Pane) -> Option<String> {
+        self.pane_path(pane).and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .filter(|name| !name.is_empty())
+        })
+    }
+
     fn pane_path(&mut self, pane: &Pane) -> Option<PathBuf> {
         let now = Instant::now();
         if let Some((fetched_at, path)) = self.pane_paths.get(&pane.id) {
@@ -213,30 +230,25 @@ mod tests {
     }
 
     #[test]
-    fn git_badge_body_matches_powerline_format() {
-        let body = git_badge_body(&GitSummary {
-            branch: "master".to_string(),
-            staged: 0,
-            unstaged: 2,
-            untracked: 0,
-            on_github: true,
-        });
-        assert!(body.starts_with(" on "));
-        assert!(body.contains(&format!("{NF_GITHUB} {NF_GIT_BRANCH}")));
-        assert!(body.contains("master"));
+    fn git_badge_body_starts_with_tree_and_folder() {
+        let body = git_badge_body(
+            "code-ui",
+            &GitSummary {
+                branch: "master".to_string(),
+                staged: 0,
+                unstaged: 2,
+                untracked: 0,
+                on_github: true,
+            },
+        );
+        assert!(body.starts_with(&format!("{NF_TREE} code-ui ")));
+        assert!(body.contains(&format!("{NF_GIT_BRANCH} master")));
         assert!(body.ends_with(" *2"));
     }
 
     #[test]
-    fn git_badge_body_omits_github_icon_without_github_remote() {
-        let body = git_badge_body(&GitSummary {
-            branch: "main".to_string(),
-            staged: 0,
-            unstaged: 0,
-            untracked: 0,
-            on_github: false,
-        });
-        assert!(!body.contains(NF_GITHUB));
-        assert!(body.contains(" main"));
+    fn folder_badge_body_shows_tree_and_name() {
+        let body = folder_badge_body("code-ui");
+        assert_eq!(body, format!("{NF_TREE} code-ui"));
     }
 }

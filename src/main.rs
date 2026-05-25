@@ -338,11 +338,13 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                     pane.mark_painted();
 
                     let git_summary = git_cache.summary_for_pane(pane);
+                    let folder_name = git_cache.folder_name_for_pane(pane);
                     let title = pane_chrome_title_label(&pane.title, &pane.command);
                     render_panel_title_chrome(
                         f,
                         pane_area,
                         &title,
+                        folder_name.as_deref(),
                         git_summary.as_ref(),
                         chrome_style,
                         theme,

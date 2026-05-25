@@ -11,7 +11,7 @@ pub(crate) fn bg_color(_theme: Theme) -> Color {
 }
 
 use crate::{
-    git_status::{truncate_git_badge_body, GitSummary},
+    git_status::{truncate_pane_subtitle_body, GitSummary},
     layout::pane_combobox_dropdown_area,
     theme::Theme,
     theme::THEMES,
@@ -27,6 +27,7 @@ pub(crate) fn render_panel_title_chrome(
     f: &mut ratatui::Frame<'_>,
     panel_area: Rect,
     title: &str,
+    folder_name: Option<&str>,
     git_summary: Option<&GitSummary>,
     chrome_style: Style,
     theme: Theme,
@@ -92,22 +93,23 @@ pub(crate) fn render_panel_title_chrome(
             );
 
             if title_y.saturating_add(1) < panel_area.bottom() {
-                let git_body = git_summary
-                    .map(|summary| truncate_git_badge_body(summary, title_max))
-                    .unwrap_or_default();
-                if !git_body.is_empty() {
-                    let git_text = format!(" {git_body} ");
-                    f.render_widget(
-                        Paragraph::new(git_text)
-                            .alignment(Alignment::Left)
-                            .style(Style::default().fg(theme.muted).bg(bg_color(theme))),
-                        Rect {
-                            x: text_x,
-                            y: title_y.saturating_add(1),
-                            width: text_width,
-                            height: 1,
-                        },
-                    );
+                if let Some(folder) = folder_name.filter(|name| !name.is_empty()) {
+                    let subtitle_body =
+                        truncate_pane_subtitle_body(folder, git_summary, title_max);
+                    if !subtitle_body.is_empty() {
+                        let subtitle_text = format!(" {subtitle_body} ");
+                        f.render_widget(
+                            Paragraph::new(subtitle_text)
+                                .alignment(Alignment::Left)
+                                .style(Style::default().fg(theme.muted).bg(bg_color(theme))),
+                            Rect {
+                                x: text_x,
+                                y: title_y.saturating_add(1),
+                                width: text_width,
+                                height: 1,
+                            },
+                        );
+                    }
                 }
             }
 
@@ -173,10 +175,8 @@ pub(crate) fn render_panel_title_chrome(
 pub(crate) const COMMANDER_COMMAND: &str = "commander";
 pub(crate) const TOP_CHROME_ROWS: u16 = 1;
 pub(crate) const COMMANDER_PROMPT: &str = " Commander > ";
-const COMMANDER_CONNECTOR: &str = "╭─";
 const COMMANDER_FRAME_LEFT: &str = "│";
-const COMMANDER_FRAME_RIGHT_POST: &str = "│";
-const COMMANDER_FRAME_CHIN: &str = "─╮";
+const COMMANDER_FRAME_RIGHT: &str = "│";
 const COMMANDER_AFTER_ADD_PAD: u16 = 3;
 const COMMANDER_SHIFT_LEFT: u16 = 2;
 const TOP_BAR_RIGHT_GAP: u16 = 1;
@@ -290,10 +290,7 @@ pub(crate) fn compute_top_bar_layout(
 }
 
 fn commander_frame_inset() -> u16 {
-    COMMANDER_CONNECTOR
-        .chars()
-        .count()
-        .saturating_add(COMMANDER_FRAME_LEFT.chars().count()) as u16
+    COMMANDER_FRAME_LEFT.chars().count() as u16
 }
 
 fn commander_inner_rect(frame: Rect) -> Rect {
@@ -459,11 +456,10 @@ fn render_commander_frame(
     commander_input: &str,
 ) {
     let frame = layout.commander_frame;
-    if frame.width < 4 || frame.height == 0 {
+    if frame.width < 2 || frame.height == 0 {
         return;
     }
 
-    let connector_style = Style::default().fg(theme.muted).bg(bg_color(theme));
     let border_style = Style::default()
         .fg(if commander_focused {
             theme.accent
@@ -484,49 +480,23 @@ fn render_commander_frame(
         Style::default().fg(theme.muted).bg(bg_color(theme))
     };
 
-    let top_row = Rect {
-        x: frame.x,
-        y: frame.y,
-        width: frame.width,
-        height: 1,
-    };
-    let connector_width = COMMANDER_CONNECTOR.chars().count() as u16;
-    let left_cap_width = COMMANDER_FRAME_LEFT.chars().count() as u16;
-    let right_post_width = COMMANDER_FRAME_RIGHT_POST.chars().count() as u16;
-    let chin_width = COMMANDER_FRAME_CHIN.chars().count() as u16;
-    let right_cap_width = right_post_width.saturating_add(chin_width);
-    if connector_width > 0 && top_row.width > 0 {
-        f.render_widget(
-            Paragraph::new(COMMANDER_CONNECTOR).style(connector_style),
-            Rect {
-                x: top_row.x,
-                y: top_row.y,
-                width: connector_width.min(top_row.width),
-                height: 1,
-            },
-        );
-    }
-    if left_cap_width > 0 && top_row.width > connector_width {
+    let pipe_width = commander_frame_inset();
+    if pipe_width > 0 && frame.width >= pipe_width {
         f.render_widget(
             Paragraph::new(COMMANDER_FRAME_LEFT).style(border_style),
             Rect {
-                x: top_row.x.saturating_add(connector_width),
-                y: top_row.y,
-                width: left_cap_width.min(top_row.width.saturating_sub(connector_width)),
+                x: frame.x,
+                y: frame.y,
+                width: pipe_width,
                 height: 1,
             },
         );
-    }
-    if top_row.width > right_cap_width {
         f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(COMMANDER_FRAME_RIGHT_POST, border_style),
-                Span::styled(COMMANDER_FRAME_CHIN, connector_style),
-            ])),
+            Paragraph::new(COMMANDER_FRAME_RIGHT).style(border_style),
             Rect {
-                x: top_row.right().saturating_sub(right_cap_width),
-                y: top_row.y,
-                width: right_cap_width,
+                x: frame.right().saturating_sub(pipe_width),
+                y: frame.y,
+                width: pipe_width,
                 height: 1,
             },
         );
