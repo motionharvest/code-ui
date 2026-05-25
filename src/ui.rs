@@ -56,7 +56,7 @@ pub(crate) fn render_panel_title_chrome(
 
         if text_width > PANE_TITLE_TEXT_PADDING.saturating_mul(2) {
             f.render_widget(
-                Paragraph::new("►")
+                Paragraph::new("◤")
                     .alignment(Alignment::Left)
                     .style(chrome_style),
                 Rect {
@@ -157,7 +157,7 @@ pub(crate) fn render_panel_title_chrome(
 
     if panel_area.width > 0 && panel_area.height > 0 {
         f.render_widget(
-            Paragraph::new("◿")
+            Paragraph::new("╯")
                 .alignment(Alignment::Left)
                 .style(chrome_style),
             Rect {
