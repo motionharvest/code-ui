@@ -34,8 +34,9 @@ pub(crate) fn render_panel_title_chrome(
     is_maximized: bool,
 ) {
     use crate::layout::{
-        pane_title_bar_area, pane_title_chrome_reserve, pane_title_y, PANE_TITLE_LEFT_PADDING,
-        PANE_TITLE_TEXT_PADDING,
+        pane_title_bar_area, pane_title_chrome_reserve, pane_title_controls_icons_area,
+        pane_title_top_right_corner_area, pane_title_y, PANE_CONTROLS_PADDING,
+        PANE_TITLE_LEFT_PADDING, PANE_TITLE_TEXT_PADDING,
     };
 
     let title_bar = pane_title_bar_area(panel_area);
@@ -111,15 +112,16 @@ pub(crate) fn render_panel_title_chrome(
             }
 
             if show_window_controls {
-                let maximize_icon = if is_maximized { "🗗" } else { "⛶" };
-                let controls_top = format!("{maximize_icon}  🗙");
-                let controls_width = controls_top.chars().count() as u16;
-                if panel_area.width >= controls_width.saturating_add(PANE_TITLE_LEFT_PADDING) {
-                    let controls_x = panel_area
-                        .right()
-                        .saturating_sub(controls_width.saturating_add(1));
+                if let (Some(icons_area), Some(corner_area)) = (
+                    pane_title_controls_icons_area(panel_area),
+                    pane_title_top_right_corner_area(panel_area),
+                ) {
+                    let maximize_icon = if is_maximized { "🗗" } else { "⛶" };
+                    let pad = " ".repeat(PANE_CONTROLS_PADDING as usize);
+                    let controls_text = format!("{pad}{maximize_icon}{pad}🗙{pad}");
+
                     let bar_start = title_rule_start;
-                    let bar_width = controls_x.saturating_sub(bar_start);
+                    let bar_width = icons_area.x.saturating_sub(bar_start);
                     if bar_width > 0 {
                         f.render_widget(
                             Paragraph::new("─".repeat(bar_width as usize))
@@ -134,13 +136,19 @@ pub(crate) fn render_panel_title_chrome(
                         );
                     }
                     f.render_widget(
-                        Paragraph::new(controls_top).style(chrome_style),
+                        Paragraph::new(controls_text).style(chrome_style),
                         Rect {
-                            x: controls_x,
-                            y: title_y,
-                            width: controls_width,
+                            x: icons_area.x,
+                            y: icons_area.y,
+                            width: icons_area.width,
                             height: 1,
                         },
+                    );
+                    f.render_widget(
+                        Paragraph::new("┐")
+                            .alignment(Alignment::Left)
+                            .style(chrome_style),
+                        corner_area,
                     );
                 }
             }

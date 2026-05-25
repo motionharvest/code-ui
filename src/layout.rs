@@ -90,6 +90,74 @@ pub(crate) const PANE_TITLE_BAR_HEIGHT: u16 = 2;
 /// Columns before title text: corner marker plus one padding cell.
 pub(crate) const PANE_TITLE_TEXT_PADDING: u16 = 1;
 pub(crate) const PANE_TITLE_LEFT_PADDING: u16 = 1 + PANE_TITLE_TEXT_PADDING;
+pub(crate) const PANE_CONTROLS_PADDING: u16 = 1;
+const PANE_CONTROL_ICON_COLUMNS: u16 = 1;
+const PANE_CONTROLS_CORNER_COLUMNS: u16 = 1;
+const PANE_CONTROLS_MIN_WIDTH: u16 = 11;
+
+pub(crate) fn pane_title_controls_icons_width() -> u16 {
+    PANE_CONTROLS_PADDING
+        .saturating_mul(3)
+        .saturating_add(PANE_CONTROL_ICON_COLUMNS.saturating_mul(2))
+}
+
+pub(crate) fn pane_title_controls_width() -> u16 {
+    pane_title_controls_icons_width().saturating_add(PANE_CONTROLS_CORNER_COLUMNS)
+}
+
+pub(crate) fn pane_title_controls_area(area: Rect) -> Option<Rect> {
+    if area.width < PANE_CONTROLS_MIN_WIDTH || area.height <= PANE_TITLE_BAR_HEIGHT {
+        return None;
+    }
+
+    let width = pane_title_controls_width();
+    Some(Rect {
+        x: area.right().saturating_sub(width),
+        y: pane_title_y(area),
+        width,
+        height: 1,
+    })
+}
+
+pub(crate) fn pane_title_controls_icons_area(area: Rect) -> Option<Rect> {
+    pane_title_controls_area(area).map(|controls| Rect {
+        x: controls.x,
+        y: controls.y,
+        width: pane_title_controls_icons_width(),
+        height: 1,
+    })
+}
+
+pub(crate) fn pane_title_top_right_corner_area(area: Rect) -> Option<Rect> {
+    pane_title_controls_area(area).map(|controls| Rect {
+        x: controls.right().saturating_sub(1),
+        y: controls.y,
+        width: 1,
+        height: 1,
+    })
+}
+
+pub(crate) fn pane_maximize_button_area(area: Rect) -> Option<Rect> {
+    pane_title_controls_area(area).map(|controls| Rect {
+        x: controls.x.saturating_add(PANE_CONTROLS_PADDING),
+        y: controls.y,
+        width: PANE_CONTROL_ICON_COLUMNS,
+        height: 1,
+    })
+}
+
+pub(crate) fn pane_close_button_area(area: Rect) -> Option<Rect> {
+    pane_title_controls_area(area).map(|controls| Rect {
+        x: controls
+            .x
+            .saturating_add(PANE_CONTROLS_PADDING)
+            .saturating_add(PANE_CONTROL_ICON_COLUMNS)
+            .saturating_add(PANE_CONTROLS_PADDING),
+        y: controls.y,
+        width: PANE_CONTROL_ICON_COLUMNS,
+        height: 1,
+    })
+}
 
 pub(crate) fn pane_borders(_exposed: ExposedSides) -> Borders {
     Borders::RIGHT
@@ -110,10 +178,10 @@ pub(crate) fn pane_title_bar_area(area: Rect) -> Rect {
 }
 
 /// Columns reserved on the right of the title bar for maximize / close
-/// controls (`main.rs` must stay in sync with these thresholds).
+/// controls (`ui.rs` rendering must stay in sync).
 pub(crate) fn pane_title_chrome_reserve(pane_area_width: u16) -> u16 {
-    if pane_area_width >= 11 {
-        7
+    if pane_area_width >= PANE_CONTROLS_MIN_WIDTH {
+        pane_title_controls_width()
     } else if pane_area_width >= 6 {
         3
     } else {
@@ -219,23 +287,14 @@ impl Placement {
     }
 
     pub(crate) fn maximize_hit(&self, x: u16, y: u16) -> bool {
-        if self.area.width < 11 || self.area.height <= PANE_TITLE_BAR_HEIGHT {
-            return false;
-        }
-
-        contains(
-            Rect {
-                x: self.area.right().saturating_sub(8),
-                y: pane_title_y(self.area),
-                width: 3,
-                height: 1,
-            },
-            x,
-            y,
-        )
+        pane_maximize_button_area(self.area).is_some_and(|area| contains(area, x, y))
     }
 
     pub(crate) fn close_hit(&self, x: u16, y: u16) -> bool {
+        if let Some(area) = pane_close_button_area(self.area) {
+            return contains(area, x, y);
+        }
+
         if self.area.width < 6 || self.area.height <= PANE_TITLE_BAR_HEIGHT {
             return false;
         }
