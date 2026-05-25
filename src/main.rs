@@ -350,6 +350,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         theme,
                         true,
                         is_maximized,
+                        !placement.exposed.right,
                     );
 
                     let inner = pane_inner_area(pane_area, placement.exposed);

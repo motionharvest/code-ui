@@ -96,22 +96,32 @@ const PANE_CONTROL_ICON_COLUMNS: u16 = 1;
 const PANE_CONTROLS_CORNER_COLUMNS: u16 = 1;
 const PANE_CONTROLS_MIN_WIDTH: u16 = 11;
 
-pub(crate) fn pane_title_controls_icons_width() -> u16 {
+pub(crate) fn pane_title_controls_icons_width(show_right_edge: bool) -> u16 {
+    let trailing_pad = if show_right_edge {
+        PANE_CONTROLS_PADDING
+    } else {
+        0
+    };
     PANE_CONTROLS_PADDING
-        .saturating_mul(3)
+        .saturating_mul(2)
         .saturating_add(PANE_CONTROL_ICON_COLUMNS.saturating_mul(2))
+        .saturating_add(trailing_pad)
 }
 
-pub(crate) fn pane_title_controls_width() -> u16 {
-    pane_title_controls_icons_width().saturating_add(PANE_CONTROLS_CORNER_COLUMNS)
+pub(crate) fn pane_title_controls_width(show_right_edge: bool) -> u16 {
+    pane_title_controls_icons_width(show_right_edge).saturating_add(if show_right_edge {
+        PANE_CONTROLS_CORNER_COLUMNS
+    } else {
+        0
+    })
 }
 
-pub(crate) fn pane_title_controls_area(area: Rect) -> Option<Rect> {
+pub(crate) fn pane_title_controls_area(area: Rect, show_right_edge: bool) -> Option<Rect> {
     if area.width < PANE_CONTROLS_MIN_WIDTH || area.height <= PANE_TITLE_BAR_HEIGHT {
         return None;
     }
 
-    let width = pane_title_controls_width();
+    let width = pane_title_controls_width(show_right_edge);
     Some(Rect {
         x: area.right().saturating_sub(width),
         y: pane_title_y(area),
@@ -120,17 +130,20 @@ pub(crate) fn pane_title_controls_area(area: Rect) -> Option<Rect> {
     })
 }
 
-pub(crate) fn pane_title_controls_icons_area(area: Rect) -> Option<Rect> {
-    pane_title_controls_area(area).map(|controls| Rect {
+pub(crate) fn pane_title_controls_icons_area(area: Rect, show_right_edge: bool) -> Option<Rect> {
+    pane_title_controls_area(area, show_right_edge).map(|controls| Rect {
         x: controls.x,
         y: controls.y,
-        width: pane_title_controls_icons_width(),
+        width: pane_title_controls_icons_width(show_right_edge),
         height: 1,
     })
 }
 
-pub(crate) fn pane_title_top_right_corner_area(area: Rect) -> Option<Rect> {
-    pane_title_controls_area(area).map(|controls| Rect {
+pub(crate) fn pane_title_top_right_corner_area(area: Rect, show_right_edge: bool) -> Option<Rect> {
+    if !show_right_edge {
+        return None;
+    }
+    pane_title_controls_area(area, show_right_edge).map(|controls| Rect {
         x: controls.right().saturating_sub(1),
         y: controls.y,
         width: 1,
@@ -138,8 +151,8 @@ pub(crate) fn pane_title_top_right_corner_area(area: Rect) -> Option<Rect> {
     })
 }
 
-pub(crate) fn pane_maximize_button_area(area: Rect) -> Option<Rect> {
-    pane_title_controls_area(area).map(|controls| Rect {
+pub(crate) fn pane_maximize_button_area(area: Rect, show_right_edge: bool) -> Option<Rect> {
+    pane_title_controls_area(area, show_right_edge).map(|controls| Rect {
         x: controls.x.saturating_add(PANE_CONTROLS_PADDING),
         y: controls.y,
         width: PANE_CONTROL_ICON_COLUMNS,
@@ -147,8 +160,8 @@ pub(crate) fn pane_maximize_button_area(area: Rect) -> Option<Rect> {
     })
 }
 
-pub(crate) fn pane_close_button_area(area: Rect) -> Option<Rect> {
-    pane_title_controls_area(area).map(|controls| Rect {
+pub(crate) fn pane_close_button_area(area: Rect, show_right_edge: bool) -> Option<Rect> {
+    pane_title_controls_area(area, show_right_edge).map(|controls| Rect {
         x: controls
             .x
             .saturating_add(PANE_CONTROLS_PADDING)
@@ -160,8 +173,12 @@ pub(crate) fn pane_close_button_area(area: Rect) -> Option<Rect> {
     })
 }
 
-pub(crate) fn pane_borders(_exposed: ExposedSides) -> Borders {
-    Borders::RIGHT
+pub(crate) fn pane_borders(exposed: ExposedSides) -> Borders {
+    if exposed.right {
+        Borders::NONE
+    } else {
+        Borders::RIGHT
+    }
 }
 
 pub(crate) fn pane_title_y(area: Rect) -> u16 {
@@ -180,9 +197,9 @@ pub(crate) fn pane_title_bar_area(area: Rect) -> Rect {
 
 /// Columns reserved on the right of the title bar for maximize / close
 /// controls (`ui.rs` rendering must stay in sync).
-pub(crate) fn pane_title_chrome_reserve(pane_area_width: u16) -> u16 {
+pub(crate) fn pane_title_chrome_reserve(pane_area_width: u16, show_right_edge: bool) -> u16 {
     if pane_area_width >= PANE_CONTROLS_MIN_WIDTH {
-        pane_title_controls_width()
+        pane_title_controls_width(show_right_edge)
     } else if pane_area_width >= 6 {
         3
     } else {
@@ -190,9 +207,13 @@ pub(crate) fn pane_title_chrome_reserve(pane_area_width: u16) -> u16 {
     }
 }
 
-pub(crate) fn pane_inner_area(area: Rect, _exposed: ExposedSides) -> Rect {
+pub(crate) fn pane_inner_area(area: Rect, exposed: ExposedSides) -> Rect {
     let left_inset = PANE_INNER_LEFT_MARGIN;
-    let right_inset = 1 + PANE_INNER_MARGIN;
+    let right_inset = if exposed.right {
+        PANE_INNER_MARGIN
+    } else {
+        1 + PANE_INNER_MARGIN
+    };
     let top_chrome = PANE_TITLE_BAR_HEIGHT;
     Rect {
         x: area.x.saturating_add(left_inset),
@@ -213,7 +234,7 @@ pub(crate) fn pane_combobox_dropdown_area(
         return pane_area;
     }
 
-    let title_hit = pane_title_hit_area(pane_area, anchor_title);
+    let title_hit = pane_title_hit_area(pane_area, anchor_title, true);
     let anchor_x = title_hit
         .map(|area| area.x)
         .unwrap_or_else(|| pane_area.x.saturating_add(1 + PANE_TITLE_LEFT_PADDING));
@@ -239,7 +260,7 @@ pub(crate) fn pane_combobox_dropdown_area(
     }
 }
 
-pub(crate) fn pane_title_hit_area(area: Rect, title: &str) -> Option<Rect> {
+pub(crate) fn pane_title_hit_area(area: Rect, title: &str, show_right_edge: bool) -> Option<Rect> {
     let title_y = pane_title_y(area);
     if area.width <= 1 || area.height <= PANE_TITLE_BAR_HEIGHT {
         return None;
@@ -254,7 +275,7 @@ pub(crate) fn pane_title_hit_area(area: Rect, title: &str) -> Option<Rect> {
         return None;
     }
 
-    let available = bar_width.saturating_sub(pane_title_chrome_reserve(area.width));
+    let available = bar_width.saturating_sub(pane_title_chrome_reserve(area.width, show_right_edge));
     if available == 0 {
         return None;
     }
@@ -282,15 +303,17 @@ pub(crate) fn pane_title_hit_area(area: Rect, title: &str) -> Option<Rect> {
 
 impl Placement {
     pub(crate) fn title_hit(&self, title: &str, _focused: bool, x: u16, y: u16) -> bool {
-        pane_title_hit_area(self.area, title).is_some_and(|area| contains(area, x, y))
+        pane_title_hit_area(self.area, title, !self.exposed.right)
+            .is_some_and(|area| contains(area, x, y))
     }
 
     pub(crate) fn maximize_hit(&self, x: u16, y: u16) -> bool {
-        pane_maximize_button_area(self.area).is_some_and(|area| contains(area, x, y))
+        pane_maximize_button_area(self.area, !self.exposed.right)
+            .is_some_and(|area| contains(area, x, y))
     }
 
     pub(crate) fn close_hit(&self, x: u16, y: u16) -> bool {
-        if let Some(area) = pane_close_button_area(self.area) {
+        if let Some(area) = pane_close_button_area(self.area, !self.exposed.right) {
             return contains(area, x, y);
         }
 
@@ -1615,6 +1638,55 @@ pub(crate) fn overlap(start_a: u16, end_a: u16, start_b: u16, end_b: u16) -> u16
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::widgets::Borders;
+
+    #[test]
+    fn pane_close_button_sits_on_last_column_when_touching_outer_edge() {
+        let area = Rect {
+            x: 10,
+            y: 0,
+            width: 40,
+            height: 20,
+        };
+        let close = pane_close_button_area(area, false).expect("close button area");
+        assert_eq!(close.x, area.right().saturating_sub(1));
+    }
+
+    #[test]
+    fn pane_close_button_keeps_trailing_space_before_corner_when_not_on_outer_edge() {
+        let area = Rect {
+            x: 10,
+            y: 0,
+            width: 40,
+            height: 20,
+        };
+        let close = pane_close_button_area(area, true).expect("close button area");
+        assert_eq!(close.x, area.right().saturating_sub(3));
+        assert_eq!(pane_title_controls_width(true), 6);
+        assert_eq!(pane_title_controls_width(false), 4);
+    }
+
+    #[test]
+    fn pane_borders_omit_right_when_touching_outer_edge() {
+        assert_eq!(
+            pane_borders(ExposedSides {
+                top: true,
+                bottom: true,
+                left: true,
+                right: true,
+            }),
+            Borders::NONE
+        );
+        assert_eq!(
+            pane_borders(ExposedSides {
+                top: true,
+                bottom: true,
+                left: true,
+                right: false,
+            }),
+            Borders::RIGHT
+        );
+    }
 
     #[test]
     fn resize_left_edge_on_outer_boundary_shrinks_from_the_right() {

@@ -33,6 +33,7 @@ pub(crate) fn render_panel_title_chrome(
     theme: Theme,
     show_window_controls: bool,
     is_maximized: bool,
+    show_right_edge: bool,
 ) {
     use crate::layout::{
         pane_title_bar_area, pane_title_chrome_reserve, pane_title_controls_icons_area,
@@ -46,7 +47,7 @@ pub(crate) fn render_panel_title_chrome(
 
     if title_y < panel_area.bottom() && title_bar_width > PANE_TITLE_LEFT_PADDING {
         let chrome_reserve = if show_window_controls {
-            pane_title_chrome_reserve(panel_area.width)
+            pane_title_chrome_reserve(panel_area.width, show_right_edge)
         } else {
             0
         };
@@ -114,13 +115,16 @@ pub(crate) fn render_panel_title_chrome(
             }
 
             if show_window_controls {
-                if let (Some(icons_area), Some(corner_area)) = (
-                    pane_title_controls_icons_area(panel_area),
-                    pane_title_top_right_corner_area(panel_area),
-                ) {
+                if let Some(icons_area) =
+                    pane_title_controls_icons_area(panel_area, show_right_edge)
+                {
                     let maximize_icon = if is_maximized { "🗗" } else { "⛶" };
                     let pad = " ".repeat(PANE_CONTROLS_PADDING as usize);
-                    let controls_text = format!("{pad}{maximize_icon}{pad}🗙{pad}");
+                    let controls_text = if show_right_edge {
+                        format!("{pad}{maximize_icon}{pad}🗙{pad}")
+                    } else {
+                        format!("{pad}{maximize_icon}{pad}🗙")
+                    };
 
                     let bar_start = title_rule_start;
                     let bar_width = icons_area.x.saturating_sub(bar_start);
@@ -146,20 +150,24 @@ pub(crate) fn render_panel_title_chrome(
                             height: 1,
                         },
                     );
-                    f.render_widget(
-                        Paragraph::new("┐")
-                            .alignment(Alignment::Left)
-                            .style(chrome_style),
-                        corner_area,
-                    );
+                    if let Some(corner_area) =
+                        pane_title_top_right_corner_area(panel_area, show_right_edge)
+                    {
+                        f.render_widget(
+                            Paragraph::new("┐")
+                                .alignment(Alignment::Left)
+                                .style(chrome_style),
+                            corner_area,
+                        );
+                    }
                 }
             }
         }
     }
 
-    if panel_area.width > 0 && panel_area.height > 0 {
+    if show_right_edge && panel_area.width > 0 && panel_area.height > 0 {
         f.render_widget(
-            Paragraph::new("╯")
+            Paragraph::new("│")
                 .alignment(Alignment::Left)
                 .style(chrome_style),
             Rect {
