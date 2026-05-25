@@ -2181,10 +2181,12 @@ impl App {
                 .is_some_and(|t| now.duration_since(t) <= QUIT_CONFIRM_WINDOW)
             {
                 self.running = false;
-            } else {
-                self.last_quit_key_press = Some(now);
+                return Ok(());
             }
-            return Ok(());
+
+            // First Ctrl+Q arms quit confirmation but is still passed through
+            // to the focused pane.
+            self.last_quit_key_press = Some(now);
         }
 
         if key.modifiers.contains(KeyModifiers::SHIFT) {
