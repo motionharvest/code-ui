@@ -18,31 +18,8 @@ use crate::{
     utils::{contains, LOGIN_SHELL_SENTINEL},
 };
 
-fn render_git_badge(
-    f: &mut ratatui::Frame<'_>,
-    area: Rect,
-    summary: &GitSummary,
-    theme: Theme,
-) {
-    if area.width == 0 {
-        return;
-    }
-
-    let body = truncate_git_badge_body(summary, area.width as usize);
-    if body.is_empty() {
-        return;
-    }
-
-    f.render_widget(
-        Paragraph::new(body)
-            .alignment(Alignment::Left)
-            .style(Style::default().fg(theme.muted).bg(bg_color(theme))),
-        area,
-    );
-}
-
 pub(crate) fn pane_chrome_title_label(pane_title: &str, command: &str) -> String {
-    format!("{} [{}] ▼", pane_title, agent_label_for_command(command))
+    format!("{} [{}]", pane_title, agent_label_for_command(command))
 }
 
 /// Two-row title bar chrome shared by workspace panes and the Commander panel.
@@ -50,7 +27,6 @@ pub(crate) fn render_panel_title_chrome(
     f: &mut ratatui::Frame<'_>,
     panel_area: Rect,
     title: &str,
-    subtitle: &str,
     git_summary: Option<&GitSummary>,
     chrome_style: Style,
     theme: Theme,
@@ -83,23 +59,25 @@ pub(crate) fn render_panel_title_chrome(
         as usize;
     let title_slot_w = title_bar_width;
     let title_body = truncate_to_width(title, title_max);
-    let usage_max = title_slot_w.saturating_sub(7) as usize;
-    let usage_body = truncate_to_width(subtitle, usage_max);
-    let usage_len = usage_body.chars().count();
+    let git_max = title_slot_w.saturating_sub(7) as usize;
+    let git_body = git_summary
+        .map(|summary| truncate_git_badge_body(summary, git_max))
+        .unwrap_or_default();
+    let git_len = git_body.chars().count();
     let top_label_prefix = format!("╭─┐ {}", title_body);
     let bottom_prefix = "│ └ ";
-    let bottom_after_usage = " ";
+    let bottom_after_git = " ";
     let top_corner_col = top_label_prefix.chars().count() + 2;
     let bottom_corner_col = bottom_prefix.chars().count()
-        + usage_len
-        + bottom_after_usage.chars().count()
+        + git_len
+        + bottom_after_git.chars().count()
         + 1;
     let top_corner_padding = bottom_corner_col.saturating_sub(top_corner_col);
     let top_prefix = format!("{top_label_prefix}{} ┌", " ".repeat(top_corner_padding));
     let top_min_len = top_prefix.chars().count() + 2;
     let bottom_min_len = bottom_prefix.chars().count()
-        + usage_len
-        + bottom_after_usage.chars().count()
+        + git_len
+        + bottom_after_git.chars().count()
         + 1;
     let target_len = top_min_len.max(bottom_min_len);
     let top_dash_count = target_len.saturating_sub(top_prefix.chars().count());
@@ -118,22 +96,22 @@ pub(crate) fn render_panel_title_chrome(
     );
 
     if title_y.saturating_add(1) < panel_area.bottom() {
-        let usage_line = Line::from(vec![
+        let git_line = Line::from(vec![
             Span::styled(bottom_prefix, chrome_style),
             Span::styled(
-                usage_body,
+                git_body,
                 Style::default().fg(theme.muted).bg(bg_color(theme)),
             ),
             Span::styled(
                 format!(
-                    "{bottom_after_usage}{}┘",
+                    "{bottom_after_git}{}┘",
                     "─".repeat(bottom_dash_count)
                 ),
                 chrome_style,
             ),
         ]);
         f.render_widget(
-            Paragraph::new(usage_line)
+            Paragraph::new(git_line)
                 .alignment(Alignment::Left)
                 .style(chrome_style),
             Rect {
@@ -143,33 +121,6 @@ pub(crate) fn render_panel_title_chrome(
                 height: 1,
             },
         );
-
-        let bottom_closed_len = bottom_prefix.chars().count()
-            + usage_len
-            + bottom_after_usage.chars().count()
-            + bottom_dash_count
-            + 1;
-        let trailing_start = title_bar
-            .x
-            .saturating_add(bottom_closed_len as u16)
-            .saturating_add(1);
-        let trailing_end = title_bar.right().saturating_sub(chrome_reserve);
-        let trailing_width = trailing_end.saturating_sub(trailing_start);
-        if trailing_width > 0 {
-            if let Some(summary) = git_summary {
-                render_git_badge(
-                    f,
-                    Rect {
-                        x: trailing_start,
-                        y: title_y.saturating_add(1),
-                        width: trailing_width,
-                        height: 1,
-                    },
-                    summary,
-                    theme,
-                );
-            }
-        }
     }
 
     if !show_window_controls {
