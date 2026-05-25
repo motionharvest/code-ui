@@ -16,8 +16,8 @@ use ratatui::layout::{Direction, Rect};
 use crate::{
     git_status::query_git_summary,
     git_worktree::{
-        branch_base_from_pane_name, create_worktree, git_root, list_worktrees,
-        next_available_branch,
+        branch_base_from_pane_name, create_worktree, delete_worktree, git_root, list_worktrees,
+        next_available_branch, worktree_is_deletable,
     },
     layout::{
         adjacent_overlap, load_persisted_layout, pane_inner_area, placement_is_adjacent,
@@ -37,7 +37,8 @@ use crate::{
         workspace_hit_index, workspace_menu_hit_index, workspace_settings_action_hit_index,
         workspace_settings_modal_area, workspace_settings_name_input_area, Modal,
         PanelSettingsFocus, WorktreePickerFocus, AGENT_PRESETS, COMMANDER_COMMAND, TOP_CHROME_ROWS,
-        worktree_picker_branch_input_area, worktree_picker_item_count, worktree_picker_list_hit_index,
+        worktree_picker_branch_input_area, worktree_picker_delete_confirm_action_hit_index,
+        worktree_picker_delete_hit_index, worktree_picker_item_count, worktree_picker_list_hit_index,
         worktree_picker_modal_area,
     },
     utils::{arrow_key_to_split_side, contains, key_to_bytes, LOGIN_SHELL_SENTINEL},
@@ -1837,34 +1838,97 @@ impl App {
                     pane_id,
                     folder_name,
                     git_summary,
-                    entries,
+                    repo_root,
+                    mut entries,
+                    mut entry_summaries,
                     current_path,
                     mut selected_index,
                     mut focus,
+                    mut delete_target_index,
+                    mut delete_action_index,
                     mut branch_name,
                     mut branch_error,
                     mut cursor,
                 } => {
                     let item_count = worktree_picker_item_count(&entries);
+                    let selected_entry_index = selected_index.checked_sub(1);
+                    let selected_deletable = selected_entry_index.is_some_and(|idx| {
+                        entries
+                            .get(idx)
+                            .is_some_and(|entry| worktree_is_deletable(entry, &repo_root, current_path.as_deref()))
+                    });
                     match key.code {
-                        KeyCode::Esc => {
-                            if focus == WorktreePickerFocus::BranchName {
+                        KeyCode::Esc => match focus {
+                            WorktreePickerFocus::DeleteConfirm => {
+                                focus = WorktreePickerFocus::List;
+                                delete_target_index = None;
+                                delete_action_index = 1;
+                            }
+                            WorktreePickerFocus::BranchName => {
                                 focus = WorktreePickerFocus::List;
                                 branch_error = None;
-                            } else {
+                            }
+                            WorktreePickerFocus::DeleteButton => {
+                                focus = WorktreePickerFocus::List;
+                            }
+                            WorktreePickerFocus::List => {
                                 self.modal = None;
                                 return Ok(());
                             }
+                        },
+                        KeyCode::Up if focus == WorktreePickerFocus::DeleteConfirm => {
+                            delete_action_index = 0;
                         }
-                        KeyCode::Up if focus == WorktreePickerFocus::List => {
+                        KeyCode::Down if focus == WorktreePickerFocus::DeleteConfirm => {
+                            delete_action_index = 1;
+                        }
+                        KeyCode::Up
+                            if matches!(
+                                focus,
+                                WorktreePickerFocus::List | WorktreePickerFocus::DeleteButton
+                            ) =>
+                        {
                             selected_index = if selected_index == 0 {
                                 item_count.saturating_sub(1)
                             } else {
                                 selected_index - 1
                             };
+                            if focus == WorktreePickerFocus::DeleteButton {
+                                let deletable = selected_index.checked_sub(1).is_some_and(|idx| {
+                                    entries.get(idx).is_some_and(|entry| {
+                                        worktree_is_deletable(entry, &repo_root, current_path.as_deref())
+                                    })
+                                });
+                                if !deletable {
+                                    focus = WorktreePickerFocus::List;
+                                }
+                            }
                         }
-                        KeyCode::Down if focus == WorktreePickerFocus::List => {
+                        KeyCode::Down
+                            if matches!(
+                                focus,
+                                WorktreePickerFocus::List | WorktreePickerFocus::DeleteButton
+                            ) =>
+                        {
                             selected_index = (selected_index + 1) % item_count.max(1);
+                            if focus == WorktreePickerFocus::DeleteButton {
+                                let deletable = selected_index.checked_sub(1).is_some_and(|idx| {
+                                    entries.get(idx).is_some_and(|entry| {
+                                        worktree_is_deletable(entry, &repo_root, current_path.as_deref())
+                                    })
+                                });
+                                if !deletable {
+                                    focus = WorktreePickerFocus::List;
+                                }
+                            }
+                        }
+                        KeyCode::Left if focus == WorktreePickerFocus::DeleteButton => {
+                            focus = WorktreePickerFocus::List;
+                        }
+                        KeyCode::Right
+                            if focus == WorktreePickerFocus::List && selected_deletable =>
+                        {
+                            focus = WorktreePickerFocus::DeleteButton;
                         }
                         KeyCode::Backspace if focus == WorktreePickerFocus::BranchName => {
                             remove_char_before_cursor(&mut branch_name, &mut cursor);
@@ -1889,6 +1953,52 @@ impl App {
                             cursor = (cursor + 1).min(branch_name.chars().count());
                         }
                         KeyCode::Enter => match focus {
+                            WorktreePickerFocus::DeleteConfirm => {
+                                if delete_action_index == 1 {
+                                    focus = WorktreePickerFocus::List;
+                                    delete_target_index = None;
+                                    delete_action_index = 1;
+                                } else if let Some(entry_index) = delete_target_index {
+                                    if let Some(entry) = entries.get(entry_index) {
+                                        let force = entry_summaries
+                                            .get(entry_index)
+                                            .and_then(|summary| summary.as_ref())
+                                            .is_some_and(|summary| summary.has_changes());
+                                        match delete_worktree(&repo_root, &entry.path, force) {
+                                            Ok(()) => {
+                                                entries = list_worktrees(&repo_root);
+                                                entry_summaries =
+                                                    Self::summaries_for_worktrees(&entries);
+                                                selected_index = selected_index.min(
+                                                    worktree_picker_item_count(&entries)
+                                                        .saturating_sub(1),
+                                                );
+                                                focus = WorktreePickerFocus::List;
+                                                delete_target_index = None;
+                                                delete_action_index = 1;
+                                                branch_error = None;
+                                            }
+                                            Err(error) => {
+                                                branch_error = Some(error.to_string());
+                                                focus = WorktreePickerFocus::List;
+                                                delete_target_index = None;
+                                                delete_action_index = 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            WorktreePickerFocus::DeleteButton => {
+                                if let Some(entry_index) = selected_entry_index {
+                                    if entries.get(entry_index).is_some_and(|entry| {
+                                        worktree_is_deletable(entry, &repo_root, current_path.as_deref())
+                                    }) {
+                                        focus = WorktreePickerFocus::DeleteConfirm;
+                                        delete_target_index = Some(entry_index);
+                                        delete_action_index = 1;
+                                    }
+                                }
+                            }
                             WorktreePickerFocus::List if selected_index == 0 => {
                                 focus = WorktreePickerFocus::BranchName;
                                 branch_error = None;
@@ -1909,7 +2019,7 @@ impl App {
                                 let branch = branch_name.trim();
                                 if branch.is_empty() {
                                     branch_error = Some("branch name required".to_string());
-                                } else if let Some(repo_root) = current_path
+                                } else if let Some(repo_root_path) = current_path
                                     .as_ref()
                                     .and_then(|path| git_root(path))
                                     .or_else(|| {
@@ -1920,7 +2030,7 @@ impl App {
                                             .and_then(|path| git_root(&path))
                                     })
                                 {
-                                    match create_worktree(&repo_root, branch) {
+                                    match create_worktree(&repo_root_path, branch) {
                                         Ok(path) => {
                                             if let Err(error) =
                                                 self.switch_pane_to_worktree(pane_id, &path)
@@ -1944,10 +2054,14 @@ impl App {
                         pane_id,
                         folder_name,
                         git_summary,
+                        repo_root,
                         entries,
+                        entry_summaries,
                         current_path,
                         selected_index,
                         focus,
+                        delete_target_index,
+                        delete_action_index,
                         branch_name,
                         branch_error,
                         cursor,
@@ -2282,10 +2396,14 @@ impl App {
                     pane_id,
                     folder_name,
                     git_summary,
+                    repo_root,
                     entries,
+                    entry_summaries,
                     current_path,
                     selected_index,
                     focus,
+                    delete_target_index,
+                    delete_action_index,
                     mut branch_name,
                     branch_error: _,
                     mut cursor,
@@ -2297,10 +2415,14 @@ impl App {
                         pane_id,
                         folder_name,
                         git_summary,
+                        repo_root,
                         entries,
+                        entry_summaries,
                         current_path,
                         selected_index,
                         focus,
+                        delete_target_index,
+                        delete_action_index,
                         branch_name,
                         branch_error: None,
                         cursor,
@@ -2615,10 +2737,14 @@ impl App {
                     pane_id,
                     folder_name,
                     git_summary,
+                    repo_root,
                     entries,
+                    entry_summaries,
                     current_path,
                     mut selected_index,
                     mut focus,
+                    mut delete_target_index,
+                    mut delete_action_index,
                     branch_name,
                     mut branch_error,
                     mut cursor,
@@ -2634,12 +2760,37 @@ impl App {
                         &folder_name,
                         &git_summary,
                         &entries,
+                        &entry_summaries,
                         focus,
                     );
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                         match focus {
-                            WorktreePickerFocus::List => {
-                                if let Some(hit) = worktree_picker_list_hit_index(
+                            WorktreePickerFocus::DeleteConfirm => {
+                                if let Some(selected) =
+                                    worktree_picker_delete_confirm_action_hit_index(
+                                        area,
+                                        mouse.column,
+                                        mouse.row,
+                                    )
+                                {
+                                    delete_action_index = selected;
+                                }
+                            }
+                            WorktreePickerFocus::List | WorktreePickerFocus::DeleteButton => {
+                                if let Some(entry_index) = worktree_picker_delete_hit_index(
+                                    area,
+                                    &entries,
+                                    &entry_summaries,
+                                    &repo_root,
+                                    current_path.as_deref(),
+                                    mouse.column,
+                                    mouse.row,
+                                ) {
+                                    selected_index = entry_index + 1;
+                                    focus = WorktreePickerFocus::DeleteConfirm;
+                                    delete_target_index = Some(entry_index);
+                                    delete_action_index = 1;
+                                } else if let Some(hit) = worktree_picker_list_hit_index(
                                     area,
                                     &entries,
                                     mouse.column,
@@ -2661,6 +2812,7 @@ impl App {
                                         }
                                     } else {
                                         selected_index = hit;
+                                        focus = WorktreePickerFocus::List;
                                     }
                                 }
                             }
@@ -2681,10 +2833,14 @@ impl App {
                         pane_id,
                         folder_name,
                         git_summary,
+                        repo_root,
                         entries,
+                        entry_summaries,
                         current_path,
                         selected_index,
                         focus,
+                        delete_target_index,
+                        delete_action_index,
                         branch_name,
                         branch_error,
                         cursor,
@@ -4939,20 +5095,32 @@ impl App {
         }
 
         let entries = list_worktrees(&repo_root);
+        let entry_summaries = Self::summaries_for_worktrees(&entries);
         let branch_name = next_available_branch(&repo_root, &branch_base_from_pane_name(&pane.title));
         let cursor = branch_name.chars().count();
         self.modal = Some(Modal::WorktreePicker {
             pane_id,
             folder_name,
             git_summary,
+            repo_root,
             entries,
+            entry_summaries,
             current_path: Some(current_path),
             selected_index: 0,
             focus: WorktreePickerFocus::List,
+            delete_target_index: None,
+            delete_action_index: 1,
             branch_name,
             branch_error: None,
             cursor,
         });
+    }
+
+    fn summaries_for_worktrees(entries: &[crate::git_worktree::WorktreeInfo]) -> Vec<Option<crate::git_status::GitSummary>> {
+        entries
+            .iter()
+            .map(|entry| query_git_summary(&entry.path))
+            .collect()
     }
 
     fn switch_pane_to_worktree(

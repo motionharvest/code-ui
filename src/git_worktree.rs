@@ -222,6 +222,45 @@ pub(crate) fn create_worktree(git_root: &Path, branch: &str) -> anyhow::Result<P
     Ok(worktree_path)
 }
 
+pub(crate) fn delete_worktree(
+    git_root: &Path,
+    worktree_path: &Path,
+    force: bool,
+) -> anyhow::Result<()> {
+    let Some(root) = git_root.to_str() else {
+        anyhow::bail!("invalid git root path");
+    };
+    let Some(path) = worktree_path.to_str() else {
+        anyhow::bail!("invalid worktree path");
+    };
+
+    let mut args = vec!["-C", root, "worktree", "remove"];
+    if force {
+        args.push("--force");
+    }
+    args.push(path);
+
+    let status = Command::new("git").args(args).status()?;
+    if !status.success() {
+        anyhow::bail!("failed to remove worktree");
+    }
+    Ok(())
+}
+
+pub(crate) fn worktree_is_deletable(
+    entry: &WorktreeInfo,
+    repo_root: &Path,
+    current_path: Option<&Path>,
+) -> bool {
+    if paths_equal(&entry.path, repo_root) {
+        return false;
+    }
+    if current_path.is_some_and(|path| paths_equal(path, &entry.path)) {
+        return false;
+    }
+    true
+}
+
 pub(crate) fn paths_equal(a: &Path, b: &Path) -> bool {
     if a == b {
         return true;

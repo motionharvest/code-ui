@@ -26,6 +26,22 @@ impl GitSummary {
     pub(crate) fn dirty_count(&self) -> usize {
         self.staged + self.unstaged + self.untracked
     }
+
+    pub(crate) fn has_changes(&self) -> bool {
+        self.dirty_count() > 0
+    }
+}
+
+pub(crate) fn format_worktree_changes(summary: &GitSummary) -> String {
+    let mut out = String::new();
+    if summary.unstaged > 0 {
+        out.push_str(&format!(" -{}", summary.unstaged));
+    }
+    let additions = summary.staged + summary.untracked;
+    if additions > 0 {
+        out.push_str(&format!(" +{}", additions));
+    }
+    out
 }
 
 pub(crate) fn folder_badge_body(folder_name: &str) -> String {
@@ -252,5 +268,29 @@ mod tests {
     fn folder_badge_body_shows_folder_icon_and_name() {
         let body = folder_badge_body("code-ui");
         assert_eq!(body, format!("{NF_FOLDER} code-ui"));
+    }
+
+    #[test]
+    fn format_worktree_changes_shows_minus_and_plus_counts() {
+        assert_eq!(
+            format_worktree_changes(&GitSummary {
+                branch: "main".to_string(),
+                staged: 2,
+                unstaged: 3,
+                untracked: 1,
+                on_github: false,
+            }),
+            " -3 +3"
+        );
+        assert_eq!(
+            format_worktree_changes(&GitSummary {
+                branch: "main".to_string(),
+                staged: 0,
+                unstaged: 0,
+                untracked: 0,
+                on_github: false,
+            }),
+            ""
+        );
     }
 }

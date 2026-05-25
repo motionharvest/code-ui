@@ -11,8 +11,8 @@ pub(crate) fn bg_color(_theme: Theme) -> Color {
 }
 
 use crate::{
-    git_status::{truncate_pane_subtitle_body, GitSummary},
-    git_worktree::WorktreeInfo,
+    git_status::{format_worktree_changes, truncate_pane_subtitle_body, GitSummary},
+    git_worktree::{worktree_is_deletable, WorktreeInfo},
     layout::{pane_combobox_dropdown_area, pane_subtitle_combobox_dropdown_area},
     theme::Theme,
     theme::THEMES,
@@ -736,10 +736,14 @@ pub(crate) enum Modal {
         pane_id: usize,
         folder_name: String,
         git_summary: GitSummary,
+        repo_root: std::path::PathBuf,
         entries: Vec<WorktreeInfo>,
+        entry_summaries: Vec<Option<GitSummary>>,
         current_path: Option<std::path::PathBuf>,
         selected_index: usize,
         focus: WorktreePickerFocus,
+        delete_target_index: Option<usize>,
+        delete_action_index: usize,
         branch_name: String,
         branch_error: Option<String>,
         cursor: usize,
@@ -749,7 +753,9 @@ pub(crate) enum Modal {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorktreePickerFocus {
     List,
+    DeleteButton,
     BranchName,
+    DeleteConfirm,
 }
 
 pub(crate) fn help_modal_area(size: Rect) -> Rect {
@@ -1745,10 +1751,29 @@ pub(crate) fn worktree_picker_item_count(entries: &[WorktreeInfo]) -> usize {
     1 + entries.len()
 }
 
-pub(crate) fn worktree_picker_modal_height(entries: &[WorktreeInfo], focus: WorktreePickerFocus) -> u16 {
+pub(crate) fn worktree_picker_modal_width(entries: &[WorktreeInfo], entry_summaries: &[Option<GitSummary>]) -> u16 {
+    let mut width = 34usize;
+    for (idx, entry) in entries.iter().enumerate() {
+        let mut row = format!("{} ({})", entry.branch, entry.folder_name);
+        if let Some(summary) = entry_summaries.get(idx).and_then(|summary| summary.as_ref()) {
+            row.push_str(&format_worktree_changes(summary));
+        }
+        row.push_str(" ✕");
+        width = width.max(row.chars().count() + 4);
+    }
+    width.min(56) as u16
+}
+
+pub(crate) fn worktree_picker_modal_height(
+    entries: &[WorktreeInfo],
+    focus: WorktreePickerFocus,
+) -> u16 {
     match focus {
-        WorktreePickerFocus::List => (worktree_picker_item_count(entries) as u16 + 3).min(16),
+        WorktreePickerFocus::List | WorktreePickerFocus::DeleteButton => {
+            (worktree_picker_item_count(entries) as u16 + 3).min(16)
+        }
         WorktreePickerFocus::BranchName => 9,
+        WorktreePickerFocus::DeleteConfirm => 9,
     }
 }
 
@@ -1757,9 +1782,10 @@ pub(crate) fn worktree_picker_modal_area(
     folder_name: &str,
     git_summary: &GitSummary,
     entries: &[WorktreeInfo],
+    entry_summaries: &[Option<GitSummary>],
     focus: WorktreePickerFocus,
 ) -> Rect {
-    let width = 34.min(pane_area.width);
+    let width = worktree_picker_modal_width(entries, entry_summaries).min(pane_area.width);
     let height = worktree_picker_modal_height(entries, focus).min(pane_area.height);
     pane_subtitle_combobox_dropdown_area(pane_area, folder_name, Some(git_summary), width, height)
 }
@@ -1797,6 +1823,113 @@ pub(crate) fn worktree_picker_list_hit_index(
     Some((y.saturating_sub(list_area.y) as usize).min(worktree_picker_item_count(entries) - 1))
 }
 
+pub(crate) fn worktree_picker_delete_hit_index(
+    modal_area: Rect,
+    entries: &[WorktreeInfo],
+    entry_summaries: &[Option<GitSummary>],
+    repo_root: &std::path::Path,
+    current_path: Option<&std::path::Path>,
+    x: u16,
+    y: u16,
+) -> Option<usize> {
+    let list_area = worktree_picker_list_area(modal_area, entries);
+    if !contains(list_area, x, y) {
+        return None;
+    }
+    let row = (y.saturating_sub(list_area.y) as usize).min(worktree_picker_item_count(entries) - 1);
+    if row == 0 {
+        return None;
+    }
+    let entry_index = row - 1;
+    let entry = entries.get(entry_index)?;
+    if !worktree_is_deletable(entry, repo_root, current_path) {
+        return None;
+    }
+    let changes = entry_summaries
+        .get(entry_index)
+        .and_then(|summary| summary.as_ref())
+        .map(format_worktree_changes)
+        .unwrap_or_default();
+    let right_len = (changes.chars().count() + 2) as u16;
+    let delete_x = list_area.x.saturating_add(list_area.width.saturating_sub(right_len));
+    if x >= delete_x {
+        Some(entry_index)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn worktree_picker_delete_confirm_action_area(modal_area: Rect) -> Rect {
+    let inner = Block::default().borders(Borders::ALL).inner(modal_area);
+    Rect {
+        x: inner.x,
+        y: inner.y + 3,
+        width: inner.width,
+        height: 2,
+    }
+}
+
+pub(crate) fn worktree_picker_delete_confirm_action_hit_index(
+    modal_area: Rect,
+    x: u16,
+    y: u16,
+) -> Option<usize> {
+    let action_area = worktree_picker_delete_confirm_action_area(modal_area);
+    if !contains(action_area, x, y) {
+        return None;
+    }
+    Some((y.saturating_sub(action_area.y) as usize).min(1))
+}
+
+fn worktree_picker_row_parts(
+    idx: usize,
+    entries: &[WorktreeInfo],
+    entry_summaries: &[Option<GitSummary>],
+    current_path: Option<&std::path::Path>,
+    repo_root: &std::path::Path,
+    width: usize,
+) -> (String, String, bool) {
+    if idx == 0 {
+        return ("New worktree".to_string(), String::new(), false);
+    }
+
+    let entry_index = idx - 1;
+    let entry = &entries[entry_index];
+    let current = current_path
+        .is_some_and(|path| crate::git_worktree::paths_equal(path, &entry.path));
+    let suffix = if current { " (current)" } else { "" };
+    let left = format!("{} ({}){}", entry.branch, entry.folder_name, suffix);
+    let changes = entry_summaries
+        .get(entry_index)
+        .and_then(|summary| summary.as_ref())
+        .map(format_worktree_changes)
+        .unwrap_or_default();
+    let deletable = worktree_is_deletable(entry, repo_root, current_path);
+    if changes.is_empty() && !deletable {
+        return (left, String::new(), false);
+    }
+
+    let right_len = changes.chars().count()
+        + if deletable {
+            if changes.is_empty() { 1 } else { 2 }
+        } else {
+            0
+        };
+    let left_max = width.saturating_sub(right_len);
+    let left = if left.chars().count() > left_max {
+        if left_max <= 1 {
+            "…".to_string()
+        } else {
+            let mut truncated: String = left.chars().take(left_max.saturating_sub(1)).collect();
+            truncated.push('…');
+            truncated
+        }
+    } else {
+        left
+    };
+    (left, changes, deletable)
+}
+
 pub(crate) fn render_worktree_picker_modal(
     f: &mut ratatui::Frame<'_>,
     pane_area: Rect,
@@ -1804,58 +1937,113 @@ pub(crate) fn render_worktree_picker_modal(
     git_summary: &GitSummary,
     theme: Theme,
     entries: &[WorktreeInfo],
+    entry_summaries: &[Option<GitSummary>],
+    repo_root: &std::path::Path,
     current_path: Option<&std::path::Path>,
     selected_index: usize,
     focus: WorktreePickerFocus,
+    delete_target_index: Option<usize>,
+    delete_action_index: usize,
     branch_name: &str,
     branch_error: Option<&str>,
     cursor: usize,
 ) {
-    let area = worktree_picker_modal_area(pane_area, folder_name, git_summary, entries, focus);
+    let area = worktree_picker_modal_area(
+        pane_area,
+        folder_name,
+        git_summary,
+        entries,
+        entry_summaries,
+        focus,
+    );
     f.render_widget(Clear, area);
 
-    let title = match focus {
-        WorktreePickerFocus::List => "─ Worktrees ─",
-        WorktreePickerFocus::BranchName => "─ New Worktree ─",
+    let (title, border_color) = match focus {
+        WorktreePickerFocus::List | WorktreePickerFocus::DeleteButton => {
+            ("─ Worktrees ─", theme.accent)
+        }
+        WorktreePickerFocus::BranchName => ("─ New Worktree ─", theme.accent),
+        WorktreePickerFocus::DeleteConfirm => {
+            let has_changes = delete_target_index
+                .and_then(|idx| entry_summaries.get(idx).and_then(|summary| summary.as_ref()))
+                .is_some_and(GitSummary::has_changes);
+            (
+                "─ Delete Worktree ─",
+                if has_changes { Color::Red } else { Color::Yellow },
+            )
+        }
     };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .title(title)
         .style(Style::default().fg(theme.foreground).bg(bg_color(theme)))
-        .border_style(Style::default().fg(theme.accent));
+        .border_style(Style::default().fg(border_color));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     match focus {
-        WorktreePickerFocus::List => {
+        WorktreePickerFocus::List | WorktreePickerFocus::DeleteButton => {
             let list_area = worktree_picker_list_area(area, entries);
             let item_count = worktree_picker_item_count(entries);
             let selected = selected_index.min(item_count.saturating_sub(1));
             let mut lines = Vec::new();
 
             for idx in 0..item_count {
-                let marker = if idx == selected { "> " } else { "  " };
-                let label = if idx == 0 {
-                    "New worktree".to_string()
-                } else {
-                    let entry = &entries[idx - 1];
-                    let current = current_path
-                        .is_some_and(|path| crate::git_worktree::paths_equal(path, &entry.path));
-                    let suffix = if current { " (current)" } else { "" };
-                    format!("{} ({}){}", entry.branch, entry.folder_name, suffix)
-                };
-                let style = if idx == selected {
-                    Style::default()
-                        .fg(theme.accent)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(theme.foreground)
-                };
-                lines.push(Line::from(vec![Span::styled(
-                    format!("{}{}", marker, label),
-                    style,
-                )]));
+                let row_selected = idx == selected;
+                let delete_selected =
+                    row_selected && focus == WorktreePickerFocus::DeleteButton && idx > 0;
+                let list_selected = row_selected && focus == WorktreePickerFocus::List;
+                let marker = if row_selected { "> " } else { "  " };
+                let (left, changes, deletable) = worktree_picker_row_parts(
+                    idx,
+                    entries,
+                    entry_summaries,
+                    current_path,
+                    repo_root,
+                    list_area.width.saturating_sub(2) as usize,
+                );
+                let right_len = changes.chars().count()
+                    + if deletable {
+                        if changes.is_empty() { 1 } else { 2 }
+                    } else {
+                        0
+                    };
+                let pad = list_area
+                    .width
+                    .saturating_sub((marker.chars().count() + left.chars().count() + right_len) as u16);
+                let mut spans = vec![
+                    Span::styled(
+                        format!("{}{}", marker, left),
+                        if list_selected {
+                            Style::default()
+                                .fg(theme.accent)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(theme.foreground)
+                        },
+                    ),
+                    Span::raw(" ".repeat(pad as usize)),
+                ];
+                if !changes.is_empty() {
+                    spans.push(Span::styled(changes.clone(), Style::default().fg(theme.muted)));
+                }
+                if deletable {
+                    if !changes.is_empty() {
+                        spans.push(Span::raw(" "));
+                    }
+                    spans.push(Span::styled(
+                        "✕".to_string(),
+                        if delete_selected {
+                            Style::default()
+                                .fg(Color::Red)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(theme.muted)
+                        },
+                    ));
+                }
+                lines.push(Line::from(spans));
             }
 
             f.render_widget(
@@ -1925,6 +2113,74 @@ pub(crate) fn render_worktree_picker_modal(
                     as u16,
             );
             f.set_cursor(cursor_x, name_inner.y);
+        }
+        WorktreePickerFocus::DeleteConfirm => {
+            let entry = delete_target_index.and_then(|idx| entries.get(idx));
+            let has_changes = delete_target_index
+                .and_then(|idx| entry_summaries.get(idx).and_then(|summary| summary.as_ref()))
+                .is_some_and(GitSummary::has_changes);
+            let message = if let Some(entry) = entry {
+                if has_changes {
+                    format!(
+                        "Delete worktree \"{}\"?\nIt has uncommitted changes.",
+                        entry.folder_name
+                    )
+                } else {
+                    format!("Delete worktree \"{}\"?", entry.folder_name)
+                }
+            } else {
+                "Delete this worktree?".to_string()
+            };
+            f.render_widget(
+                Paragraph::new(message)
+                    .style(Style::default().fg(theme.foreground).bg(bg_color(theme)))
+                    .wrap(Wrap { trim: false }),
+                Rect {
+                    x: inner.x,
+                    y: inner.y,
+                    width: inner.width,
+                    height: 2,
+                },
+            );
+
+            let delete_label = if has_changes {
+                "Force Delete"
+            } else {
+                "Delete"
+            };
+            let actions = [delete_label, "Cancel"];
+            let selected = delete_action_index.min(1);
+            let action_area = worktree_picker_delete_confirm_action_area(area);
+            let mut action_lines = Vec::new();
+            for (idx, label) in actions.iter().enumerate() {
+                let is_selected = idx == selected;
+                let marker = if is_selected { "> " } else { "  " };
+                let mut style = if idx == 0 {
+                    Style::default().fg(if has_changes {
+                        Color::Red
+                    } else {
+                        theme.foreground
+                    })
+                } else {
+                    Style::default().fg(theme.foreground)
+                };
+                if is_selected {
+                    style = style.add_modifier(Modifier::BOLD);
+                    if idx != 0 {
+                        style = style.fg(theme.accent);
+                    }
+                }
+                action_lines.push(Line::from(vec![Span::styled(
+                    format!("{}{}", marker, label),
+                    style,
+                )]));
+            }
+            f.render_widget(
+                Paragraph::new(Text::from(action_lines))
+                    .style(Style::default().fg(theme.foreground).bg(bg_color(theme)))
+                    .wrap(Wrap { trim: false }),
+                action_area,
+            );
         }
     }
 }
