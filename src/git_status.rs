@@ -15,8 +15,10 @@ pub(crate) struct GitSummary {
     pub on_github: bool,
 }
 
-/// Nerd Font: nf-md-file_tree
+/// Nerd Font: nf-md-file_tree (git repos)
 pub(crate) const NF_TREE: char = '\u{e21c}';
+/// Nerd Font: folder when cwd is not a git repository
+pub(crate) const NF_FOLDER: char = '\u{e5ff}';
 /// Nerd Font: nf-fa-git_branch
 pub(crate) const NF_GIT_BRANCH: char = '\u{f126}';
 
@@ -27,11 +29,11 @@ impl GitSummary {
 }
 
 pub(crate) fn folder_badge_body(folder_name: &str) -> String {
-    format!("{NF_TREE} {folder_name}")
+    format!("{NF_FOLDER} {folder_name}")
 }
 
 pub(crate) fn git_badge_body(folder_name: &str, summary: &GitSummary) -> String {
-    let mut body = folder_badge_body(folder_name);
+    let mut body = format!("{NF_TREE} {folder_name}");
     body.push(' ');
     body.push(NF_GIT_BRANCH);
     body.push(' ');
@@ -247,8 +249,8 @@ mod tests {
     }
 
     #[test]
-    fn folder_badge_body_shows_tree_and_name() {
+    fn folder_badge_body_shows_folder_icon_and_name() {
         let body = folder_badge_body("code-ui");
-        assert_eq!(body, format!("{NF_TREE} code-ui"));
+        assert_eq!(body, format!("{NF_FOLDER} code-ui"));
     }
 }
