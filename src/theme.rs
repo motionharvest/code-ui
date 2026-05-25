@@ -9,9 +9,6 @@ pub(crate) struct Theme {
     pub(crate) foreground: Color,
     pub(crate) muted: Color,
     pub(crate) accent: Color,
-    /// Background color used for pane title bars. Slightly distinct from
-    /// `background` so the title bar reads as a discrete UI element.
-    pub(crate) title_bar: Color,
     /// When true, terminal content should not be recolored by the app.
     pub(crate) passthrough: bool,
     /// Terminal palette in ANSI-first order with optional extended colors.
@@ -25,7 +22,6 @@ pub(crate) const THEMES: &[Theme] = &[
         foreground: Color::Reset,
         muted: Color::Reset,
         accent: Color::Reset,
-        title_bar: Color::Reset,
         passthrough: true,
         palette: &[
             Color::Reset,
@@ -52,7 +48,6 @@ pub(crate) const THEMES: &[Theme] = &[
         foreground: Color::White,
         muted: Color::Gray,
         accent: Color::Cyan,
-        title_bar: Color::Reset,
         passthrough: true,
         palette: &[
             Color::Reset,
@@ -79,7 +74,6 @@ pub(crate) const THEMES: &[Theme] = &[
         foreground: Color::White,
         muted: Color::Gray,
         accent: Color::White,
-        title_bar: Color::Reset,
         passthrough: false,
         palette: &[
             Color::Black,
@@ -106,7 +100,6 @@ pub(crate) const THEMES: &[Theme] = &[
         foreground: Color::Rgb(255, 255, 255),
         muted: Color::Rgb(213, 188, 255),
         accent: Color::Rgb(217, 160, 255),
-        title_bar: Color::Reset,
         passthrough: false,
         palette: &[
             Color::Rgb(30, 30, 46),
@@ -149,7 +142,6 @@ pub(crate) const THEMES: &[Theme] = &[
         foreground: Color::Rgb(255, 255, 255),
         muted: Color::Rgb(255, 230, 0),
         accent: Color::Rgb(0, 229, 255),
-        title_bar: Color::Reset,
         passthrough: false,
         palette: &[
             Color::Rgb(10, 10, 20),
@@ -186,7 +178,6 @@ pub(crate) const THEMES: &[Theme] = &[
         foreground: Color::Rgb(255, 255, 255),
         muted: Color::Rgb(248, 252, 196),
         accent: Color::Rgb(189, 147, 249),
-        title_bar: Color::Reset,
         passthrough: false,
         palette: &[
             Color::Rgb(26, 27, 38),
@@ -225,7 +216,6 @@ pub(crate) const THEMES: &[Theme] = &[
         foreground: Color::Rgb(255, 255, 255),
         muted: Color::Rgb(231, 244, 205),
         accent: Color::Rgb(189, 228, 129),
-        title_bar: Color::Reset,
         passthrough: false,
         palette: &[
             Color::Rgb(25, 31, 29),
@@ -265,7 +255,6 @@ pub(crate) const THEMES: &[Theme] = &[
         foreground: Color::Rgb(255, 255, 255),
         muted: Color::Rgb(252, 235, 197),
         accent: Color::Rgb(253, 149, 63),
-        title_bar: Color::Reset,
         passthrough: false,
         palette: &[
             Color::Rgb(34, 31, 28),
@@ -303,7 +292,6 @@ pub(crate) const THEMES: &[Theme] = &[
         foreground: Color::Rgb(230, 241, 255),
         muted: Color::Rgb(136, 146, 176),
         accent: Color::Rgb(0, 119, 190),
-        title_bar: Color::Reset,
         passthrough: false,
         palette: &[
             Color::Rgb(10, 25, 47),
@@ -333,7 +321,6 @@ pub(crate) const THEMES: &[Theme] = &[
         foreground: Color::Rgb(255, 255, 255),
         muted: Color::Rgb(204, 235, 244),
         accent: Color::Rgb(114, 206, 232),
-        title_bar: Color::Reset,
         passthrough: false,
         palette: &[
             Color::Rgb(26, 29, 35),
@@ -374,7 +361,6 @@ pub(crate) const THEMES: &[Theme] = &[
         foreground: Color::Rgb(255, 255, 255),
         muted: Color::Rgb(194, 250, 242),
         accent: Color::Rgb(51, 255, 247),
-        title_bar: Color::Reset,
         passthrough: false,
         palette: &[
             Color::Rgb(13, 27, 42),
@@ -414,7 +400,6 @@ pub(crate) const THEMES: &[Theme] = &[
         foreground: Color::Rgb(255, 255, 255),
         muted: Color::Rgb(240, 168, 190),
         accent: Color::Rgb(212, 168, 255),
-        title_bar: Color::Reset,
         passthrough: false,
         palette: &[
             Color::Rgb(26, 23, 38),
@@ -454,7 +439,6 @@ pub(crate) const THEMES: &[Theme] = &[
         foreground: Color::Rgb(255, 255, 255),
         muted: Color::Rgb(140, 130, 201),
         accent: Color::Rgb(244, 69, 247),
-        title_bar: Color::Reset,
         passthrough: false,
         palette: &[
             Color::Rgb(38, 35, 53),
@@ -493,7 +477,6 @@ pub(crate) const THEMES: &[Theme] = &[
         foreground: Color::Rgb(255, 255, 255),
         muted: Color::Rgb(144, 232, 255),
         accent: Color::Rgb(126, 170, 255),
-        title_bar: Color::Reset,
         passthrough: false,
         palette: &[
             Color::Rgb(26, 27, 38),
@@ -533,7 +516,6 @@ pub(crate) const THEMES: &[Theme] = &[
         foreground: Color::Rgb(171, 178, 191),
         muted: Color::Rgb(92, 99, 112),
         accent: Color::Rgb(97, 175, 239),
-        title_bar: Color::Reset,
         passthrough: false,
         palette: &[
             Color::Rgb(40, 44, 52),
@@ -560,7 +542,6 @@ pub(crate) const THEMES: &[Theme] = &[
         foreground: Color::Rgb(238, 232, 213),
         muted: Color::Rgb(101, 123, 131),
         accent: Color::Rgb(38, 139, 210),
-        title_bar: Color::Reset,
         passthrough: false,
         palette: &[
             Color::Rgb(0, 43, 54),
@@ -587,7 +568,6 @@ pub(crate) const THEMES: &[Theme] = &[
         foreground: Color::Rgb(32, 32, 32),
         muted: Color::Rgb(90, 90, 90),
         accent: Color::Rgb(32, 32, 32),
-        title_bar: Color::Reset,
         passthrough: false,
         palette: &[
             Color::Rgb(245, 245, 240),

@@ -855,7 +855,6 @@ mod tests {
             foreground: Color::Rgb(220, 220, 230),
             muted: Color::Rgb(120, 120, 130),
             accent: Color::Rgb(80, 140, 220),
-            title_bar: Color::Reset,
             passthrough: false,
             palette: TEST_PALETTE,
         }
@@ -936,7 +935,6 @@ mod tests {
             foreground: Color::Reset,
             muted: Color::Reset,
             accent: Color::Reset,
-            title_bar: Color::Reset,
             passthrough: true,
             palette: RESET_PALETTE,
         };

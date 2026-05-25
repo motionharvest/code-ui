@@ -703,13 +703,6 @@ impl Pane {
         rows.join("\n")
     }
 
-    pub(crate) fn visible_plain_text(&self) -> String {
-        let screen = self.parser.screen();
-        let (_, cols) = screen.size();
-        let rows: Vec<String> = screen.rows(0, cols).collect();
-        rows.join("\n")
-    }
-
     fn build_styled_view(&self, selection: Option<PaneSelection>) -> Text<'static> {
         let screen = self.parser.screen();
         let (rows, cols) = screen.size();

@@ -2938,14 +2938,7 @@ impl App {
         self.commander.cursor
     }
 
-    pub(crate) fn commander_busy(&self) -> bool {
-        self.commander.busy
-    }
-
-    pub(crate) fn commander_history(&self) -> &[String] {
-        &self.commander.history
-    }
-
+    #[cfg(test)]
     pub(crate) fn commander_chat_offset_from_bottom(&self) -> usize {
         self.commander.chat_offset_from_bottom
     }
@@ -2970,6 +2963,7 @@ impl App {
         self.commander.chat_pinned_to_bottom = true;
     }
 
+    #[cfg(test)]
     pub(crate) fn set_commander_chat_metrics(&mut self, viewport_lines: u16, total_lines: usize) {
         self.commander.chat_viewport_lines = viewport_lines;
         self.commander.chat_total_lines = total_lines;
@@ -3029,17 +3023,6 @@ impl App {
             self.commander.chat_offset_from_bottom = 0;
         } else {
             self.clamp_commander_chat_scroll();
-        }
-    }
-
-    pub(crate) fn commander_phase_label(&self) -> &'static str {
-        if self.commander.busy {
-            return "thinking";
-        }
-        match self.commander.phase {
-            CommanderPhase::Discussing => "planning",
-            CommanderPhase::AwaitingApproval => "awaiting /approve",
-            CommanderPhase::Executing => "executing",
         }
     }
 
@@ -4050,33 +4033,6 @@ impl App {
     fn queue_tts(&self, text: &str) {
         if let Some(tx) = self.tts.tx.as_ref() {
             let _ = tx.send(text.trim().to_string());
-        }
-    }
-
-    pub(crate) fn commander_palette_video_frame(&self) -> Option<&str> {
-        if self.commander_palette_video.child.is_some()
-            && !self.commander_palette_video.frame_text.trim().is_empty()
-        {
-            Some(self.commander_palette_video.frame_text.as_str())
-        } else {
-            None
-        }
-    }
-
-    pub(crate) fn set_commander_palette_video_size(&mut self, rows: u16, cols: u16) {
-        let rows = rows.max(1);
-        let cols = cols.max(1);
-        if rows == self.commander_palette_video.rows && cols == self.commander_palette_video.cols {
-            return;
-        }
-        self.commander_palette_video.rows = rows;
-        self.commander_palette_video.cols = cols;
-        self.commander_palette_video
-            .parser
-            .set_size(commander_palette_video_source_rows(rows), cols);
-        self.commander_palette_video.frame_text.clear();
-        if self.commander_palette_video.child.is_some() {
-            self.start_commander_palette_video();
         }
     }
 

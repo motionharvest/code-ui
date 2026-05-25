@@ -158,7 +158,6 @@ pub(crate) fn render_panel_title_chrome(
 
 pub(crate) const COMMANDER_COMMAND: &str = "commander";
 pub(crate) const TOP_CHROME_ROWS: u16 = 2;
-pub(crate) const WORKSPACE_BAR_HEIGHT: u16 = 2;
 pub(crate) const COMMANDER_PROMPT: &str = " Commander > ";
 const COMMANDER_CONNECTOR: &str = "╭─";
 const COMMANDER_FRAME_LEFT: &str = "│";
