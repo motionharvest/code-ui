@@ -56,7 +56,7 @@ pub(crate) fn render_panel_title_chrome(
 
         if text_width > PANE_TITLE_TEXT_PADDING.saturating_mul(2) {
             f.render_widget(
-                Paragraph::new("◤")
+                Paragraph::new("─")
                     .alignment(Alignment::Left)
                     .style(chrome_style),
                 Rect {
@@ -171,19 +171,14 @@ pub(crate) fn render_panel_title_chrome(
 }
 
 pub(crate) const COMMANDER_COMMAND: &str = "commander";
-pub(crate) const TOP_CHROME_ROWS: u16 = 2;
+pub(crate) const TOP_CHROME_ROWS: u16 = 1;
 pub(crate) const COMMANDER_PROMPT: &str = " Commander > ";
 const COMMANDER_CONNECTOR: &str = "╭─";
 const COMMANDER_FRAME_LEFT: &str = "│";
 const COMMANDER_FRAME_RIGHT_POST: &str = "│";
 const COMMANDER_FRAME_CHIN: &str = "─╮";
-const WORKSPACE_ROW2_TAIL: &str = "───╯";
-const WORKSPACE_ROW2_LEAD: &str = "╰───";
-const WORKSPACE_ROW2_TAIL_WIDTH: u16 = 4;
-const COMMANDER_ROW2_GAP: u16 = 1;
 const COMMANDER_AFTER_ADD_PAD: u16 = 3;
 const COMMANDER_SHIFT_LEFT: u16 = 2;
-const COMMANDER_ROW2_SHIFT_RIGHT: u16 = 2;
 const TOP_BAR_RIGHT_GAP: u16 = 1;
 const RIGHT_CLUSTER_SEP: &str = " │ ";
 const APP_NAME: &str = "Code UI";
@@ -217,8 +212,6 @@ pub(crate) struct TopBarLayout {
     pub commander_frame: Rect,
     pub commander_inner: Rect,
     pub right_cluster: Rect,
-    pub right_cluster_rule_y: u16,
-    pub workspace_tab_rule_end_x: u16,
 }
 
 pub(crate) fn top_bar_area(size: Rect) -> Rect {
@@ -284,20 +277,15 @@ pub(crate) fn compute_top_bar_layout(
         x: commander_left,
         y: bar.y,
         width: commander_width,
-        height: bar.height.max(1),
+        height: 1,
     };
     let commander_inner = commander_inner_rect(commander_frame);
-    let workspace_tab_rule_end_x = commander_frame
-        .x
-        .saturating_sub(WORKSPACE_ROW2_TAIL_WIDTH.saturating_add(COMMANDER_ROW2_GAP));
 
     TopBarLayout {
         bar,
         commander_frame,
         commander_inner,
         right_cluster,
-        right_cluster_rule_y: bar.y.saturating_add(1),
-        workspace_tab_rule_end_x,
     }
 }
 
@@ -399,10 +387,6 @@ fn inactive_workspace_tab_style(theme: Theme, keyboard_focused: bool) -> Style {
     style
 }
 
-fn workspace_tab_rule_style(theme: Theme) -> Style {
-    Style::default().fg(theme.muted).bg(bg_color(theme))
-}
-
 fn workspace_tabs_start_x(sidebar_area: Rect) -> u16 {
     sidebar_area.x
 }
@@ -431,71 +415,12 @@ fn workspace_item_x(
     x
 }
 
-fn workspace_tab_divider_columns(
-    sidebar_area: Rect,
-    workspace_names: &[String],
-    active_workspace_index: usize,
-) -> Vec<u16> {
-    let mut xs = Vec::new();
-    for idx in 0..workspace_names.len().saturating_sub(1) {
-        let left = workspace_item_area(sidebar_area, workspace_names, idx, active_workspace_index);
-        let right =
-            workspace_item_area(sidebar_area, workspace_names, idx + 1, active_workspace_index);
-        let gap_x = left.right();
-        if right.x > gap_x {
-            xs.push(gap_x);
-        }
-    }
-    xs
-}
-
-fn active_tab_left_corner_x(active_tab: Rect, active_is_leftmost: bool) -> Option<u16> {
-    if active_is_leftmost {
-        None
-    } else {
-        Some(active_tab.x.saturating_sub(1))
-    }
-}
-
-fn workspace_tab_rule_char(
-    x: u16,
-    active_tab: Rect,
-    active_is_leftmost: bool,
-    active_is_rightmost: bool,
-    tab_dividers: &[u16],
-) -> char {
-    if active_tab_left_corner_x(active_tab, active_is_leftmost) == Some(x) {
-        return '┘';
-    }
-    if !active_is_rightmost && x == active_tab.right() {
-        return '└';
-    }
-    if x >= active_tab.x && x < active_tab.right() {
-        return '▀';
-    }
-    if tab_dividers.contains(&x) {
-        return '┴';
-    }
-    '─'
-}
-
-fn workspace_tab_rule_span_style(ch: char, theme: Theme) -> Style {
-    if ch == '▀' {
-        Style::default()
-            .fg(selected_tab_bg(theme))
-            .bg(bg_color(theme))
-    } else {
-        workspace_tab_rule_style(theme)
-    }
-}
-
 fn render_workspace_tab_chrome(
     f: &mut ratatui::Frame<'_>,
     sidebar_area: Rect,
     theme: Theme,
     workspace_names: &[String],
     active_workspace_index: usize,
-    rule_end_x: u16,
 ) {
     if sidebar_area.height == 0 || workspace_names.is_empty() {
         return;
@@ -524,123 +449,6 @@ fn render_workspace_tab_chrome(
             },
         );
     }
-
-    if sidebar_area.height < 2 {
-        return;
-    }
-
-    let rule_y = sidebar_area.bottom().saturating_sub(1);
-    let active_tab =
-        workspace_item_area(sidebar_area, workspace_names, active_workspace_index, active_workspace_index);
-    let first_workspace_x =
-        workspace_item_area(sidebar_area, workspace_names, 0, active_workspace_index).x;
-    let rule_end = rule_end_x.max(first_workspace_x).min(sidebar_area.right());
-    let rule_width = rule_end.saturating_sub(first_workspace_x);
-    if rule_width == 0 {
-        return;
-    }
-
-    let tab_dividers =
-        workspace_tab_divider_columns(sidebar_area, workspace_names, active_workspace_index);
-    let active_is_leftmost = active_workspace_index == 0;
-    let active_is_rightmost = active_workspace_index + 1 == workspace_names.len();
-    let mut spans = Vec::with_capacity(rule_width as usize);
-    for offset in 0..rule_width {
-        let x = first_workspace_x.saturating_add(offset);
-        let ch = workspace_tab_rule_char(
-            x,
-            active_tab,
-            active_is_leftmost,
-            active_is_rightmost,
-            &tab_dividers,
-        );
-        let style = workspace_tab_rule_span_style(ch, theme);
-        spans.push(Span::styled(ch.to_string(), style));
-    }
-    f.render_widget(
-        Paragraph::new(Line::from(spans)),
-        Rect {
-            x: first_workspace_x,
-            y: rule_y,
-            width: rule_width,
-            height: 1,
-        },
-    );
-}
-
-fn workspace_row2_tail_x(layout: TopBarLayout) -> u16 {
-    layout
-        .commander_frame
-        .x
-        .saturating_sub(WORKSPACE_ROW2_TAIL_WIDTH.saturating_add(COMMANDER_ROW2_GAP))
-        .saturating_add(COMMANDER_ROW2_SHIFT_RIGHT)
-}
-
-fn workspace_row2_lead_x(layout: TopBarLayout) -> u16 {
-    layout
-        .commander_frame
-        .right()
-        .saturating_add(COMMANDER_ROW2_GAP)
-        .saturating_sub(COMMANDER_ROW2_SHIFT_RIGHT)
-}
-
-fn render_workspace_row2_gap_fill(f: &mut ratatui::Frame<'_>, layout: TopBarLayout, theme: Theme) {
-    if layout.bar.height < 2 {
-        return;
-    }
-    let y = layout.right_cluster_rule_y;
-    let x = layout.workspace_tab_rule_end_x;
-    let width = workspace_row2_tail_x(layout).saturating_sub(x);
-    if width == 0 {
-        return;
-    }
-    let fill = std::iter::repeat_n('─', width as usize).collect::<String>();
-    let style = Style::default().fg(theme.muted).bg(bg_color(theme));
-    f.render_widget(
-        Paragraph::new(fill).style(style),
-        Rect {
-            x,
-            y,
-            width,
-            height: 1,
-        },
-    );
-}
-
-fn render_workspace_row2_tail(f: &mut ratatui::Frame<'_>, layout: TopBarLayout, theme: Theme) {
-    if layout.bar.height < 2 {
-        return;
-    }
-    let y = layout.right_cluster_rule_y;
-    let x = workspace_row2_tail_x(layout);
-    let style = Style::default().fg(theme.muted).bg(bg_color(theme));
-    f.render_widget(
-        Paragraph::new(WORKSPACE_ROW2_TAIL).style(style),
-        Rect {
-            x,
-            y,
-            width: WORKSPACE_ROW2_TAIL_WIDTH,
-            height: 1,
-        },
-    );
-}
-
-fn render_workspace_row2_lead(f: &mut ratatui::Frame<'_>, layout: TopBarLayout, theme: Theme) {
-    if layout.bar.height < 2 {
-        return;
-    }
-    let y = layout.right_cluster_rule_y;
-    let x = workspace_row2_lead_x(layout);
-    let style = Style::default().fg(theme.muted).bg(bg_color(theme));
-    f.render_widget(
-        Paragraph::new(WORKSPACE_ROW2_LEAD).style(style),
-        Rect {
-            x,
-            y,
-            width: WORKSPACE_ROW2_TAIL_WIDTH,
-            height: 1,
-        },
-    );
 }
 
 fn render_commander_frame(
@@ -744,32 +552,6 @@ fn render_commander_frame(
             .alignment(Alignment::Left),
             inner,
         );
-    }
-
-    if frame.height > 1 {
-        let bottom_y = frame.y.saturating_add(1);
-        let bottom_x = frame.x.saturating_add(COMMANDER_ROW2_SHIFT_RIGHT);
-        let bottom_render_width = frame
-            .width
-            .saturating_sub(COMMANDER_ROW2_SHIFT_RIGHT.saturating_mul(2));
-        let bottom_width = bottom_render_width as usize;
-        if bottom_width >= 2 {
-            let dash_count = bottom_width.saturating_sub(2);
-            let mut bottom = String::with_capacity(bottom_width);
-            bottom.push('╰');
-            bottom.extend(std::iter::repeat_n('─', dash_count));
-            bottom.push('╯');
-            let bottom_line = Line::from(Span::styled(bottom, border_style));
-            f.render_widget(
-                Paragraph::new(bottom_line),
-                Rect {
-                    x: bottom_x,
-                    y: bottom_y,
-                    width: bottom_render_width,
-                    height: 1,
-                },
-            );
-        }
     }
 }
 
@@ -1074,7 +856,7 @@ pub(crate) fn workspace_tab_hit_area(
     active_workspace_index: usize,
 ) -> Rect {
     let mut area = workspace_item_area(sidebar_area, workspace_names, index, active_workspace_index);
-    area.height = sidebar_area.height.min(2).max(area.height);
+    area.height = sidebar_area.height.min(1).max(area.height);
     if index > 0 {
         area.x = area.x.saturating_sub(1);
         area.width = area.width.saturating_add(1);
@@ -1212,10 +994,7 @@ pub(crate) fn render_workspace_sidebar(
         theme,
         workspace_names,
         active_workspace_index,
-        layout.workspace_tab_rule_end_x,
     );
-    render_workspace_row2_gap_fill(f, layout, theme);
-    render_workspace_row2_tail(f, layout, theme);
     render_commander_frame(
         f,
         layout,
@@ -1223,11 +1002,6 @@ pub(crate) fn render_workspace_sidebar(
         commander_focused,
         commander_input,
     );
-    render_workspace_row2_lead(f, layout, theme);
-    if commander_focused {
-        render_workspace_row2_tail(f, layout, theme);
-        render_workspace_row2_lead(f, layout, theme);
-    }
 
     let add_area = workspace_add_button_area(sidebar_area, workspace_names, active_workspace_index);
     if add_area.width > 0 && add_area.height > 0 {
@@ -1251,84 +1025,6 @@ pub(crate) fn render_workspace_sidebar(
             },
         );
     }
-}
-
-struct RightClusterSegment {
-    width: u16,
-}
-
-fn right_cluster_segment_widths(usage_summary: Option<&str>) -> Vec<RightClusterSegment> {
-    let app_width = APP_NAME
-        .chars()
-        .count()
-        .saturating_add(1)
-        .saturating_add(APP_VERSION.chars().count()) as u16;
-    let mut segments = vec![RightClusterSegment { width: app_width }];
-    if let Some(usage) = usage_summary.map(str::trim).filter(|t| !t.is_empty()) {
-        segments.push(RightClusterSegment {
-            width: usage.chars().count() as u16,
-        });
-    }
-    segments.push(RightClusterSegment {
-        width: APP_HANDLE.chars().count() as u16,
-    });
-    segments
-}
-
-fn right_cluster_separator_pipe_columns(
-    cluster: Rect,
-    usage_summary: Option<&str>,
-) -> Vec<u16> {
-    let segments = right_cluster_segment_widths(usage_summary);
-    let sep_width = RIGHT_CLUSTER_SEP.chars().count() as u16;
-    const PIPE_OFFSET: u16 = 1;
-
-    let mut x = cluster.x;
-    let mut pipes = Vec::new();
-    for (idx, segment) in segments.iter().enumerate() {
-        x = x.saturating_add(segment.width);
-        if idx + 1 < segments.len() {
-            pipes.push(x.saturating_add(PIPE_OFFSET));
-            x = x.saturating_add(sep_width);
-        }
-    }
-    pipes
-}
-
-fn render_right_cluster_rule(
-    f: &mut ratatui::Frame<'_>,
-    cluster: Rect,
-    rule_y: u16,
-    theme: Theme,
-    usage_summary: Option<&str>,
-) {
-    if cluster.width == 0 {
-        return;
-    }
-
-    let w = cluster.width as usize;
-    if w == 0 {
-        return;
-    }
-
-    let rule_style = Style::default().fg(theme.muted).bg(bg_color(theme));
-    let mut line = vec!['─'; w];
-    for pipe_x in right_cluster_separator_pipe_columns(cluster, usage_summary) {
-        let col = pipe_x.saturating_sub(cluster.x) as usize;
-        if col < w {
-            line[col] = '┴';
-        }
-    }
-
-    f.render_widget(
-        Paragraph::new(line.into_iter().collect::<String>()).style(rule_style),
-        Rect {
-            x: cluster.x,
-            y: rule_y,
-            width: cluster.width,
-            height: 1,
-        },
-    );
 }
 
 pub(crate) fn render_top_chrome(
@@ -1376,18 +1072,6 @@ pub(crate) fn render_top_chrome(
             .alignment(Alignment::Left)
             .style(Style::default().bg(bg_color(theme))),
         cluster,
-    );
-
-    if layout.bar.height < 2 {
-        return;
-    }
-
-    render_right_cluster_rule(
-        f,
-        cluster,
-        layout.right_cluster_rule_y,
-        theme,
-        usage_summary,
     );
 }
 
