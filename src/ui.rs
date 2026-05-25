@@ -12,7 +12,8 @@ pub(crate) fn bg_color(_theme: Theme) -> Color {
 
 use crate::{
     git_status::{truncate_pane_subtitle_body, GitSummary},
-    layout::pane_combobox_dropdown_area,
+    git_worktree::WorktreeInfo,
+    layout::{pane_combobox_dropdown_area, pane_subtitle_combobox_dropdown_area},
     theme::Theme,
     theme::THEMES,
     utils::{contains, LOGIN_SHELL_SENTINEL},
@@ -731,6 +732,24 @@ pub(crate) enum Modal {
         cursor: usize,
         action_index: usize,
     },
+    WorktreePicker {
+        pane_id: usize,
+        folder_name: String,
+        git_summary: GitSummary,
+        entries: Vec<WorktreeInfo>,
+        current_path: Option<std::path::PathBuf>,
+        selected_index: usize,
+        focus: WorktreePickerFocus,
+        branch_name: String,
+        branch_error: Option<String>,
+        cursor: usize,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorktreePickerFocus {
+    List,
+    BranchName,
 }
 
 pub(crate) fn help_modal_area(size: Rect) -> Rect {
@@ -1720,4 +1739,192 @@ pub(crate) fn render_workspace_settings_modal(
         .x
         .saturating_add(cursor.min(name_inner.width.saturating_sub(1) as usize) as u16);
     f.set_cursor(cursor_x, name_inner.y);
+}
+
+pub(crate) fn worktree_picker_item_count(entries: &[WorktreeInfo]) -> usize {
+    1 + entries.len()
+}
+
+pub(crate) fn worktree_picker_modal_height(entries: &[WorktreeInfo], focus: WorktreePickerFocus) -> u16 {
+    match focus {
+        WorktreePickerFocus::List => (worktree_picker_item_count(entries) as u16 + 3).min(16),
+        WorktreePickerFocus::BranchName => 9,
+    }
+}
+
+pub(crate) fn worktree_picker_modal_area(
+    pane_area: Rect,
+    folder_name: &str,
+    git_summary: &GitSummary,
+    entries: &[WorktreeInfo],
+    focus: WorktreePickerFocus,
+) -> Rect {
+    let width = 34.min(pane_area.width);
+    let height = worktree_picker_modal_height(entries, focus).min(pane_area.height);
+    pane_subtitle_combobox_dropdown_area(pane_area, folder_name, Some(git_summary), width, height)
+}
+
+pub(crate) fn worktree_picker_list_area(modal_area: Rect, entries: &[WorktreeInfo]) -> Rect {
+    let inner = Block::default().borders(Borders::ALL).inner(modal_area);
+    Rect {
+        x: inner.x,
+        y: inner.y + 1,
+        width: inner.width,
+        height: worktree_picker_item_count(entries) as u16,
+    }
+}
+
+pub(crate) fn worktree_picker_branch_input_area(modal_area: Rect) -> Rect {
+    let inner = Block::default().borders(Borders::ALL).inner(modal_area);
+    Rect {
+        x: inner.x,
+        y: inner.y + 3,
+        width: inner.width,
+        height: 3,
+    }
+}
+
+pub(crate) fn worktree_picker_list_hit_index(
+    modal_area: Rect,
+    entries: &[WorktreeInfo],
+    x: u16,
+    y: u16,
+) -> Option<usize> {
+    let list_area = worktree_picker_list_area(modal_area, entries);
+    if !contains(list_area, x, y) {
+        return None;
+    }
+    Some((y.saturating_sub(list_area.y) as usize).min(worktree_picker_item_count(entries) - 1))
+}
+
+pub(crate) fn render_worktree_picker_modal(
+    f: &mut ratatui::Frame<'_>,
+    pane_area: Rect,
+    folder_name: &str,
+    git_summary: &GitSummary,
+    theme: Theme,
+    entries: &[WorktreeInfo],
+    current_path: Option<&std::path::Path>,
+    selected_index: usize,
+    focus: WorktreePickerFocus,
+    branch_name: &str,
+    branch_error: Option<&str>,
+    cursor: usize,
+) {
+    let area = worktree_picker_modal_area(pane_area, folder_name, git_summary, entries, focus);
+    f.render_widget(Clear, area);
+
+    let title = match focus {
+        WorktreePickerFocus::List => "─ Worktrees ─",
+        WorktreePickerFocus::BranchName => "─ New Worktree ─",
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(title)
+        .style(Style::default().fg(theme.foreground).bg(bg_color(theme)))
+        .border_style(Style::default().fg(theme.accent));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    match focus {
+        WorktreePickerFocus::List => {
+            let list_area = worktree_picker_list_area(area, entries);
+            let item_count = worktree_picker_item_count(entries);
+            let selected = selected_index.min(item_count.saturating_sub(1));
+            let mut lines = Vec::new();
+
+            for idx in 0..item_count {
+                let marker = if idx == selected { "> " } else { "  " };
+                let label = if idx == 0 {
+                    "New worktree".to_string()
+                } else {
+                    let entry = &entries[idx - 1];
+                    let current = current_path
+                        .is_some_and(|path| crate::git_worktree::paths_equal(path, &entry.path));
+                    let suffix = if current { " (current)" } else { "" };
+                    format!("{} ({}){}", entry.branch, entry.folder_name, suffix)
+                };
+                let style = if idx == selected {
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.foreground)
+                };
+                lines.push(Line::from(vec![Span::styled(
+                    format!("{}{}", marker, label),
+                    style,
+                )]));
+            }
+
+            f.render_widget(
+                Paragraph::new(Text::from(lines))
+                    .style(Style::default().fg(theme.foreground).bg(bg_color(theme)))
+                    .wrap(Wrap { trim: false }),
+                list_area,
+            );
+        }
+        WorktreePickerFocus::BranchName => {
+            let hint = Paragraph::new("Enter: create   Esc: back")
+                .style(Style::default().fg(theme.muted).bg(bg_color(theme)));
+            f.render_widget(
+                hint,
+                Rect {
+                    x: inner.x,
+                    y: inner.y,
+                    width: inner.width,
+                    height: 1,
+                },
+            );
+
+            let label = Paragraph::new("Branch")
+                .style(Style::default().fg(theme.foreground).bg(bg_color(theme)));
+            f.render_widget(
+                label,
+                Rect {
+                    x: inner.x,
+                    y: inner.y + 1,
+                    width: inner.width,
+                    height: 1,
+                },
+            );
+
+            let name_area = worktree_picker_branch_input_area(area);
+            let name_block = Block::default()
+                .borders(Borders::ALL)
+                .style(Style::default().fg(theme.foreground).bg(bg_color(theme)))
+                .border_style(if branch_error.is_some() {
+                    Style::default().fg(Color::Red)
+                } else {
+                    Style::default().fg(theme.accent)
+                });
+            let name_inner = name_block.inner(name_area);
+            f.render_widget(name_block, name_area);
+            f.render_widget(
+                Paragraph::new(branch_name.to_string())
+                    .style(Style::default().fg(theme.foreground).bg(bg_color(theme))),
+                name_inner,
+            );
+
+            if let Some(error) = branch_error {
+                f.render_widget(
+                    Paragraph::new(error).style(Style::default().fg(Color::Red).bg(bg_color(theme))),
+                    Rect {
+                        x: inner.x,
+                        y: name_area.bottom(),
+                        width: inner.width,
+                        height: 1,
+                    },
+                );
+            }
+
+            let cursor_x = name_inner.x.saturating_add(
+                cursor
+                    .min(name_inner.width.saturating_sub(1) as usize)
+                    as u16,
+            );
+            f.set_cursor(cursor_x, name_inner.y);
+        }
+    }
 }

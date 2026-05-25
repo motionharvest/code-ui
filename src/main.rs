@@ -1,5 +1,6 @@
 mod app;
 mod git_status;
+mod git_worktree;
 mod layout;
 mod pane;
 mod theme;
@@ -46,7 +47,8 @@ use ui::{
     commander_input_cursor_position, compute_top_bar_layout, pane_chrome_title_label,
     render_help_modal, render_new_pane_picker_modal, render_panel_settings_modal,
     render_panel_title_chrome, render_theme_modal, render_top_chrome,
-    render_workspace_settings_modal, render_workspace_sidebar, bg_color,
+    render_worktree_picker_modal, render_workspace_settings_modal, render_workspace_sidebar,
+    bg_color,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -266,7 +268,6 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                 }
 
                 let placements = app.pane_placements(App::content_area(f.size()));
-                let preview_pane_ids = app.resize_preview_pane_ids().map(|ids| ids.to_vec());
                 let swap_preview_target = app.pane_swap_preview_target();
                 let modal_is_none = app.modal.is_none();
                 let commander_focused = app.commander_focused();
@@ -286,9 +287,6 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
 
                 for placement in placements {
                     let focused = focused_pane_id == Some(placement.pane_id);
-                    let in_resize_preview = preview_pane_ids
-                        .as_ref()
-                        .is_some_and(|pane_ids| pane_ids.contains(&placement.pane_id));
                     let in_swap_preview = swap_preview_target == Some(placement.pane_id);
                     let Some(pane_index) = app
                         .panes
@@ -322,8 +320,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         continue;
                     }
 
-                    let title_row_selected =
-                        focused || in_resize_preview || in_swap_preview;
+                    let title_row_selected = focused || in_swap_preview;
                     let title_row_color = if title_row_selected {
                         theme.accent
                     } else {
@@ -488,6 +485,39 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                             *cursor,
                             *action_index,
                         ),
+                        ui::Modal::WorktreePicker {
+                            pane_id,
+                            folder_name,
+                            git_summary,
+                            entries,
+                            current_path,
+                            selected_index,
+                            focus,
+                            branch_name,
+                            branch_error,
+                            cursor,
+                        } => {
+                            let (pane_area, _) = app
+                                .pane_placements(App::content_area(f.size()))
+                                .into_iter()
+                                .find(|placement| placement.pane_id == *pane_id)
+                                .map(|placement| (placement.area, ()))
+                                .unwrap_or_else(|| (App::content_area(f.size()), ()));
+                            render_worktree_picker_modal(
+                                f,
+                                pane_area,
+                                folder_name,
+                                git_summary,
+                                theme,
+                                entries,
+                                current_path.as_deref(),
+                                *selected_index,
+                                *focus,
+                                branch_name,
+                                branch_error.as_deref(),
+                                *cursor,
+                            );
+                        }
                     }
                 }
             })?;
@@ -503,6 +533,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         ..
                     })
                     | Some(ui::Modal::WorkspaceSettings { .. })
+                    | Some(ui::Modal::WorktreePicker {
+                        focus: ui::WorktreePickerFocus::BranchName,
+                        ..
+                    })
             );
         if should_show_cursor != cursor_visible {
             if should_show_cursor {

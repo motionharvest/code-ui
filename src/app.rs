@@ -14,6 +14,11 @@ use crossterm::event::{
 use ratatui::layout::{Direction, Rect};
 
 use crate::{
+    git_status::query_git_summary,
+    git_worktree::{
+        branch_base_from_pane_name, create_worktree, git_root, list_worktrees,
+        next_available_branch,
+    },
     layout::{
         adjacent_overlap, load_persisted_layout, pane_inner_area, placement_is_adjacent,
         save_persisted_layout, DebugContainer, DebugPlacement, ExposedSides, Node,
@@ -31,7 +36,9 @@ use crate::{
         compute_top_bar_layout, workspace_add_button_hit, workspace_commander_input_hit,
         workspace_hit_index, workspace_menu_hit_index, workspace_settings_action_hit_index,
         workspace_settings_modal_area, workspace_settings_name_input_area, Modal,
-        PanelSettingsFocus, AGENT_PRESETS, COMMANDER_COMMAND, TOP_CHROME_ROWS,
+        PanelSettingsFocus, WorktreePickerFocus, AGENT_PRESETS, COMMANDER_COMMAND, TOP_CHROME_ROWS,
+        worktree_picker_branch_input_area, worktree_picker_item_count, worktree_picker_list_hit_index,
+        worktree_picker_modal_area,
     },
     utils::{arrow_key_to_split_side, contains, key_to_bytes, LOGIN_SHELL_SENTINEL},
 };
@@ -80,13 +87,12 @@ struct WorkspaceState {
     maximized_pane: Option<usize>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct DragResize {
     pane_a: usize,
     pane_b: usize,
     direction: Direction,
     last_coord: u16,
-    pane_ids: Vec<usize>,
 }
 
 #[derive(Clone)]
@@ -114,7 +120,7 @@ struct ResizeTarget {
     pane_a: usize,
     pane_b: usize,
     direction: Direction,
-    pane_ids: Vec<usize>,
+    focus_pane_id: usize,
 }
 
 struct HitTestCache {
@@ -660,6 +666,23 @@ impl App {
     fn finish_drag_resize(&mut self) {
         self.flush_pending_layout_persist();
         self.rebuild_hit_test_cache();
+        self.sync_pane_sizes_from_layout();
+    }
+
+    fn sync_pane_sizes_from_layout(&mut self) {
+        let content = Self::content_area(self.last_terminal_size);
+        let placements = self
+            .hit_test_cache
+            .as_ref()
+            .filter(|cache| cache.content == content)
+            .map(|cache| cache.placements.clone())
+            .unwrap_or_else(|| self.compute_pane_placements(content));
+        for placement in placements {
+            if let Some(pane) = self.pane_mut(placement.pane_id) {
+                let inner = pane_inner_area(placement.area, placement.exposed);
+                pane.resize(inner.height.max(1), inner.width.max(1));
+            }
+        }
     }
 
     /// Drain PTY output for all panes. Returns true if any pane processed new
@@ -1810,6 +1833,127 @@ impl App {
                     });
                     return Ok(());
                 }
+                Modal::WorktreePicker {
+                    pane_id,
+                    folder_name,
+                    git_summary,
+                    entries,
+                    current_path,
+                    mut selected_index,
+                    mut focus,
+                    mut branch_name,
+                    mut branch_error,
+                    mut cursor,
+                } => {
+                    let item_count = worktree_picker_item_count(&entries);
+                    match key.code {
+                        KeyCode::Esc => {
+                            if focus == WorktreePickerFocus::BranchName {
+                                focus = WorktreePickerFocus::List;
+                                branch_error = None;
+                            } else {
+                                self.modal = None;
+                                return Ok(());
+                            }
+                        }
+                        KeyCode::Up if focus == WorktreePickerFocus::List => {
+                            selected_index = if selected_index == 0 {
+                                item_count.saturating_sub(1)
+                            } else {
+                                selected_index - 1
+                            };
+                        }
+                        KeyCode::Down if focus == WorktreePickerFocus::List => {
+                            selected_index = (selected_index + 1) % item_count.max(1);
+                        }
+                        KeyCode::Backspace if focus == WorktreePickerFocus::BranchName => {
+                            remove_char_before_cursor(&mut branch_name, &mut cursor);
+                            branch_error = None;
+                        }
+                        KeyCode::Delete if focus == WorktreePickerFocus::BranchName => {
+                            remove_char_at_cursor(&mut branch_name, cursor);
+                            branch_error = None;
+                        }
+                        KeyCode::Char(c)
+                            if focus == WorktreePickerFocus::BranchName
+                                && !key.modifiers.contains(KeyModifiers::CONTROL)
+                                && !key.modifiers.contains(KeyModifiers::ALT) =>
+                        {
+                            insert_char_at_cursor(&mut branch_name, &mut cursor, c);
+                            branch_error = None;
+                        }
+                        KeyCode::Left if focus == WorktreePickerFocus::BranchName => {
+                            cursor = cursor.saturating_sub(1);
+                        }
+                        KeyCode::Right if focus == WorktreePickerFocus::BranchName => {
+                            cursor = (cursor + 1).min(branch_name.chars().count());
+                        }
+                        KeyCode::Enter => match focus {
+                            WorktreePickerFocus::List if selected_index == 0 => {
+                                focus = WorktreePickerFocus::BranchName;
+                                branch_error = None;
+                            }
+                            WorktreePickerFocus::List => {
+                                if let Some(entry) = entries.get(selected_index - 1) {
+                                    if let Err(error) =
+                                        self.switch_pane_to_worktree(pane_id, &entry.path)
+                                    {
+                                        branch_error = Some(error.to_string());
+                                    } else {
+                                        self.modal = None;
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                            WorktreePickerFocus::BranchName => {
+                                let branch = branch_name.trim();
+                                if branch.is_empty() {
+                                    branch_error = Some("branch name required".to_string());
+                                } else if let Some(repo_root) = current_path
+                                    .as_ref()
+                                    .and_then(|path| git_root(path))
+                                    .or_else(|| {
+                                        self.panes
+                                            .iter()
+                                            .find(|pane| pane.id == pane_id)
+                                            .and_then(|pane| pane.tmux_pane_path())
+                                            .and_then(|path| git_root(&path))
+                                    })
+                                {
+                                    match create_worktree(&repo_root, branch) {
+                                        Ok(path) => {
+                                            if let Err(error) =
+                                                self.switch_pane_to_worktree(pane_id, &path)
+                                            {
+                                                branch_error = Some(error.to_string());
+                                            } else {
+                                                self.modal = None;
+                                                return Ok(());
+                                            }
+                                        }
+                                        Err(error) => branch_error = Some(error.to_string()),
+                                    }
+                                } else {
+                                    branch_error = Some("git repository not found".to_string());
+                                }
+                            }
+                        },
+                        _ => {}
+                    }
+                    self.modal = Some(Modal::WorktreePicker {
+                        pane_id,
+                        folder_name,
+                        git_summary,
+                        entries,
+                        current_path,
+                        selected_index,
+                        focus,
+                        branch_name,
+                        branch_error,
+                        cursor,
+                    });
+                    return Ok(());
+                }
             }
         }
 
@@ -2134,6 +2278,34 @@ impl App {
                         action_index,
                     });
                 }
+                Modal::WorktreePicker {
+                    pane_id,
+                    folder_name,
+                    git_summary,
+                    entries,
+                    current_path,
+                    selected_index,
+                    focus,
+                    mut branch_name,
+                    branch_error: _,
+                    mut cursor,
+                } if focus == WorktreePickerFocus::BranchName => {
+                    for ch in text.chars() {
+                        insert_char_at_cursor(&mut branch_name, &mut cursor, ch);
+                    }
+                    self.modal = Some(Modal::WorktreePicker {
+                        pane_id,
+                        folder_name,
+                        git_summary,
+                        entries,
+                        current_path,
+                        selected_index,
+                        focus,
+                        branch_name,
+                        branch_error: None,
+                        cursor,
+                    });
+                }
                 other => {
                     self.modal = Some(other);
                 }
@@ -2181,7 +2353,7 @@ impl App {
             self.drag_resize = None;
         }
 
-        if let Some(drag) = self.drag_resize.clone() {
+        if let Some(drag) = self.drag_resize.as_ref() {
             if matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left)) {
                 let coord = match drag.direction {
                     Direction::Vertical => mouse.row,
@@ -2202,13 +2374,9 @@ impl App {
                         side,
                         delta.unsigned_abs() as u16,
                     )?;
-                    self.drag_resize = Some(DragResize {
-                        pane_a: drag.pane_a,
-                        pane_b: drag.pane_b,
-                        direction: drag.direction,
-                        last_coord: coord,
-                        pane_ids: drag.pane_ids,
-                    });
+                    if let Some(drag) = self.drag_resize.as_mut() {
+                        drag.last_coord = coord;
+                    }
                 }
                 return Ok(());
             }
@@ -2443,6 +2611,86 @@ impl App {
                     });
                     return Ok(());
                 }
+                Modal::WorktreePicker {
+                    pane_id,
+                    folder_name,
+                    git_summary,
+                    entries,
+                    current_path,
+                    mut selected_index,
+                    mut focus,
+                    branch_name,
+                    mut branch_error,
+                    mut cursor,
+                } => {
+                    let (pane_area, _) = self
+                        .pane_placements(Self::content_area(size))
+                        .into_iter()
+                        .find(|placement| placement.pane_id == pane_id)
+                        .map(|placement| (placement.area, ()))
+                        .unwrap_or_else(|| (Self::content_area(size), ()));
+                    let area = worktree_picker_modal_area(
+                        pane_area,
+                        &folder_name,
+                        &git_summary,
+                        &entries,
+                        focus,
+                    );
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                        match focus {
+                            WorktreePickerFocus::List => {
+                                if let Some(hit) = worktree_picker_list_hit_index(
+                                    area,
+                                    &entries,
+                                    mouse.column,
+                                    mouse.row,
+                                ) {
+                                    if hit == selected_index {
+                                        if hit == 0 {
+                                            focus = WorktreePickerFocus::BranchName;
+                                            branch_error = None;
+                                        } else if let Some(entry) = entries.get(hit - 1) {
+                                            if let Err(error) =
+                                                self.switch_pane_to_worktree(pane_id, &entry.path)
+                                            {
+                                                branch_error = Some(error.to_string());
+                                            } else {
+                                                self.modal = None;
+                                                return Ok(());
+                                            }
+                                        }
+                                    } else {
+                                        selected_index = hit;
+                                    }
+                                }
+                            }
+                            WorktreePickerFocus::BranchName => {
+                                let name_area = worktree_picker_branch_input_area(area);
+                                let name_inner = ratatui::widgets::Block::default()
+                                    .borders(ratatui::widgets::Borders::ALL)
+                                    .inner(name_area);
+                                if contains(name_inner, mouse.column, mouse.row) {
+                                    let click_col =
+                                        mouse.column.saturating_sub(name_inner.x) as usize;
+                                    cursor = click_col.min(branch_name.chars().count());
+                                }
+                            }
+                        }
+                    }
+                    self.modal = Some(Modal::WorktreePicker {
+                        pane_id,
+                        folder_name,
+                        git_summary,
+                        entries,
+                        current_path,
+                        selected_index,
+                        focus,
+                        branch_name,
+                        branch_error,
+                        cursor,
+                    });
+                    return Ok(());
+                }
             }
         }
 
@@ -2560,7 +2808,7 @@ impl App {
                 || placement.close_hit(mouse.column, mouse.row);
             if !chrome_hit {
                 if let Some(target) = self.resize_target_at(size, mouse.column, mouse.row) {
-                    self.focus_pane(target.pane_a);
+                    self.focus_pane(target.focus_pane_id);
                     self.drag_resize = Some(DragResize {
                         pane_a: target.pane_a,
                         pane_b: target.pane_b,
@@ -2569,7 +2817,6 @@ impl App {
                             Direction::Vertical => mouse.row,
                             Direction::Horizontal => mouse.column,
                         },
-                        pane_ids: target.pane_ids,
                     });
                     return Ok(());
                 }
@@ -2586,6 +2833,37 @@ impl App {
             self.focus_pane(placement.pane_id);
             self.close_pane();
             return Ok(());
+        }
+
+        if clicked {
+            if let Some((folder_name, git_summary)) = self
+                .panes
+                .iter()
+                .find(|pane| pane.id == placement.pane_id)
+                .and_then(|pane| {
+                    pane.tmux_pane_path().and_then(|path| {
+                        query_git_summary(&path).map(|summary| {
+                            (
+                                path.file_name()
+                                    .map(|name| name.to_string_lossy().into_owned())
+                                    .unwrap_or_default(),
+                                summary,
+                            )
+                        })
+                    })
+                })
+            {
+                if placement.subtitle_hit(
+                    &folder_name,
+                    Some(&git_summary),
+                    mouse.column,
+                    mouse.row,
+                ) {
+                    self.focus_pane(placement.pane_id);
+                    self.open_worktree_picker(placement.pane_id);
+                    return Ok(());
+                }
+            }
         }
 
         if clicked && placement.title_hit(&pane_title, was_focused, mouse.column, mouse.row) {
@@ -2810,6 +3088,15 @@ impl App {
     }
 
     pub(crate) fn pane_placements(&self, size: Rect) -> Vec<Placement> {
+        if let Some(cache) = &self.hit_test_cache {
+            if cache.content == size {
+                return cache.placements.clone();
+            }
+        }
+        self.compute_pane_placements(size)
+    }
+
+    fn compute_pane_placements(&self, size: Rect) -> Vec<Placement> {
         if let Some(pane_id) = self.maximized_pane {
             return vec![Placement {
                 pane_id,
@@ -2912,12 +3199,6 @@ impl App {
                 Direction::Vertical => MousePointerShape::VerticalResize,
             })
             .unwrap_or(MousePointerShape::Default)
-    }
-
-    pub(crate) fn resize_preview_pane_ids(&self) -> Option<&[usize]> {
-        self.drag_resize
-            .as_ref()
-            .map(|drag| drag.pane_ids.as_slice())
     }
 
     pub(crate) fn pane_swap_preview_target(&self) -> Option<usize> {
@@ -4474,63 +4755,20 @@ impl App {
 
         let pane_a = *boundary.first_pane_ids.first()?;
         let pane_b = *boundary.second_pane_ids.first()?;
-        let mut pane_ids = boundary.first_pane_ids.clone();
-        pane_ids.extend(boundary.second_pane_ids.iter().copied());
+        let focus_pane_id = resize_focus_pane_at(boundary, x, y)?;
 
         Some(ResizeTarget {
             pane_a,
             pane_b,
             direction: boundary.direction,
-            pane_ids,
+            focus_pane_id,
         })
     }
 
     fn rebuild_hit_test_cache(&mut self) {
         let content = Self::content_area(self.last_terminal_size);
-        let placements = if let Some(pane_id) = self.maximized_pane {
-            vec![Placement {
-                pane_id,
-                area: content,
-                exposed: ExposedSides {
-                    top: true,
-                    bottom: true,
-                    left: true,
-                    right: true,
-                },
-            }]
-        } else if self.debug_container_boxes {
-            self.debug_layout_areas(content)
-                .1
-                .into_iter()
-                .map(|placement| Placement {
-                    pane_id: placement.pane_id,
-                    area: placement.pane_area,
-                    exposed: ExposedSides {
-                        top: true,
-                        bottom: true,
-                        left: true,
-                        right: true,
-                    },
-                })
-                .collect()
-        } else {
-            self.pane_placements(content)
-        };
-
-        let mut row_candidates = vec![Vec::new(); content.height as usize];
-        for (idx, placement) in placements.iter().enumerate() {
-            let start = placement.area.y.saturating_sub(content.y) as usize;
-            let end = placement
-                .area
-                .bottom()
-                .saturating_sub(content.y)
-                .min(content.height) as usize;
-            for row in start..end {
-                if let Some(bucket) = row_candidates.get_mut(row) {
-                    bucket.push(idx);
-                }
-            }
-        }
+        let placements = self.hit_test_placements_for(content);
+        let row_candidates = build_row_candidates(content, &placements);
 
         let mut resize_boundaries = Vec::new();
         if self.maximized_pane.is_none() {
@@ -4549,6 +4787,54 @@ impl App {
             row_candidates,
             resize_boundaries,
         });
+    }
+
+    fn refresh_hit_test_placements(&mut self) {
+        let content = Self::content_area(self.last_terminal_size);
+        let placements = self.hit_test_placements_for(content);
+        let row_candidates = build_row_candidates(content, &placements);
+
+        match &mut self.hit_test_cache {
+            Some(cache) => {
+                cache.content = content;
+                cache.placements = placements;
+                cache.row_candidates = row_candidates;
+            }
+            None => self.rebuild_hit_test_cache(),
+        }
+    }
+
+    fn hit_test_placements_for(&self, content: Rect) -> Vec<Placement> {
+        if let Some(pane_id) = self.maximized_pane {
+            return vec![Placement {
+                pane_id,
+                area: content,
+                exposed: ExposedSides {
+                    top: true,
+                    bottom: true,
+                    left: true,
+                    right: true,
+                },
+            }];
+        }
+        if self.debug_container_boxes {
+            return self
+                .debug_layout_areas(content)
+                .1
+                .into_iter()
+                .map(|placement| Placement {
+                    pane_id: placement.pane_id,
+                    area: placement.pane_area,
+                    exposed: ExposedSides {
+                        top: true,
+                        bottom: true,
+                        left: true,
+                        right: true,
+                    },
+                })
+                .collect();
+        }
+        self.compute_pane_placements(content)
     }
 
     fn resize_between_panes(
@@ -4570,7 +4856,7 @@ impl App {
 
         if ok {
             self.pending_layout_persist = true;
-            self.resize(size.height, size.width);
+            self.refresh_hit_test_placements();
         }
         Ok(())
     }
@@ -4629,6 +4915,56 @@ impl App {
             name_error: None,
             agent_index,
         });
+    }
+
+    fn open_worktree_picker(&mut self, pane_id: usize) {
+        let Some(pane) = self.panes.iter().find(|pane| pane.id == pane_id) else {
+            return;
+        };
+        let Some(current_path) = pane.tmux_pane_path() else {
+            return;
+        };
+        let Some(repo_root) = git_root(&current_path) else {
+            return;
+        };
+        let Some(git_summary) = query_git_summary(&current_path) else {
+            return;
+        };
+        let folder_name = current_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if folder_name.is_empty() {
+            return;
+        }
+
+        let entries = list_worktrees(&repo_root);
+        let branch_name = next_available_branch(&repo_root, &branch_base_from_pane_name(&pane.title));
+        let cursor = branch_name.chars().count();
+        self.modal = Some(Modal::WorktreePicker {
+            pane_id,
+            folder_name,
+            git_summary,
+            entries,
+            current_path: Some(current_path),
+            selected_index: 0,
+            focus: WorktreePickerFocus::List,
+            branch_name,
+            branch_error: None,
+            cursor,
+        });
+    }
+
+    fn switch_pane_to_worktree(
+        &mut self,
+        pane_id: usize,
+        path: &Path,
+    ) -> anyhow::Result<()> {
+        let pane = self
+            .pane_mut(pane_id)
+            .ok_or_else(|| anyhow::anyhow!("pane not found"))?;
+        pane.change_directory(path)?;
+        Ok(())
     }
 }
 
@@ -6201,6 +6537,56 @@ fn parse_bool_env_with_default(name: &str, default: bool) -> bool {
             matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
         })
         .unwrap_or(default)
+}
+
+fn build_row_candidates(content: Rect, placements: &[Placement]) -> Vec<Vec<usize>> {
+    let mut row_candidates = vec![Vec::new(); content.height as usize];
+    for (idx, placement) in placements.iter().enumerate() {
+        let start = placement.area.y.saturating_sub(content.y) as usize;
+        let end = placement
+            .area
+            .bottom()
+            .saturating_sub(content.y)
+            .min(content.height) as usize;
+        for row in start..end {
+            if let Some(bucket) = row_candidates.get_mut(row) {
+                bucket.push(idx);
+            }
+        }
+    }
+    row_candidates
+}
+
+fn resize_focus_pane_at(boundary: &ResizeBoundary, x: u16, y: u16) -> Option<usize> {
+    let first = *boundary.first_pane_ids.last()?;
+    let second = *boundary.second_pane_ids.first()?;
+
+    let pick_first = match boundary.direction {
+        Direction::Horizontal => {
+            let first_edge_x = boundary.first_area.right().saturating_sub(1);
+            if x == first_edge_x {
+                true
+            } else if let Some(divider) = boundary.divider_area {
+                contains(divider, x, y)
+                    && x < divider.x.saturating_add(divider.width / 2)
+            } else {
+                false
+            }
+        }
+        Direction::Vertical => {
+            let first_edge_y = boundary.first_area.bottom().saturating_sub(1);
+            if y == first_edge_y {
+                true
+            } else if let Some(divider) = boundary.divider_area {
+                contains(divider, x, y)
+                    && y < divider.y.saturating_add(divider.height / 2)
+            } else {
+                false
+            }
+        }
+    };
+
+    Some(if pick_first { first } else { second })
 }
 
 fn resize_boundary_hit(boundary: &ResizeBoundary, x: u16, y: u16) -> bool {

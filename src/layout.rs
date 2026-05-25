@@ -6,6 +6,7 @@ use ratatui::{
 };
 
 use crate::{
+    git_status::GitSummary,
     pane::Pane,
     ui::{truncate_to_width, AGENT_PRESETS},
 };
@@ -48,6 +49,7 @@ pub(crate) struct PersistedLayout {
     pub(crate) scroll_offsets: BTreeMap<usize, usize>,
 }
 
+#[derive(Clone)]
 pub(crate) struct Placement {
     pub(crate) pane_id: usize,
     pub(crate) area: Rect,
@@ -223,6 +225,96 @@ pub(crate) fn pane_inner_area(area: Rect, exposed: ExposedSides) -> Rect {
     }
 }
 
+pub(crate) fn pane_subtitle_hit_area(
+    area: Rect,
+    folder_name: &str,
+    git_summary: Option<&GitSummary>,
+    show_right_edge: bool,
+) -> Option<Rect> {
+    if folder_name.is_empty() || area.height <= PANE_TITLE_BAR_HEIGHT {
+        return None;
+    }
+
+    let title_y = pane_title_y(area);
+    let subtitle_y = title_y.saturating_add(1);
+    if subtitle_y >= area.bottom() {
+        return None;
+    }
+
+    let bar_width = area.width.saturating_sub(1);
+    if bar_width <= PANE_TITLE_LEFT_PADDING {
+        return None;
+    }
+
+    let available = bar_width.saturating_sub(pane_title_chrome_reserve(area.width, show_right_edge));
+    if available <= PANE_TITLE_LEFT_PADDING {
+        return None;
+    }
+
+    let text_area_width = available.saturating_sub(PANE_TITLE_LEFT_PADDING);
+    if text_area_width <= PANE_TITLE_TEXT_PADDING.saturating_mul(2) {
+        return None;
+    }
+
+    let title_max = text_area_width
+        .saturating_sub(PANE_TITLE_TEXT_PADDING.saturating_mul(2)) as usize;
+    let subtitle_body =
+        crate::git_status::truncate_pane_subtitle_body(folder_name, git_summary, title_max);
+    if subtitle_body.is_empty() {
+        return None;
+    }
+
+    let subtitle_width = subtitle_body
+        .chars()
+        .count()
+        .saturating_add(PANE_TITLE_TEXT_PADDING as usize * 2) as u16;
+
+    Some(Rect {
+        x: area.x.saturating_add(PANE_TITLE_LEFT_PADDING),
+        y: subtitle_y,
+        width: subtitle_width.min(text_area_width),
+        height: 1,
+    })
+}
+
+/// Position a modal directly under the pane subtitle (git folder badge).
+pub(crate) fn pane_subtitle_combobox_dropdown_area(
+    pane_area: Rect,
+    folder_name: &str,
+    git_summary: Option<&GitSummary>,
+    modal_width: u16,
+    modal_height: u16,
+) -> Rect {
+    if pane_area.width == 0 || pane_area.height == 0 {
+        return pane_area;
+    }
+
+    let subtitle_hit = pane_subtitle_hit_area(pane_area, folder_name, git_summary, true);
+    let anchor_x = subtitle_hit
+        .map(|area| area.x)
+        .unwrap_or_else(|| pane_area.x.saturating_add(1 + PANE_TITLE_LEFT_PADDING));
+    let anchor_width = subtitle_hit.map(|area| area.width).unwrap_or(modal_width);
+
+    let width = modal_width.max(anchor_width).min(pane_area.width);
+    let max_height = pane_area
+        .height
+        .saturating_sub(PANE_TITLE_BAR_HEIGHT.min(pane_area.height));
+    let height = modal_height.min(max_height).max(1);
+
+    let y = pane_area
+        .y
+        .saturating_add(PANE_TITLE_BAR_HEIGHT.min(pane_area.height));
+    let x = anchor_x.min(pane_area.right().saturating_sub(width));
+    let y = y.min(pane_area.bottom().saturating_sub(height));
+
+    Rect {
+        x,
+        y,
+        width,
+        height,
+    }
+}
+
 /// Position a modal directly under the pane title bar, aligned with the title text.
 pub(crate) fn pane_combobox_dropdown_area(
     pane_area: Rect,
@@ -304,6 +396,17 @@ pub(crate) fn pane_title_hit_area(area: Rect, title: &str, show_right_edge: bool
 impl Placement {
     pub(crate) fn title_hit(&self, title: &str, _focused: bool, x: u16, y: u16) -> bool {
         pane_title_hit_area(self.area, title, !self.exposed.right)
+            .is_some_and(|area| contains(area, x, y))
+    }
+
+    pub(crate) fn subtitle_hit(
+        &self,
+        folder_name: &str,
+        git_summary: Option<&GitSummary>,
+        x: u16,
+        y: u16,
+    ) -> bool {
+        pane_subtitle_hit_area(self.area, folder_name, git_summary, !self.exposed.right)
             .is_some_and(|area| contains(area, x, y))
     }
 

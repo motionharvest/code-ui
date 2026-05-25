@@ -294,6 +294,14 @@ impl Pane {
         Ok(())
     }
 
+    pub(crate) fn change_directory(&mut self, path: &std::path::Path) -> anyhow::Result<()> {
+        let quoted = shell_quote(&path.to_string_lossy());
+        let cmd = format!("cd {quoted}");
+        self.send(cmd.as_bytes())?;
+        self.send(&[b'\r'])?;
+        Ok(())
+    }
+
     pub(crate) fn tmux_pane_path(&self) -> Option<std::path::PathBuf> {
         let output = Command::new("tmux")
             .args([
