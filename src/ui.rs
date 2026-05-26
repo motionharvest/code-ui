@@ -24,11 +24,127 @@ use crate::{
 };
 
 pub(crate) fn pane_chrome_title_label(pane_title: &str, command: &str) -> String {
-    format!("{} [{}]", pane_title, agent_label_for_command(command))
+    format!("{} {{{}}}", pane_title, agent_label_for_command(command))
 }
 
 pub(crate) fn commander_chrome_title_label() -> String {
-    "Commander [harness]".to_string()
+    "Commander {harness}".to_string()
+}
+
+fn pane_title_body_spans(
+    title: &str,
+    title_row_style: Style,
+    title_row_selected: bool,
+    theme: Theme,
+) -> Vec<Span<'static>> {
+    let accent_style = Style::default().fg(theme.accent).bg(bg_color(theme));
+    let muted_style = Style::default().fg(theme.muted).bg(bg_color(theme));
+    let brace_style = if title_row_selected {
+        accent_style
+    } else {
+        muted_style
+    };
+
+    if let Some(open_brace) = title.rfind(" {") {
+        let type_start = open_brace + 2;
+        if title.ends_with('}') && type_start < title.len() {
+            let type_end = title.len() - 1;
+            return vec![
+                Span::styled(title[..open_brace].to_string(), title_row_style),
+                Span::styled(" ".to_string(), title_row_style),
+                Span::styled("{".to_string(), brace_style),
+                Span::styled(title[type_start..type_end].to_string(), muted_style),
+                Span::styled("}".to_string(), brace_style),
+            ];
+        }
+    }
+
+    vec![Span::styled(title.to_string(), title_row_style)]
+}
+
+fn pane_bottom_line(bottom_width: usize) -> String {
+    match bottom_width {
+        0 => String::new(),
+        1 => "╰".to_string(),
+        2 => "╰╯".to_string(),
+        width => {
+            let mut line = String::with_capacity(width);
+            line.push('╰');
+            line.extend(std::iter::repeat_n('─', width - 2));
+            line.push('╯');
+            line
+        }
+    }
+}
+
+fn render_screen_edges(
+    f: &mut ratatui::Frame<'_>,
+    panel_area: Rect,
+    title_y: u16,
+    edge_style: Style,
+    touches_outer_left: bool,
+    touches_outer_right: bool,
+    touches_outer_bottom: bool,
+) {
+    if panel_area.width == 0 || panel_area.height == 0 {
+        return;
+    }
+
+    let bottom_y = panel_area.bottom().saturating_sub(1);
+    // Start below the top title row (`╭─` occupies row 0); Commander's second
+    // title row still needs the screen-edge verticals.
+    let vertical_top = title_y.saturating_add(1);
+    let vertical_bottom = if touches_outer_bottom {
+        bottom_y.saturating_sub(1)
+    } else {
+        bottom_y
+    };
+
+    if vertical_top <= vertical_bottom {
+        let vertical_height = vertical_bottom.saturating_sub(vertical_top) + 1;
+        if touches_outer_left {
+            let column = "│\n".repeat(vertical_height.saturating_sub(1) as usize) + "│";
+            f.render_widget(
+                Paragraph::new(column)
+                    .alignment(Alignment::Left)
+                    .style(edge_style),
+                Rect {
+                    x: panel_area.x,
+                    y: vertical_top,
+                    width: 1,
+                    height: vertical_height,
+                },
+            );
+        }
+        if touches_outer_right {
+            let column = "│\n".repeat(vertical_height.saturating_sub(1) as usize) + "│";
+            f.render_widget(
+                Paragraph::new(column)
+                    .alignment(Alignment::Left)
+                    .style(edge_style),
+                Rect {
+                    x: panel_area.right().saturating_sub(1),
+                    y: vertical_top,
+                    width: 1,
+                    height: vertical_height,
+                },
+            );
+        }
+    }
+
+    if touches_outer_bottom && panel_area.width >= 1 {
+        f.render_widget(
+            Paragraph::new(pane_bottom_line(panel_area.width as usize))
+                .alignment(Alignment::Left)
+                .style(edge_style),
+            Rect {
+                x: panel_area.x,
+                y: bottom_y,
+                width: panel_area.width,
+                height: 1,
+            },
+        );
+    }
 }
 
 /// Title bar chrome shared by workspace panes (single row) and Commander (two rows).
@@ -48,6 +164,7 @@ pub(crate) fn render_panel_title_chrome(
     is_maximized: bool,
     show_right_edge: bool,
     show_bottom_edge: bool,
+    show_left_edge: bool,
 ) {
     use crate::layout::{
         pane_title_bar_area, pane_title_chrome_reserve, pane_title_controls_icons_area,
@@ -74,7 +191,6 @@ pub(crate) fn render_panel_title_chrome(
 
         if text_width > PANE_TITLE_TEXT_PADDING.saturating_mul(2) {
             let rule_glyph = if title_row_selected { '═' } else { '─' };
-            let corner_glyph = if title_row_selected { '╕' } else { '┐' };
 
             f.render_widget(
                 Paragraph::new(Line::from(vec![
@@ -113,10 +229,13 @@ pub(crate) fn render_panel_title_chrome(
                 text_x.saturating_add(title_content_width as u16 + TITLE_RULE_GAP);
 
             if inline_subtitle {
-                let mut spans = vec![
-                    Span::raw(" "),
-                    Span::styled(title_layout.title_body.clone(), title_row_style),
-                ];
+                let mut spans = vec![Span::raw(" ")];
+                spans.extend(pane_title_body_spans(
+                    &title_layout.title_body,
+                    title_row_style,
+                    title_row_selected,
+                    theme,
+                ));
                 if let Some((icon, name, branch_tail, git_color, subpath_tail)) =
                     title_layout.subtitle
                 {
@@ -151,11 +270,15 @@ pub(crate) fn render_panel_title_chrome(
                 );
             } else {
                 let title_body = truncate_to_width(title, title_max);
-                let title_text = format!(" {title_body}");
+                let mut spans = vec![Span::raw(" ")];
+                spans.extend(pane_title_body_spans(
+                    &title_body,
+                    title_row_style,
+                    title_row_selected,
+                    theme,
+                ));
                 f.render_widget(
-                    Paragraph::new(title_text)
-                        .alignment(Alignment::Left)
-                        .style(title_row_style),
+                    Paragraph::new(Line::from(spans)).alignment(Alignment::Left),
                     Rect {
                         x: text_x,
                         y: title_y,
@@ -171,11 +294,7 @@ pub(crate) fn render_panel_title_chrome(
                 {
                     let maximize_icon = if is_maximized { "🗗" } else { "⛶" };
                     let pad = " ".repeat(PANE_CONTROLS_PADDING as usize);
-                    let controls_text = if show_right_edge {
-                        format!("{pad}{maximize_icon}{pad}✕{pad}")
-                    } else {
-                        format!("{pad}{maximize_icon}{pad}✕")
-                    };
+                    let controls_text = format!("{pad}{maximize_icon}{pad}✕{pad}");
 
                     let bar_start = title_rule_start;
                     let bar_width = icons_area.x.saturating_sub(bar_start);
@@ -205,7 +324,7 @@ pub(crate) fn render_panel_title_chrome(
                         pane_title_top_right_corner_area(panel_area, show_right_edge)
                     {
                         f.render_widget(
-                            Paragraph::new(corner_glyph.to_string())
+                            Paragraph::new("─╮")
                                 .alignment(Alignment::Left)
                                 .style(title_row_style),
                             corner_area,
@@ -217,20 +336,25 @@ pub(crate) fn render_panel_title_chrome(
     }
 
     if panel_area.width > 0 && panel_area.height > 0 {
-        let bottom_y = panel_area.bottom().saturating_sub(1);
+        let touches_outer_bottom = !show_bottom_edge;
+        let touches_outer_left = !show_left_edge;
+        let touches_outer_right = !show_right_edge;
+
+        if touches_outer_left || touches_outer_right || touches_outer_bottom {
+            render_screen_edges(
+                f,
+                panel_area,
+                title_y,
+                edge_style,
+                touches_outer_left,
+                touches_outer_right,
+                touches_outer_bottom,
+            );
+        }
+
         if show_bottom_edge && panel_area.width >= 2 {
-            let bottom_width = panel_area.width as usize;
-            let mut bottom_line = String::with_capacity(bottom_width);
-            bottom_line.push('╰');
-            let dash_count = if show_right_edge {
-                bottom_width.saturating_sub(2)
-            } else {
-                bottom_width.saturating_sub(1)
-            };
-            bottom_line.extend(std::iter::repeat_n('─', dash_count));
-            if show_right_edge {
-                bottom_line.push('╯');
-            }
+            let bottom_y = panel_area.bottom().saturating_sub(1);
+            let bottom_line = pane_bottom_line(panel_area.width as usize);
             f.render_widget(
                 Paragraph::new(bottom_line)
                     .alignment(Alignment::Left)
@@ -242,7 +366,8 @@ pub(crate) fn render_panel_title_chrome(
                     height: 1,
                 },
             );
-        } else if show_right_edge {
+        } else if show_right_edge && panel_area.width < 2 {
+            let bottom_y = panel_area.bottom().saturating_sub(1);
             f.render_widget(
                 Paragraph::new("│")
                     .alignment(Alignment::Left)
@@ -259,7 +384,7 @@ pub(crate) fn render_panel_title_chrome(
 }
 
 pub(crate) const COMMANDER_COMMAND: &str = "commander";
-const PANE_TITLE_CORNER_ICON: char = '\u{ea8b}';
+const PANE_TITLE_CORNER_ICON: char = '\u{F04FD}';
 pub(crate) const TOP_CHROME_ROWS: u16 = 1;
 const RIGHT_CLUSTER_SEP: &str = " │ ";
 const APP_NAME: &str = "Code UI";

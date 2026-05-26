@@ -234,27 +234,17 @@ pub(crate) const PANE_TITLE_TEXT_PADDING: u16 = 1;
 pub(crate) const PANE_TITLE_LEFT_PADDING: u16 = 4;
 pub(crate) const PANE_CONTROLS_PADDING: u16 = 1;
 const PANE_CONTROL_ICON_COLUMNS: u16 = 1;
-const PANE_CONTROLS_CORNER_COLUMNS: u16 = 1;
+const PANE_CONTROLS_CORNER_COLUMNS: u16 = 2;
 const PANE_CONTROLS_MIN_WIDTH: u16 = 11;
 
-pub(crate) fn pane_title_controls_icons_width(show_right_edge: bool) -> u16 {
-    let trailing_pad = if show_right_edge {
-        PANE_CONTROLS_PADDING
-    } else {
-        0
-    };
+pub(crate) fn pane_title_controls_icons_width(_show_right_edge: bool) -> u16 {
     PANE_CONTROLS_PADDING
-        .saturating_mul(2)
+        .saturating_mul(3)
         .saturating_add(PANE_CONTROL_ICON_COLUMNS.saturating_mul(2))
-        .saturating_add(trailing_pad)
 }
 
-pub(crate) fn pane_title_controls_width(show_right_edge: bool) -> u16 {
-    pane_title_controls_icons_width(show_right_edge).saturating_add(if show_right_edge {
-        PANE_CONTROLS_CORNER_COLUMNS
-    } else {
-        0
-    })
+pub(crate) fn pane_title_controls_width(_show_right_edge: bool) -> u16 {
+    pane_title_controls_icons_width(false).saturating_add(PANE_CONTROLS_CORNER_COLUMNS)
 }
 
 pub(crate) fn pane_title_controls_area(area: Rect, show_right_edge: bool) -> Option<Rect> {
@@ -281,13 +271,10 @@ pub(crate) fn pane_title_controls_icons_area(area: Rect, show_right_edge: bool) 
 }
 
 pub(crate) fn pane_title_top_right_corner_area(area: Rect, show_right_edge: bool) -> Option<Rect> {
-    if !show_right_edge {
-        return None;
-    }
     pane_title_controls_area(area, show_right_edge).map(|controls| Rect {
-        x: controls.right().saturating_sub(1),
+        x: controls.right().saturating_sub(PANE_CONTROLS_CORNER_COLUMNS),
         y: controls.y,
-        width: 1,
+        width: PANE_CONTROLS_CORNER_COLUMNS,
         height: 1,
     })
 }
@@ -356,7 +343,7 @@ pub(crate) fn pane_inner_area(area: Rect, exposed: ExposedSides, is_commander: b
         1 + PANE_INNER_MARGIN
     };
     let top_chrome = pane_title_bar_height(is_commander);
-    let bottom_chrome = u16::from(!exposed.bottom);
+    let bottom_chrome = 1;
     Rect {
         x: area.x.saturating_add(left_inset),
         y: area.y.saturating_add(top_chrome),
@@ -1934,7 +1921,7 @@ mod tests {
     use ratatui::widgets::Borders;
 
     #[test]
-    fn pane_close_button_sits_on_last_column_when_touching_outer_edge() {
+    fn pane_close_button_on_outer_right_edge_leaves_room_for_corner_tail() {
         let area = Rect {
             x: 10,
             y: 0,
@@ -1942,7 +1929,9 @@ mod tests {
             height: 20,
         };
         let close = pane_close_button_area(area, false).expect("close button area");
-        assert_eq!(close.x, area.right().saturating_sub(1));
+        assert_eq!(close.x, area.right().saturating_sub(4));
+        assert_eq!(pane_title_controls_width(false), 7);
+        assert_eq!(pane_title_controls_width(true), 7);
     }
 
     #[test]
@@ -1953,7 +1942,7 @@ mod tests {
         let area = pane_combobox_dropdown_area(
             pane_area,
             frame,
-            "Pane [Terminal]",
+            "Pane {Terminal}",
             26,
             desired_height,
             PANE_TITLE_BAR_HEIGHT,
@@ -1972,9 +1961,9 @@ mod tests {
             height: 20,
         };
         let close = pane_close_button_area(area, true).expect("close button area");
-        assert_eq!(close.x, area.right().saturating_sub(3));
-        assert_eq!(pane_title_controls_width(true), 6);
-        assert_eq!(pane_title_controls_width(false), 4);
+        assert_eq!(close.x, area.right().saturating_sub(4));
+        assert_eq!(pane_title_controls_width(true), 7);
+        assert_eq!(pane_title_controls_width(false), 7);
     }
 
     #[test]

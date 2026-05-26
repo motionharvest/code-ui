@@ -349,14 +349,14 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                     }
 
                     let title_row_selected = focused || in_swap_preview;
-                    let title_row_color = if title_row_selected {
+                    let outline_color = if title_row_selected {
                         theme.accent
                     } else {
                         theme.muted
                     };
                     let title_row_style =
-                        Style::default().fg(title_row_color).bg(bg_color(theme));
-                    let edge_style = Style::default().fg(theme.muted).bg(bg_color(theme));
+                        Style::default().fg(outline_color).bg(bg_color(theme));
+                    let edge_style = title_row_style;
 
                     let block = Block::default()
                         .borders(pane_borders(placement.exposed))
@@ -402,6 +402,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         is_maximized,
                         !placement.exposed.right,
                         !placement.exposed.bottom,
+                        !placement.exposed.left,
                     );
 
                     let inner = pane_inner_area(pane_area, placement.exposed, is_commander);

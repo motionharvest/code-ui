@@ -34,7 +34,7 @@ use crate::{
         panel_settings_agent_list_area, panel_settings_cancel_button_area,
         panel_settings_close_button_area, panel_settings_confirm_button_area,
         panel_settings_modal_area, panel_settings_modal_inner, panel_settings_name_input_area,
-        compute_top_bar_layout, workspace_add_button_hit,
+        workspace_add_button_hit,
         workspace_hit_index, workspace_menu_hit_index, workspace_settings_action_hit_index,
         workspace_settings_modal_area, workspace_settings_name_input_area, Modal,
         PanelSettingsFocus, WorktreePickerFocus, AGENT_PRESETS, COMMANDER_COMMAND, TOP_CHROME_ROWS,
@@ -542,15 +542,37 @@ impl App {
         Ok(app)
     }
 
+    fn commander_pane_id(&self) -> Option<usize> {
+        self.panes
+            .iter()
+            .find(|pane| pane.command == COMMANDER_COMMAND)
+            .map(|pane| pane.id)
+    }
+
     fn commander_pane_id_in_layout(&self, layout: &Node) -> Option<usize> {
-        let mut ids = Vec::new();
-        layout.collect_leaf_ids(&mut ids);
-        ids.into_iter()
-            .find(|&id| self.pane_is_commander(id))
+        self.commander_pane_id()
+            .filter(|&id| layout.contains_pane_id(id))
     }
 
     fn commander_pane_id_for_active_layout(&self) -> Option<usize> {
         self.commander_pane_id_in_layout(&self.layout)
+    }
+
+    fn commander_has_prior_session(&self) -> bool {
+        self.commander.pending_plan.is_some()
+            || !matches!(self.commander.phase, CommanderPhase::Discussing)
+            || !self.commander.input.is_empty()
+            || self.commander.history.len() > 3
+    }
+
+    fn preferred_new_pane_agent_index(&self, pane_id: usize, fallback: usize) -> usize {
+        let commander_idx = agent_index_for_command(COMMANDER_COMMAND);
+        if self.commander_has_prior_session()
+            && self.agent_available_for_pane(pane_id, commander_idx)
+        {
+            return commander_idx;
+        }
+        self.first_available_agent_for_pane(pane_id, fallback)
     }
 
     pub(crate) fn body_area(size: Rect) -> Rect {
@@ -569,16 +591,6 @@ impl App {
 
     pub(crate) fn content_area(size: Rect) -> Rect {
         Self::body_area(size)
-    }
-
-    fn top_bar_layout(&self, size: Rect, usage_summary: Option<&str>) -> crate::ui::TopBarLayout {
-        let workspace_names = self.workspace_names();
-        compute_top_bar_layout(
-            size,
-            &workspace_names,
-            self.active_workspace_index(),
-            usage_summary,
-        )
     }
 
     pub(crate) fn workspace_names(&self) -> Vec<String> {
@@ -1352,9 +1364,7 @@ impl App {
     }
 
     pub(crate) fn close_pane(&mut self) {
-        if self.pane_is_commander(self.focused) {
-            return;
-        }
+        let closing_commander = self.pane_is_commander(self.focused);
         let mut current_workspace_panes = Vec::new();
         self.layout.collect_leaf_ids(&mut current_workspace_panes);
         if current_workspace_panes.len() <= 1 {
@@ -1372,6 +1382,9 @@ impl App {
 
         self.panes[pos].terminate_session();
         self.panes.remove(pos);
+        if closing_commander {
+            self.on_commander_pane_closed();
+        }
         self.focus_pane(next_focus);
         for (workspace_index, workspace) in self.workspaces.iter_mut().enumerate() {
             if workspace_index == self.active_workspace
@@ -1432,21 +1445,43 @@ impl App {
 
         let was_commander = self.pane_is_commander(pane_id);
 
-        let (rows, cols, title_changed, needs_session) = {
+        let (rows, cols, title_changed, needs_session, current_path, launch_in_place) = {
             let pane = &self.panes[pos];
+            let needs_session = panel_settings_needs_session(
+                &pane.command,
+                pane.exited,
+                pane.is_stub(),
+                &command,
+                force_session,
+            );
+            let launch_in_place = should_launch_agent_in_placeholder_shell(
+                &pane.command,
+                pane.exited,
+                pane.is_stub(),
+                &command,
+            );
+            let current_path = if needs_session && !pane.is_stub() {
+                pane.tmux_pane_path()
+            } else {
+                None
+            };
             (
                 pane.rows,
                 pane.cols,
                 pane.title != name,
-                panel_settings_needs_session(
-                    &pane.command,
-                    pane.exited,
-                    pane.is_stub(),
-                    &command,
-                    force_session,
-                ),
+                needs_session,
+                current_path,
+                launch_in_place,
             )
         };
+
+        if launch_in_place {
+            self.panes[pos].title = name;
+            self.panes[pos].launch_agent_command(&command)?;
+            self.focus_pane(pane_id);
+            self.persist_layout();
+            return Ok(());
+        }
 
         if !needs_session {
             if title_changed {
@@ -1468,8 +1503,16 @@ impl App {
         } else {
             Pane::new(pane_id, name, command, None, None, rows, cols, None)?
         };
+        if let (Some(path), Some(pane)) = (current_path.as_deref(), self.pane_mut(pane_id)) {
+            if !pane.is_stub() {
+                let _ = pane.change_directory_for_open(path);
+            }
+        }
         if was_commander && !switching_to_commander {
             self.stop_commander_palette_video();
+        }
+        if switching_to_commander {
+            self.commander_sync_scroll_after_history_change();
         }
         self.focus_pane(pane_id);
         self.persist_layout();
@@ -2167,7 +2210,7 @@ impl App {
                     .map(|pane| pane.title.clone())
                     .unwrap_or_else(|| format!("Pane {}", pane_id + 1));
                 let agent_index =
-                    self.first_available_agent_for_pane(pane_id, self.default_agent_index);
+                    self.preferred_new_pane_agent_index(pane_id, self.default_agent_index);
                 self.modal = Some(Modal::NewPanePicker {
                     pane_id,
                     source_pane_id,
@@ -3199,6 +3242,11 @@ impl App {
         if !self.command_available_for_pane(new_id, command) {
             anyhow::bail!("selected type is unavailable")
         }
+        let source_path = self
+            .panes
+            .iter()
+            .find(|pane| pane.id == pane_id && !pane.is_stub())
+            .and_then(|pane| pane.tmux_pane_path());
         self.next_pane_id = self.next_pane_id.saturating_add(1);
 
         let title = if command == COMMANDER_COMMAND {
@@ -3216,6 +3264,11 @@ impl App {
         }
 
         if self.layout.split_leaf(pane_id, side, new_id) {
+            if let (Some(path), Some(pane)) = (source_path.as_deref(), self.pane_mut(new_id)) {
+                if !pane.is_stub() {
+                    let _ = pane.change_directory_for_open(path);
+                }
+            }
             self.resize(terminal_size.height, terminal_size.width);
             self.persist_layout();
             Ok(new_id)
@@ -3497,23 +3550,8 @@ impl App {
         self.commander.cursor
     }
 
-    pub(crate) fn commander_busy(&self) -> bool {
-        self.commander.busy
-    }
-
     pub(crate) fn commander_history(&self) -> &[String] {
         &self.commander.history
-    }
-
-    pub(crate) fn commander_phase_label(&self) -> &'static str {
-        if self.commander.busy {
-            return "thinking";
-        }
-        match self.commander.phase {
-            CommanderPhase::Discussing => "planning",
-            CommanderPhase::AwaitingApproval => "awaiting /approve",
-            CommanderPhase::Executing => "executing",
-        }
     }
 
     pub(crate) fn commander_palette_video_frame(&self) -> Option<&str> {
@@ -4791,6 +4829,45 @@ impl App {
         self.commander_palette_video.frame_text.clear();
     }
 
+    fn on_commander_pane_closed(&mut self) {
+        self.stop_commander_palette_video();
+        self.commander.rx = None;
+        self.commander.busy = false;
+        self.refresh_modal_after_commander_closed();
+    }
+
+    fn refresh_modal_after_commander_closed(&mut self) {
+        let commander_idx = agent_index_for_command(COMMANDER_COMMAND);
+        let next_agent_index = match &self.modal {
+            Some(Modal::NewPanePicker { pane_id, agent_index, .. }) => {
+                if self.agent_available_for_pane(*pane_id, commander_idx) {
+                    Some(commander_idx)
+                } else if !self.agent_available_for_pane(*pane_id, *agent_index) {
+                    Some(self.first_available_agent_for_pane(*pane_id, *agent_index))
+                } else {
+                    None
+                }
+            }
+            Some(Modal::PanelSettings { pane_id, agent_index, .. }) => {
+                if !self.agent_available_for_pane(*pane_id, *agent_index) {
+                    Some(self.first_available_agent_for_pane(*pane_id, *agent_index))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let (Some(index), Some(modal)) = (next_agent_index, self.modal.as_mut()) {
+            match modal {
+                Modal::NewPanePicker { agent_index, .. }
+                | Modal::PanelSettings { agent_index, .. } => {
+                    *agent_index = index;
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn close_panes_from_requests(&mut self, requests: &[String]) -> Option<String> {
         if requests.is_empty() {
             return None;
@@ -4999,11 +5076,10 @@ impl App {
         if command != COMMANDER_COMMAND {
             return true;
         }
-        let mut ids = Vec::new();
-        self.layout.collect_leaf_ids(&mut ids);
-        !ids
-            .iter()
-            .any(|&id| id != pane_id && self.pane_is_commander(id))
+        match self.commander_pane_id() {
+            Some(existing) => existing == pane_id,
+            None => true,
+        }
     }
 
     fn first_available_agent_for_pane(&self, pane_id: usize, preferred: usize) -> usize {
@@ -5232,7 +5308,7 @@ impl App {
             return;
         };
 
-        let agent_index = self.first_available_agent_for_pane(pane_id, agent_index);
+        let agent_index = self.preferred_new_pane_agent_index(pane_id, agent_index);
         self.modal = Some(Modal::NewPanePicker {
             pane_id,
             source_pane_id: pane_id,
@@ -6192,6 +6268,20 @@ mod tests {
     use crate::ui::agent_command_for_input;
 
     #[test]
+    fn commander_agent_availability_follows_open_pane() {
+        let mut app = commander_scroll_test_app();
+        let commander_idx = super::agent_index_for_command(COMMANDER_COMMAND);
+        assert!(app.agent_available_for_pane(99, commander_idx));
+
+        app.panes = vec![Pane::new_commander(0, 1, 1)];
+        assert!(!app.agent_available_for_pane(99, commander_idx));
+        assert!(app.agent_available_for_pane(0, commander_idx));
+
+        app.panes.clear();
+        assert!(app.agent_available_for_pane(99, commander_idx));
+    }
+
+    #[test]
     fn resize_resizes_panes_from_current_layout_not_stale_cache() {
         let mut app = commander_scroll_test_app();
         app.panes = vec![
@@ -6224,8 +6314,8 @@ mod tests {
     }
 
     #[test]
-    fn new_pane_confirm_forces_session_for_placeholder_terminal() {
-        assert!(panel_settings_needs_session(
+    fn new_pane_confirm_keeps_placeholder_shell_session() {
+        assert!(!panel_settings_needs_session(
             LOGIN_SHELL_SENTINEL,
             false,
             false,
@@ -6236,8 +6326,27 @@ mod tests {
             LOGIN_SHELL_SENTINEL,
             false,
             false,
+            "codex",
+            true,
+        ));
+        assert!(should_launch_agent_in_placeholder_shell(
             LOGIN_SHELL_SENTINEL,
             false,
+            false,
+            "codex",
+        ));
+        assert!(!should_launch_agent_in_placeholder_shell(
+            LOGIN_SHELL_SENTINEL,
+            false,
+            false,
+            LOGIN_SHELL_SENTINEL,
+        ));
+        assert!(panel_settings_needs_session(
+            LOGIN_SHELL_SENTINEL,
+            false,
+            false,
+            COMMANDER_COMMAND,
+            true,
         ));
     }
 
@@ -7049,9 +7158,29 @@ fn panel_settings_needs_session(
     selected_command: &str,
     force_session: bool,
 ) -> bool {
+    if !pane_exited
+        && !pane_is_stub
+        && pane_command == LOGIN_SHELL_SENTINEL
+        && selected_command != COMMANDER_COMMAND
+    {
+        return false;
+    }
     force_session
         || pane_command != selected_command
         || (pane_exited && !pane_is_stub)
+}
+
+fn should_launch_agent_in_placeholder_shell(
+    pane_command: &str,
+    pane_exited: bool,
+    pane_is_stub: bool,
+    selected_command: &str,
+) -> bool {
+    !pane_exited
+        && !pane_is_stub
+        && pane_command == LOGIN_SHELL_SENTINEL
+        && selected_command != LOGIN_SHELL_SENTINEL
+        && selected_command != COMMANDER_COMMAND
 }
 
 fn normalize_stored_agent_command(command: String) -> String {

@@ -342,11 +342,40 @@ impl Pane {
         Ok(())
     }
 
+    pub(crate) fn launch_agent_command(&mut self, command: &str) -> anyhow::Result<()> {
+        let command = command.trim();
+        if command.is_empty() {
+            return Ok(());
+        }
+        self.send_paste(command)?;
+        self.send(&[b'\r'])?;
+        self.last_command = Some(command.to_string());
+        self.last_replayed_command = Some(command.to_string());
+        self.set_command(command.to_string());
+        Ok(())
+    }
+
     pub(crate) fn change_directory(&mut self, path: &std::path::Path) -> anyhow::Result<()> {
+        self.change_directory_internal(path, false)
+    }
+
+    pub(crate) fn change_directory_for_open(&mut self, path: &std::path::Path) -> anyhow::Result<()> {
+        self.change_directory_internal(path, true)
+    }
+
+    fn change_directory_internal(
+        &mut self,
+        path: &std::path::Path,
+        clear: bool,
+    ) -> anyhow::Result<()> {
         let quoted = shell_quote(&path.to_string_lossy());
         let cmd = format!("cd {quoted}");
         self.send(cmd.as_bytes())?;
         self.send(&[b'\r'])?;
+        if clear {
+            self.send(b"clear")?;
+            self.send(&[b'\r'])?;
+        }
         Ok(())
     }
 

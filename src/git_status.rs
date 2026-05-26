@@ -84,16 +84,6 @@ pub(crate) fn format_worktree_changes(summary: &GitSummary) -> String {
     out
 }
 
-pub(crate) fn folder_badge_body(folder_name: &str) -> String {
-    format!("{NF_FOLDER} {folder_name}")
-}
-
-pub(crate) fn git_badge_body(folder_name: &str, summary: &GitSummary) -> String {
-    let mut body = format!("{NF_TREE} {folder_name}");
-    body.push_str(&git_subtitle_tail(summary));
-    body
-}
-
 fn git_subtitle_tail(summary: &GitSummary) -> String {
     format!(
         " ({branch} {symbol})",
@@ -214,19 +204,6 @@ fn truncate_pane_subtitle_without_subpath(
         git_color,
         String::new(),
     ))
-}
-
-pub(crate) fn truncate_pane_subtitle_body(
-    folder_name: &str,
-    summary: Option<&GitSummary>,
-    subpath: Option<&str>,
-    max_cols: usize,
-) -> String {
-    pane_subtitle_parts(folder_name, summary, subpath, max_cols)
-        .map(|(icon, name, branch_tail, _, subpath_tail)| {
-            format!("{icon} {name}{branch_tail}{subpath_tail}")
-        })
-        .unwrap_or_default()
 }
 
 pub(crate) fn query_git_summary(cwd: &Path) -> Option<GitSummary> {
@@ -389,19 +366,23 @@ mod tests {
     }
 
     #[test]
-    fn git_badge_body_starts_with_tree_and_paren_prompt() {
-        let body = git_badge_body(
+    fn pane_subtitle_parts_includes_tree_and_paren_prompt() {
+        let parts = pane_subtitle_parts(
             "code-ui",
-            &GitSummary {
+            Some(&GitSummary {
                 branch: "master".to_string(),
                 staged: 0,
                 unstaged: 2,
                 untracked: 0,
                 on_github: true,
-            },
-        );
-        assert!(body.starts_with(&format!("{NF_TREE} code-ui ")));
-        assert!(body.ends_with("(master !)"));
+            }),
+            None,
+            80,
+        )
+        .expect("parts");
+        assert_eq!(parts.0, NF_TREE);
+        assert_eq!(parts.1, "code-ui");
+        assert_eq!(parts.2, " (master !)");
     }
 
     #[test]
@@ -444,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    fn pane_subtitle_parts_matches_truncated_body() {
+    fn pane_subtitle_parts_respects_max_cols() {
         let summary = GitSummary {
             branch: "feature/long-branch-name".to_string(),
             staged: 1,
@@ -453,18 +434,12 @@ mod tests {
             on_github: false,
         };
         for max_cols in [10, 20, 40] {
-            let truncated = truncate_pane_subtitle_body(
-                "code-ui-worktree",
-                Some(&summary),
-                None,
-                max_cols,
-            );
-            let parts = pane_subtitle_parts("code-ui-worktree", Some(&summary), None, max_cols)
+            let body = pane_subtitle_parts("code-ui-worktree", Some(&summary), None, max_cols)
                 .map(|(icon, name, branch_tail, _, subpath_tail)| {
                     format!("{icon} {name}{branch_tail}{subpath_tail}")
                 })
                 .unwrap_or_default();
-            assert_eq!(parts, truncated, "max_cols={max_cols}");
+            assert!(body.chars().count() <= max_cols, "max_cols={max_cols}");
         }
     }
 
@@ -485,9 +460,11 @@ mod tests {
     }
 
     #[test]
-    fn folder_badge_body_shows_folder_icon_and_name() {
-        let body = folder_badge_body("code-ui");
-        assert_eq!(body, format!("{NF_FOLDER} code-ui"));
+    fn pane_subtitle_parts_shows_folder_icon_without_git_summary() {
+        let parts = pane_subtitle_parts("code-ui", None, None, 80).expect("parts");
+        assert_eq!(parts.0, NF_FOLDER);
+        assert_eq!(parts.1, "code-ui");
+        assert_eq!(parts.2, "");
     }
 
     #[test]
