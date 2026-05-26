@@ -1402,9 +1402,6 @@ impl App {
         name: String,
         agent_index: usize,
     ) -> anyhow::Result<()> {
-        if self.pane_is_commander(pane_id) {
-            return Ok(());
-        }
         let Some(pos) = self.panes.iter().position(|pane| pane.id == pane_id) else {
             return Ok(());
         };
@@ -1420,6 +1417,8 @@ impl App {
         if !self.command_available_for_pane(pane_id, &command) {
             return Ok(());
         }
+
+        let was_commander = self.pane_is_commander(pane_id);
 
         let (rows, cols, title_changed, needs_session) = {
             let pane = &self.panes[pos];
@@ -1443,13 +1442,17 @@ impl App {
         // Changing the agent of a pane discards any prior session state. Also
         // respawn when the command is unchanged but the PTY child already exited.
         self.panes[pos].terminate_session();
-        self.panes[pos] = if command == COMMANDER_COMMAND {
+        let switching_to_commander = command == COMMANDER_COMMAND;
+        self.panes[pos] = if switching_to_commander {
             let mut pane = Pane::new_commander(pane_id, rows, cols);
             pane.title = name;
             pane
         } else {
             Pane::new(pane_id, name, command, None, None, rows, cols, None)?
         };
+        if was_commander && !switching_to_commander {
+            self.stop_commander_palette_video();
+        }
         self.focus_pane(pane_id);
         self.persist_layout();
         self.resize(
