@@ -261,6 +261,7 @@ pub(crate) fn pane_subtitle_hit_area(
     area: Rect,
     folder_name: &str,
     git_summary: Option<&GitSummary>,
+    subpath: Option<&str>,
     show_right_edge: bool,
 ) -> Option<Rect> {
     if folder_name.is_empty() || area.height <= PANE_TITLE_BAR_HEIGHT {
@@ -290,8 +291,12 @@ pub(crate) fn pane_subtitle_hit_area(
 
     let title_max = text_area_width
         .saturating_sub(PANE_TITLE_TEXT_PADDING.saturating_mul(2)) as usize;
-    let subtitle_body =
-        crate::git_status::truncate_pane_subtitle_body(folder_name, git_summary, title_max);
+    let subtitle_body = crate::git_status::truncate_pane_subtitle_body(
+        folder_name,
+        git_summary,
+        subpath,
+        title_max,
+    );
     if subtitle_body.is_empty() {
         return None;
     }
@@ -315,6 +320,7 @@ pub(crate) fn pane_subtitle_combobox_dropdown_area(
     frame: Rect,
     folder_name: &str,
     git_summary: Option<&GitSummary>,
+    subpath: Option<&str>,
     modal_width: u16,
     modal_height: u16,
 ) -> Rect {
@@ -322,7 +328,8 @@ pub(crate) fn pane_subtitle_combobox_dropdown_area(
         return pane_area;
     }
 
-    let subtitle_hit = pane_subtitle_hit_area(pane_area, folder_name, git_summary, true);
+    let subtitle_hit =
+        pane_subtitle_hit_area(pane_area, folder_name, git_summary, subpath, true);
     let anchor_x = subtitle_hit
         .map(|area| area.x)
         .unwrap_or_else(|| pane_area.x.saturating_add(1 + PANE_TITLE_LEFT_PADDING));
@@ -439,11 +446,18 @@ impl Placement {
         &self,
         folder_name: &str,
         git_summary: Option<&GitSummary>,
+        subpath: Option<&str>,
         x: u16,
         y: u16,
     ) -> bool {
-        pane_subtitle_hit_area(self.area, folder_name, git_summary, !self.exposed.right)
-            .is_some_and(|area| contains(area, x, y))
+        pane_subtitle_hit_area(
+            self.area,
+            folder_name,
+            git_summary,
+            subpath,
+            !self.exposed.right,
+        )
+        .is_some_and(|area| contains(area, x, y))
     }
 
     pub(crate) fn maximize_hit(&self, x: u16, y: u16) -> bool {

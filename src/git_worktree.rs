@@ -27,6 +27,44 @@ pub(crate) fn git_root(cwd: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(root))
 }
 
+/// Leaf directory name for pane subtitles: git worktree/repo root when `path` is inside a repo.
+pub(crate) fn display_folder_name(path: &Path) -> Option<String> {
+    let root = git_root(path).unwrap_or_else(|| path.to_path_buf());
+    root.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+}
+
+/// Relative path below the git toplevel, e.g. `src/ui` or `.pi`. Empty when cwd is the root.
+pub(crate) fn relative_subpath_from_git_root(cwd: &Path) -> Option<String> {
+    let root = git_root(cwd)?;
+    if paths_equal(cwd, &root) {
+        return None;
+    }
+
+    if let Ok(relative) = cwd.strip_prefix(&root) {
+        return subpath_display(relative);
+    }
+
+    let canonical_root = fs::canonicalize(&root).ok()?;
+    let canonical_cwd = fs::canonicalize(cwd).ok()?;
+    if paths_equal(&canonical_cwd, &canonical_root) {
+        return None;
+    }
+    canonical_cwd
+        .strip_prefix(&canonical_root)
+        .ok()
+        .and_then(subpath_display)
+}
+
+fn subpath_display(relative: &Path) -> Option<String> {
+    let relative = relative.to_string_lossy();
+    if relative.is_empty() || relative == "." {
+        return None;
+    }
+    Some(relative.replace('\\', "/"))
+}
+
 pub(crate) fn list_worktrees(git_root: &Path) -> Vec<WorktreeInfo> {
     let git_root = git_root.to_str().unwrap_or("");
     let output = match Command::new("git")
@@ -274,6 +312,37 @@ pub(crate) fn paths_equal(a: &Path, b: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_subpath_from_git_root_returns_path_below_toplevel() {
+        let repo_root = std::env::current_dir().expect("cwd");
+        let nested = repo_root.join("src");
+        if !nested.is_dir() {
+            return;
+        }
+        assert_eq!(
+            relative_subpath_from_git_root(&nested).as_deref(),
+            Some("src")
+        );
+        assert_eq!(relative_subpath_from_git_root(&repo_root), None);
+    }
+
+    #[test]
+    fn display_folder_name_uses_git_toplevel_not_cwd_leaf() {
+        let repo_root = std::env::current_dir().expect("cwd");
+        let nested = repo_root.join("src");
+        if !nested.is_dir() {
+            return;
+        }
+        let name = display_folder_name(&nested).expect("name");
+        assert_eq!(
+            name,
+            repo_root
+                .file_name()
+                .expect("repo root name")
+                .to_string_lossy()
+        );
+    }
 
     #[test]
     fn branch_base_from_pane_name_sanitizes() {

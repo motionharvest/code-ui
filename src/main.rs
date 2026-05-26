@@ -376,6 +376,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                     } else {
                         git_cache.folder_name_for_pane(pane)
                     };
+                    let subpath = if is_commander {
+                        None
+                    } else {
+                        git_cache.subpath_for_pane(pane)
+                    };
                     let title = if is_commander {
                         commander_chrome_title_label()
                     } else {
@@ -387,6 +392,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         &title,
                         folder_name.as_deref(),
                         git_summary.as_ref(),
+                        subpath.as_deref(),
                         title_row_style,
                         title_row_selected,
                         edge_style,

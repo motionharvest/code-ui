@@ -11,8 +11,8 @@ pub(crate) fn bg_color(_theme: Theme) -> Color {
 }
 
 use crate::{
-    git_status::{format_worktree_changes, truncate_pane_subtitle_body, GitSummary},
-    git_worktree::{worktree_is_deletable, WorktreeInfo},
+    git_status::{format_worktree_changes, pane_subtitle_parts, GitSummary},
+    git_worktree::{relative_subpath_from_git_root, worktree_is_deletable, WorktreeInfo},
     layout::{
         clip_rect_to_frame, pane_combobox_dropdown_area, pane_dropdown_max_height,
         pane_subtitle_combobox_dropdown_area,
@@ -37,6 +37,7 @@ pub(crate) fn render_panel_title_chrome(
     title: &str,
     folder_name: Option<&str>,
     git_summary: Option<&GitSummary>,
+    subpath: Option<&str>,
     title_row_style: Style,
     title_row_selected: bool,
     edge_style: Style,
@@ -108,14 +109,34 @@ pub(crate) fn render_panel_title_chrome(
 
             if title_y.saturating_add(1) < panel_area.bottom() {
                 if let Some(folder) = folder_name.filter(|name| !name.is_empty()) {
-                    let subtitle_body =
-                        truncate_pane_subtitle_body(folder, git_summary, title_max);
-                    if !subtitle_body.is_empty() {
-                        let subtitle_text = format!(" {subtitle_body} ");
+                    if let Some((icon, name, branch_tail, git_color, subpath_tail)) =
+                        pane_subtitle_parts(folder, git_summary, subpath, title_max)
+                    {
+                        let icon_style =
+                            Style::default().fg(theme.foreground).bg(bg_color(theme));
+                        let name_style = Style::default()
+                            .fg(selected_tab_bg(theme))
+                            .bg(bg_color(theme));
+                        let muted_style =
+                            Style::default().fg(theme.muted).bg(bg_color(theme));
+                        let mut spans = vec![
+                            Span::raw(" "),
+                            Span::styled(icon.to_string(), icon_style),
+                            Span::raw(" "),
+                            Span::styled(name, name_style),
+                        ];
+                        if !branch_tail.is_empty() {
+                            let branch_style = git_color
+                                .map(|color| Style::default().fg(color).bg(bg_color(theme)))
+                                .unwrap_or(muted_style);
+                            spans.push(Span::styled(branch_tail, branch_style));
+                        }
+                        if !subpath_tail.is_empty() {
+                            spans.push(Span::styled(subpath_tail, muted_style));
+                        }
+                        spans.push(Span::raw(" "));
                         f.render_widget(
-                            Paragraph::new(subtitle_text)
-                                .alignment(Alignment::Left)
-                                .style(Style::default().fg(theme.muted).bg(bg_color(theme))),
+                            Paragraph::new(Line::from(spans)).alignment(Alignment::Left),
                             Rect {
                                 x: text_x,
                                 y: title_y.saturating_add(1),
@@ -1711,6 +1732,7 @@ pub(crate) fn worktree_picker_modal_area(
     frame: Rect,
     folder_name: &str,
     git_summary: &GitSummary,
+    subpath: Option<&str>,
     entries: &[WorktreeInfo],
     entry_summaries: &[Option<GitSummary>],
     focus: WorktreePickerFocus,
@@ -1723,6 +1745,7 @@ pub(crate) fn worktree_picker_modal_area(
         frame,
         folder_name,
         Some(git_summary),
+        subpath,
         width,
         height,
     )
@@ -1887,11 +1910,13 @@ pub(crate) fn render_worktree_picker_modal(
     cursor: usize,
 ) {
     let frame = f.size();
+    let subpath = current_path.and_then(relative_subpath_from_git_root);
     let area = worktree_picker_modal_area(
         pane_area,
         frame,
         folder_name,
         git_summary,
+        subpath.as_deref(),
         entries,
         entry_summaries,
         focus,

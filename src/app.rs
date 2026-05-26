@@ -16,8 +16,9 @@ use ratatui::layout::{Direction, Rect};
 use crate::{
     git_status::query_git_summary,
     git_worktree::{
-        branch_base_from_pane_name, create_worktree, delete_worktree, git_root, list_worktrees,
-        next_available_branch, worktree_is_deletable,
+        branch_base_from_pane_name, create_worktree, delete_worktree, display_folder_name,
+        git_root, list_worktrees, next_available_branch, relative_subpath_from_git_root,
+        worktree_is_deletable,
     },
     layout::{
         adjacent_overlap, load_persisted_layout, pane_inner_area, placement_is_adjacent,
@@ -645,7 +646,9 @@ impl App {
             width: cols,
             height: total_rows,
         };
-        let placements = self.pane_placements(Self::content_area(Rect {
+        // Always derive placements from the current layout. The hit-test cache may
+        // still describe the previous workspace until we rebuild it below.
+        let placements = self.compute_pane_placements(Self::content_area(Rect {
             x: 0,
             y: 0,
             width: cols,
@@ -2802,11 +2805,15 @@ impl App {
                         .find(|placement| placement.pane_id == pane_id)
                         .map(|placement| (placement.area, ()))
                         .unwrap_or_else(|| (Self::content_area(size), ()));
+                    let subpath = current_path
+                        .as_deref()
+                        .and_then(relative_subpath_from_git_root);
                     let area = worktree_picker_modal_area(
                         pane_area,
                         size,
                         &folder_name,
                         &git_summary,
+                        subpath.as_deref(),
                         &entries,
                         &entry_summaries,
                         focus,
@@ -3018,7 +3025,7 @@ impl App {
         }
 
         if clicked {
-            if let Some((folder_name, git_summary)) = self
+            if let Some((folder_name, git_summary, subpath)) = self
                 .panes
                 .iter()
                 .find(|pane| pane.id == placement.pane_id)
@@ -3026,10 +3033,9 @@ impl App {
                     pane.tmux_pane_path().and_then(|path| {
                         query_git_summary(&path).map(|summary| {
                             (
-                                path.file_name()
-                                    .map(|name| name.to_string_lossy().into_owned())
-                                    .unwrap_or_default(),
+                                display_folder_name(&path).unwrap_or_default(),
                                 summary,
+                                relative_subpath_from_git_root(&path),
                             )
                         })
                     })
@@ -3038,6 +3044,7 @@ impl App {
                 if placement.subtitle_hit(
                     &folder_name,
                     Some(&git_summary),
+                    subpath.as_deref(),
                     mouse.column,
                     mouse.row,
                 ) {
@@ -5195,10 +5202,7 @@ impl App {
         let Some(git_summary) = query_git_summary(&current_path) else {
             return;
         };
-        let folder_name = current_path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let folder_name = display_folder_name(&current_path).unwrap_or_default();
         if folder_name.is_empty() {
             return;
         }
@@ -6130,6 +6134,37 @@ mod tests {
         }
     }
     use crate::ui::agent_command_for_input;
+
+    #[test]
+    fn resize_resizes_panes_from_current_layout_not_stale_cache() {
+        let mut app = commander_scroll_test_app();
+        app.panes = vec![
+            Pane::new_commander(0, 1, 1),
+            Pane::new_commander(1, 1, 1),
+        ];
+        app.layout = Node::Leaf { pane_id: 0 };
+        app.focused = 0;
+        app.rebuild_hit_test_cache();
+
+        app.layout = Node::Leaf { pane_id: 1 };
+        app.focused = 1;
+        app.resize(40, 100);
+
+        let content = App::content_area(app.last_terminal_size);
+        let expected = pane_inner_area(
+            content,
+            ExposedSides {
+                top: true,
+                bottom: true,
+                left: true,
+                right: true,
+            },
+        );
+        assert_eq!(app.panes[1].rows, expected.height.max(1));
+        assert_eq!(app.panes[1].cols, expected.width.max(1));
+        assert_eq!(app.panes[0].rows, 1);
+        assert_eq!(app.panes[0].cols, 1);
+    }
 
     #[test]
     fn new_pane_confirm_forces_session_for_placeholder_terminal() {

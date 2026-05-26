@@ -4,6 +4,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use ratatui::style::Color;
+
 use crate::pane::Pane;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -15,12 +17,19 @@ pub(crate) struct GitSummary {
     pub on_github: bool,
 }
 
-/// Nerd Font: nf-md-file_tree (git repos)
-pub(crate) const NF_TREE: char = '\u{e21c}';
+/// Nerd Font: git repo badge icon
+pub(crate) const NF_TREE: char = '\u{f418}';
 /// Nerd Font: folder when cwd is not a git repository
 pub(crate) const NF_FOLDER: char = '\u{e5ff}';
-/// Nerd Font: nf-fa-git_branch
-pub(crate) const NF_GIT_BRANCH: char = '\u{f126}';
+
+/// Matches `parse_git_prompt` in ~/.zshrc.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GitPromptKind {
+    Clean,
+    StagedOnly,
+    UnstagedOnly,
+    Mixed,
+}
 
 impl GitSummary {
     pub(crate) fn dirty_count(&self) -> usize {
@@ -29,6 +38,37 @@ impl GitSummary {
 
     pub(crate) fn has_changes(&self) -> bool {
         self.dirty_count() > 0
+    }
+
+    /// Same rules as `parse_git_prompt` in ~/.zshrc.
+    pub(crate) fn prompt_kind(&self) -> GitPromptKind {
+        if self.staged == 0 && self.unstaged == 0 && self.untracked == 0 {
+            GitPromptKind::Clean
+        } else if self.staged > 0 && self.unstaged == 0 && self.untracked == 0 {
+            GitPromptKind::StagedOnly
+        } else if self.staged == 0 && (self.unstaged > 0 || self.untracked > 0) {
+            GitPromptKind::UnstagedOnly
+        } else {
+            GitPromptKind::Mixed
+        }
+    }
+
+    pub(crate) fn prompt_symbol(&self) -> char {
+        match self.prompt_kind() {
+            GitPromptKind::Clean => '✓',
+            GitPromptKind::StagedOnly => '+',
+            GitPromptKind::UnstagedOnly => '!',
+            GitPromptKind::Mixed => '±',
+        }
+    }
+
+    pub(crate) fn prompt_color(&self) -> Color {
+        match self.prompt_kind() {
+            GitPromptKind::Clean => Color::Green,
+            GitPromptKind::StagedOnly => Color::Blue,
+            GitPromptKind::UnstagedOnly => Color::Red,
+            GitPromptKind::Mixed => Color::Yellow,
+        }
     }
 }
 
@@ -50,44 +90,143 @@ pub(crate) fn folder_badge_body(folder_name: &str) -> String {
 
 pub(crate) fn git_badge_body(folder_name: &str, summary: &GitSummary) -> String {
     let mut body = format!("{NF_TREE} {folder_name}");
-    body.push(' ');
-    body.push(NF_GIT_BRANCH);
-    body.push(' ');
-    body.push_str(&summary.branch);
-    if summary.dirty_count() > 0 {
-        body.push_str(&format!(" *{}", summary.dirty_count()));
-    }
+    body.push_str(&git_subtitle_tail(summary));
     body
+}
+
+fn git_subtitle_tail(summary: &GitSummary) -> String {
+    format!(
+        " ({branch} {symbol})",
+        branch = summary.branch,
+        symbol = summary.prompt_symbol()
+    )
+}
+
+fn format_subpath_tail(subpath: Option<&str>) -> String {
+    subpath
+        .filter(|path| !path.is_empty())
+        .map(|path| format!(" ./{path}"))
+        .unwrap_or_default()
+}
+
+pub(crate) fn pane_subtitle_parts(
+    folder_name: &str,
+    summary: Option<&GitSummary>,
+    subpath: Option<&str>,
+    max_cols: usize,
+) -> Option<(char, String, String, Option<Color>, String)> {
+    if max_cols == 0 || folder_name.is_empty() {
+        return None;
+    }
+
+    let icon = match summary {
+        Some(_) => NF_TREE,
+        None => NF_FOLDER,
+    };
+    let branch_tail = summary.map(git_subtitle_tail).unwrap_or_default();
+    let subpath_tail = format_subpath_tail(subpath);
+    let git_color = summary.map(GitSummary::prompt_color);
+
+    let body = format!("{icon} {folder_name}{branch_tail}{subpath_tail}");
+    let body_len = body.chars().count();
+
+    if body_len <= max_cols {
+        return Some((
+            icon,
+            folder_name.to_string(),
+            branch_tail,
+            git_color,
+            subpath_tail,
+        ));
+    }
+
+    if !subpath_tail.is_empty() {
+        let without_subpath = format!("{icon} {folder_name}{branch_tail}");
+        if without_subpath.chars().count() <= max_cols {
+            return Some((
+                icon,
+                folder_name.to_string(),
+                branch_tail,
+                git_color,
+                String::new(),
+            ));
+        }
+    }
+
+    truncate_pane_subtitle_without_subpath(
+        icon,
+        folder_name,
+        branch_tail,
+        git_color,
+        max_cols,
+    )
+}
+
+fn truncate_pane_subtitle_without_subpath(
+    icon: char,
+    folder_name: &str,
+    branch_tail: String,
+    git_color: Option<Color>,
+    max_cols: usize,
+) -> Option<(char, String, String, Option<Color>, String)> {
+    let body = format!("{icon} {folder_name}{branch_tail}");
+    let body_len = body.chars().count();
+
+    if body_len <= max_cols {
+        return Some((
+            icon,
+            folder_name.to_string(),
+            branch_tail,
+            git_color,
+            String::new(),
+        ));
+    }
+
+    let visible_len = if max_cols <= 1 {
+        max_cols
+    } else {
+        max_cols - 1
+    };
+    let has_ellipsis = max_cols > 1;
+    let name_len = folder_name.chars().count();
+    let name_end = 2 + name_len;
+
+    if visible_len <= 2 {
+        return Some((icon, String::new(), String::new(), git_color, String::new()));
+    }
+
+    if visible_len <= name_end {
+        let mut name: String = body.chars().skip(2).take(visible_len - 2).collect();
+        if has_ellipsis {
+            name.push('…');
+        }
+        return Some((icon, name, String::new(), git_color, String::new()));
+    }
+
+    let mut visible_tail: String = branch_tail.chars().take(visible_len - name_end).collect();
+    if has_ellipsis && visible_len < body_len {
+        visible_tail.push('…');
+    }
+    Some((
+        icon,
+        folder_name.to_string(),
+        visible_tail,
+        git_color,
+        String::new(),
+    ))
 }
 
 pub(crate) fn truncate_pane_subtitle_body(
     folder_name: &str,
     summary: Option<&GitSummary>,
+    subpath: Option<&str>,
     max_cols: usize,
 ) -> String {
-    if max_cols == 0 || folder_name.is_empty() {
-        return String::new();
-    }
-    let body = match summary {
-        Some(summary) => git_badge_body(folder_name, summary),
-        None => folder_badge_body(folder_name),
-    };
-    truncate_to_chars(&body, max_cols)
-}
-
-fn truncate_to_chars(text: &str, max_cols: usize) -> String {
-    if text.chars().count() <= max_cols {
-        return text.to_string();
-    }
-    if max_cols == 0 {
-        String::new()
-    } else if max_cols == 1 {
-        "…".to_string()
-    } else {
-        let mut out: String = text.chars().take(max_cols.saturating_sub(1)).collect();
-        out.push('…');
-        out
-    }
+    pane_subtitle_parts(folder_name, summary, subpath, max_cols)
+        .map(|(icon, name, branch_tail, _, subpath_tail)| {
+            format!("{icon} {name}{branch_tail}{subpath_tail}")
+        })
+        .unwrap_or_default()
 }
 
 pub(crate) fn query_git_summary(cwd: &Path) -> Option<GitSummary> {
@@ -202,11 +341,13 @@ impl GitStatusCache {
     }
 
     pub(crate) fn folder_name_for_pane(&mut self, pane: &Pane) -> Option<String> {
-        self.pane_path(pane).and_then(|path| {
-            path.file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .filter(|name| !name.is_empty())
-        })
+        self.pane_path(pane)
+            .and_then(|path| crate::git_worktree::display_folder_name(&path))
+    }
+
+    pub(crate) fn subpath_for_pane(&mut self, pane: &Pane) -> Option<String> {
+        self.pane_path(pane)
+            .and_then(|path| crate::git_worktree::relative_subpath_from_git_root(&path))
     }
 
     fn pane_path(&mut self, pane: &Pane) -> Option<PathBuf> {
@@ -248,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn git_badge_body_starts_with_tree_and_folder() {
+    fn git_badge_body_starts_with_tree_and_paren_prompt() {
         let body = git_badge_body(
             "code-ui",
             &GitSummary {
@@ -260,8 +401,87 @@ mod tests {
             },
         );
         assert!(body.starts_with(&format!("{NF_TREE} code-ui ")));
-        assert!(body.contains(&format!("{NF_GIT_BRANCH} master")));
-        assert!(body.ends_with(" *2"));
+        assert!(body.ends_with("(master !)"));
+    }
+
+    #[test]
+    fn prompt_kind_matches_zshrc_rules() {
+        let clean = GitSummary {
+            branch: "main".to_string(),
+            staged: 0,
+            unstaged: 0,
+            untracked: 0,
+            on_github: false,
+        };
+        assert_eq!(clean.prompt_kind(), GitPromptKind::Clean);
+        assert_eq!(clean.prompt_symbol(), '✓');
+        assert_eq!(clean.prompt_color(), Color::Green);
+
+        let staged_only = GitSummary {
+            staged: 1,
+            ..clean.clone()
+        };
+        assert_eq!(staged_only.prompt_kind(), GitPromptKind::StagedOnly);
+        assert_eq!(staged_only.prompt_symbol(), '+');
+        assert_eq!(staged_only.prompt_color(), Color::Blue);
+
+        let unstaged_only = GitSummary {
+            unstaged: 1,
+            ..clean.clone()
+        };
+        assert_eq!(unstaged_only.prompt_kind(), GitPromptKind::UnstagedOnly);
+        assert_eq!(unstaged_only.prompt_symbol(), '!');
+        assert_eq!(unstaged_only.prompt_color(), Color::Red);
+
+        let mixed = GitSummary {
+            staged: 1,
+            unstaged: 1,
+            ..clean
+        };
+        assert_eq!(mixed.prompt_kind(), GitPromptKind::Mixed);
+        assert_eq!(mixed.prompt_symbol(), '±');
+        assert_eq!(mixed.prompt_color(), Color::Yellow);
+    }
+
+    #[test]
+    fn pane_subtitle_parts_matches_truncated_body() {
+        let summary = GitSummary {
+            branch: "feature/long-branch-name".to_string(),
+            staged: 1,
+            unstaged: 2,
+            untracked: 0,
+            on_github: false,
+        };
+        for max_cols in [10, 20, 40] {
+            let truncated = truncate_pane_subtitle_body(
+                "code-ui-worktree",
+                Some(&summary),
+                None,
+                max_cols,
+            );
+            let parts = pane_subtitle_parts("code-ui-worktree", Some(&summary), None, max_cols)
+                .map(|(icon, name, branch_tail, _, subpath_tail)| {
+                    format!("{icon} {name}{branch_tail}{subpath_tail}")
+                })
+                .unwrap_or_default();
+            assert_eq!(parts, truncated, "max_cols={max_cols}");
+        }
+    }
+
+    #[test]
+    fn pane_subtitle_parts_appends_muted_subpath_tail() {
+        let summary = GitSummary {
+            branch: "main".to_string(),
+            staged: 0,
+            unstaged: 1,
+            untracked: 0,
+            on_github: false,
+        };
+        let parts = pane_subtitle_parts("code-ui", Some(&summary), Some(".pi"), 80)
+            .expect("parts");
+        assert_eq!(parts.1, "code-ui");
+        assert_eq!(parts.2, " (main !)");
+        assert_eq!(parts.4, " ./.pi");
     }
 
     #[test]
