@@ -11,11 +11,12 @@ pub(crate) fn bg_color(_theme: Theme) -> Color {
 }
 
 use crate::{
-    git_status::{format_worktree_changes, pane_subtitle_parts, GitSummary},
+    git_status::{format_worktree_changes, GitSummary},
     git_worktree::{relative_subpath_from_git_root, worktree_is_deletable, WorktreeInfo},
     layout::{
         clip_rect_to_frame, pane_combobox_dropdown_area, pane_dropdown_max_height,
-        pane_subtitle_combobox_dropdown_area,
+        pane_subtitle_combobox_dropdown_area, pane_title_bar_height, pane_title_line_layout,
+        PANE_TITLE_BAR_HEIGHT,
     },
     theme::Theme,
     theme::THEMES,
@@ -30,7 +31,7 @@ pub(crate) fn commander_chrome_title_label() -> String {
     "Commander [harness]".to_string()
 }
 
-/// Two-row title bar chrome shared by workspace panes and the Commander panel.
+/// Title bar chrome shared by workspace panes (single row) and Commander (two rows).
 pub(crate) fn render_panel_title_chrome(
     f: &mut ratatui::Frame<'_>,
     panel_area: Rect,
@@ -38,6 +39,7 @@ pub(crate) fn render_panel_title_chrome(
     folder_name: Option<&str>,
     git_summary: Option<&GitSummary>,
     subpath: Option<&str>,
+    is_commander: bool,
     title_row_style: Style,
     title_row_selected: bool,
     edge_style: Style,
@@ -45,6 +47,7 @@ pub(crate) fn render_panel_title_chrome(
     show_window_controls: bool,
     is_maximized: bool,
     show_right_edge: bool,
+    show_bottom_edge: bool,
 ) {
     use crate::layout::{
         pane_title_bar_area, pane_title_chrome_reserve, pane_title_controls_icons_area,
@@ -52,9 +55,11 @@ pub(crate) fn render_panel_title_chrome(
         PANE_TITLE_LEFT_PADDING, PANE_TITLE_TEXT_PADDING,
     };
 
-    let title_bar = pane_title_bar_area(panel_area);
+    let title_bar_height = pane_title_bar_height(is_commander);
+    let title_bar = pane_title_bar_area(panel_area, title_bar_height);
     let title_y = pane_title_y(panel_area);
     let title_bar_width = title_bar.width;
+    let inline_subtitle = !is_commander;
 
     if title_y < panel_area.bottom() && title_bar_width > PANE_TITLE_LEFT_PADDING {
         let chrome_reserve = if show_window_controls {
@@ -72,80 +77,92 @@ pub(crate) fn render_panel_title_chrome(
             let corner_glyph = if title_row_selected { '╕' } else { '┐' };
 
             f.render_widget(
-                Paragraph::new(rule_glyph.to_string())
-                    .alignment(Alignment::Left)
-                    .style(title_row_style),
+                Paragraph::new(Line::from(vec![
+                    Span::styled("╭─ ", title_row_style),
+                    Span::styled(
+                        PANE_TITLE_CORNER_ICON.to_string(),
+                        Style::default().fg(Color::White).bg(bg_color(theme)),
+                    ),
+                ]))
+                .alignment(Alignment::Left),
                 Rect {
                     x: title_bar.x,
                     y: title_y,
-                    width: 1,
+                    width: PANE_TITLE_LEFT_PADDING,
                     height: 1,
                 },
             );
 
             let title_max = text_width
                 .saturating_sub(PANE_TITLE_TEXT_PADDING.saturating_mul(2)) as usize;
-            let title_body = truncate_to_width(title, title_max);
-            let title_text = format!(" {title_body} ");
-            let title_rule_start = title_text
-                .chars()
-                .enumerate()
-                .filter(|(_, ch)| *ch == ']')
-                .map(|(col, _)| col + 2)
-                .last()
-                .map(|col| text_x.saturating_add(col as u16))
-                .unwrap_or_else(|| text_x.saturating_add(title_text.chars().count() as u16));
-            f.render_widget(
-                Paragraph::new(title_text)
-                    .alignment(Alignment::Left)
-                    .style(title_row_style),
-                Rect {
-                    x: text_x,
-                    y: title_y,
-                    width: text_width,
-                    height: 1,
-                },
+            let title_layout = pane_title_line_layout(
+                title,
+                folder_name,
+                git_summary,
+                subpath,
+                title_max,
+                inline_subtitle,
             );
+            const TITLE_RULE_GAP: u16 = 1;
+            let title_content_width = if inline_subtitle {
+                title_layout.total_width()
+            } else {
+                1 + truncate_to_width(title, title_max).chars().count()
+            };
+            let title_rule_start =
+                text_x.saturating_add(title_content_width as u16 + TITLE_RULE_GAP);
 
-            if title_y.saturating_add(1) < panel_area.bottom() {
-                if let Some(folder) = folder_name.filter(|name| !name.is_empty()) {
-                    if let Some((icon, name, branch_tail, git_color, subpath_tail)) =
-                        pane_subtitle_parts(folder, git_summary, subpath, title_max)
-                    {
-                        let icon_style =
-                            Style::default().fg(theme.foreground).bg(bg_color(theme));
-                        let name_style = Style::default()
-                            .fg(selected_tab_bg(theme))
-                            .bg(bg_color(theme));
-                        let muted_style =
-                            Style::default().fg(theme.muted).bg(bg_color(theme));
-                        let mut spans = vec![
-                            Span::raw(" "),
-                            Span::styled(icon.to_string(), icon_style),
-                            Span::raw(" "),
-                            Span::styled(name, name_style),
-                        ];
-                        if !branch_tail.is_empty() {
-                            let branch_style = git_color
-                                .map(|color| Style::default().fg(color).bg(bg_color(theme)))
-                                .unwrap_or(muted_style);
-                            spans.push(Span::styled(branch_tail, branch_style));
-                        }
-                        if !subpath_tail.is_empty() {
-                            spans.push(Span::styled(subpath_tail, muted_style));
-                        }
-                        spans.push(Span::raw(" "));
-                        f.render_widget(
-                            Paragraph::new(Line::from(spans)).alignment(Alignment::Left),
-                            Rect {
-                                x: text_x,
-                                y: title_y.saturating_add(1),
-                                width: text_width,
-                                height: 1,
-                            },
-                        );
+            if inline_subtitle {
+                let mut spans = vec![
+                    Span::raw(" "),
+                    Span::styled(title_layout.title_body.clone(), title_row_style),
+                ];
+                if let Some((icon, name, branch_tail, git_color, subpath_tail)) =
+                    title_layout.subtitle
+                {
+                    let icon_style =
+                        Style::default().fg(theme.foreground).bg(bg_color(theme));
+                    let name_style = Style::default()
+                        .fg(selected_tab_bg(theme))
+                        .bg(bg_color(theme));
+                    let muted_style = Style::default().fg(theme.muted).bg(bg_color(theme));
+                    spans.push(Span::raw(" "));
+                    spans.push(Span::styled(icon.to_string(), icon_style));
+                    spans.push(Span::raw(" "));
+                    spans.push(Span::styled(name, name_style));
+                    if !branch_tail.is_empty() {
+                        let branch_style = git_color
+                            .map(|color| Style::default().fg(color).bg(bg_color(theme)))
+                            .unwrap_or(muted_style);
+                        spans.push(Span::styled(branch_tail, branch_style));
+                    }
+                    if !subpath_tail.is_empty() {
+                        spans.push(Span::styled(subpath_tail, muted_style));
                     }
                 }
+                f.render_widget(
+                    Paragraph::new(Line::from(spans)).alignment(Alignment::Left),
+                    Rect {
+                        x: text_x,
+                        y: title_y,
+                        width: text_width,
+                        height: 1,
+                    },
+                );
+            } else {
+                let title_body = truncate_to_width(title, title_max);
+                let title_text = format!(" {title_body}");
+                f.render_widget(
+                    Paragraph::new(title_text)
+                        .alignment(Alignment::Left)
+                        .style(title_row_style),
+                    Rect {
+                        x: text_x,
+                        y: title_y,
+                        width: text_width,
+                        height: 1,
+                    },
+                );
             }
 
             if show_window_controls {
@@ -199,22 +216,50 @@ pub(crate) fn render_panel_title_chrome(
         }
     }
 
-    if show_right_edge && panel_area.width > 0 && panel_area.height > 0 {
-        f.render_widget(
-            Paragraph::new("│")
-                .alignment(Alignment::Left)
-                .style(edge_style),
-            Rect {
-                x: panel_area.right().saturating_sub(1),
-                y: panel_area.bottom().saturating_sub(1),
-                width: 1,
-                height: 1,
-            },
-        );
+    if panel_area.width > 0 && panel_area.height > 0 {
+        let bottom_y = panel_area.bottom().saturating_sub(1);
+        if show_bottom_edge && panel_area.width >= 2 {
+            let bottom_width = panel_area.width as usize;
+            let mut bottom_line = String::with_capacity(bottom_width);
+            bottom_line.push('╰');
+            let dash_count = if show_right_edge {
+                bottom_width.saturating_sub(2)
+            } else {
+                bottom_width.saturating_sub(1)
+            };
+            bottom_line.extend(std::iter::repeat_n('─', dash_count));
+            if show_right_edge {
+                bottom_line.push('╯');
+            }
+            f.render_widget(
+                Paragraph::new(bottom_line)
+                    .alignment(Alignment::Left)
+                    .style(edge_style),
+                Rect {
+                    x: panel_area.x,
+                    y: bottom_y,
+                    width: panel_area.width,
+                    height: 1,
+                },
+            );
+        } else if show_right_edge {
+            f.render_widget(
+                Paragraph::new("│")
+                    .alignment(Alignment::Left)
+                    .style(edge_style),
+                Rect {
+                    x: panel_area.right().saturating_sub(1),
+                    y: bottom_y,
+                    width: 1,
+                    height: 1,
+                },
+            );
+        }
     }
 }
 
 pub(crate) const COMMANDER_COMMAND: &str = "commander";
+const PANE_TITLE_CORNER_ICON: char = '\u{ea8b}';
 pub(crate) const TOP_CHROME_ROWS: u16 = 1;
 const RIGHT_CLUSTER_SEP: &str = " │ ";
 const APP_NAME: &str = "Code UI";
@@ -1137,10 +1182,22 @@ pub(crate) fn render_theme_modal(
     f.render_widget(list, inner);
 }
 
-pub(crate) fn panel_settings_modal_area(pane_area: Rect, anchor_title: &str, frame: Rect) -> Rect {
+pub(crate) fn panel_settings_modal_area(
+    pane_area: Rect,
+    anchor_title: &str,
+    frame: Rect,
+    title_bar_height: u16,
+) -> Rect {
     let width = 40.min(pane_area.width);
-    let height = 16.min(pane_dropdown_max_height(pane_area));
-    pane_combobox_dropdown_area(pane_area, frame, anchor_title, width, height)
+    let height = 16.min(pane_dropdown_max_height(pane_area, title_bar_height));
+    pane_combobox_dropdown_area(
+        pane_area,
+        frame,
+        anchor_title,
+        width,
+        height,
+        title_bar_height,
+    )
 }
 
 /// Content rectangle inside the modal frame (must match `render_panel_settings_modal`).
@@ -1260,11 +1317,21 @@ pub(crate) fn new_pane_picker_modal_area(
     pane_area: Rect,
     anchor_title: &str,
     frame: Rect,
+    title_bar_height: u16,
 ) -> Rect {
     let width = 26.min(pane_area.width);
     let desired = AGENT_PRESETS.len() as u16 + 2;
-    let height = desired.min(pane_dropdown_max_height(pane_area)).max(1);
-    let mut area = pane_combobox_dropdown_area(pane_area, frame, anchor_title, width, height);
+    let height = desired
+        .min(pane_dropdown_max_height(pane_area, title_bar_height))
+        .max(1);
+    let mut area = pane_combobox_dropdown_area(
+        pane_area,
+        frame,
+        anchor_title,
+        width,
+        height,
+        title_bar_height,
+    );
     area.y = pane_area
         .y
         .saturating_add(NEW_PANE_PICKER_Y_INSET_FROM_PANE_TOP)
@@ -1290,6 +1357,7 @@ pub(crate) fn render_new_pane_picker_modal(
     f: &mut ratatui::Frame<'_>,
     pane_area: Rect,
     anchor_title: &str,
+    title_bar_height: u16,
     theme: Theme,
     name: &str,
     name_error: Option<&str>,
@@ -1299,7 +1367,7 @@ pub(crate) fn render_new_pane_picker_modal(
     agent_available: &[bool],
 ) {
     let frame = f.size();
-    let area = new_pane_picker_modal_area(pane_area, anchor_title, frame);
+    let area = new_pane_picker_modal_area(pane_area, anchor_title, frame, title_bar_height);
     f.render_widget(Clear, area);
 
     let block = Block::default()
@@ -1379,6 +1447,7 @@ pub(crate) fn render_panel_settings_modal(
     f: &mut ratatui::Frame<'_>,
     pane_area: Rect,
     anchor_title: &str,
+    title_bar_height: u16,
     theme: Theme,
     name: &str,
     name_error: Option<&str>,
@@ -1387,7 +1456,7 @@ pub(crate) fn render_panel_settings_modal(
     agent_available: &[bool],
 ) {
     let frame = f.size();
-    let area = panel_settings_modal_area(pane_area, anchor_title, frame);
+    let area = panel_settings_modal_area(pane_area, anchor_title, frame, title_bar_height);
     f.render_widget(Clear, area);
 
     let inner = panel_settings_modal_inner(area);
@@ -1730,6 +1799,7 @@ pub(crate) fn worktree_picker_modal_height(
 pub(crate) fn worktree_picker_modal_area(
     pane_area: Rect,
     frame: Rect,
+    chrome_title: &str,
     folder_name: &str,
     git_summary: &GitSummary,
     subpath: Option<&str>,
@@ -1739,15 +1809,18 @@ pub(crate) fn worktree_picker_modal_area(
 ) -> Rect {
     let width = worktree_picker_modal_width(entries, entry_summaries).min(pane_area.width);
     let height = worktree_picker_modal_height(entries, focus)
-        .min(pane_dropdown_max_height(pane_area));
+        .min(pane_dropdown_max_height(pane_area, PANE_TITLE_BAR_HEIGHT));
     pane_subtitle_combobox_dropdown_area(
         pane_area,
         frame,
+        chrome_title,
         folder_name,
         Some(git_summary),
         subpath,
         width,
         height,
+        true,
+        PANE_TITLE_BAR_HEIGHT,
     )
 }
 
@@ -1894,6 +1967,7 @@ fn worktree_picker_row_parts(
 pub(crate) fn render_worktree_picker_modal(
     f: &mut ratatui::Frame<'_>,
     pane_area: Rect,
+    chrome_title: &str,
     folder_name: &str,
     git_summary: &GitSummary,
     theme: Theme,
@@ -1914,6 +1988,7 @@ pub(crate) fn render_worktree_picker_modal(
     let area = worktree_picker_modal_area(
         pane_area,
         frame,
+        chrome_title,
         folder_name,
         git_summary,
         subpath.as_deref(),

@@ -2,11 +2,12 @@ use std::{collections::BTreeMap, fs, io, path::PathBuf};
 
 use ratatui::{
     layout::{Direction, Rect},
+    style::Color,
     widgets::Borders,
 };
 
 use crate::{
-    git_status::GitSummary,
+    git_status::{pane_subtitle_parts, GitSummary},
     pane::Pane,
     ui::{truncate_to_width, AGENT_PRESETS},
 };
@@ -37,10 +38,10 @@ pub(crate) fn clip_rect_to_frame(area: Rect, frame: Rect) -> Rect {
 }
 
 /// Vertical space below the pane title bar available for a dropdown.
-pub(crate) fn pane_dropdown_max_height(pane_area: Rect) -> u16 {
+pub(crate) fn pane_dropdown_max_height(pane_area: Rect, title_bar_height: u16) -> u16 {
     pane_area
         .height
-        .saturating_sub(PANE_TITLE_BAR_HEIGHT.min(pane_area.height))
+        .saturating_sub(title_bar_height.min(pane_area.height))
 }
 
 #[derive(Clone, Copy, Default)]
@@ -120,11 +121,117 @@ const RATIO_HALF: u16 = RATIO_SCALE / 2;
 
 pub(crate) const PANE_INNER_LEFT_MARGIN: u16 = 2;
 pub(crate) const PANE_INNER_MARGIN: u16 = 1;
-// Two rows of title text/chrome on the pane's top edge.
-pub(crate) const PANE_TITLE_BAR_HEIGHT: u16 = 2;
+// One row of title text/chrome for workspace panes; Commander keeps a second row.
+pub(crate) const PANE_TITLE_BAR_HEIGHT: u16 = 1;
+pub(crate) const COMMANDER_TITLE_BAR_HEIGHT: u16 = 2;
+
+pub(crate) fn pane_title_bar_height(is_commander: bool) -> u16 {
+    if is_commander {
+        COMMANDER_TITLE_BAR_HEIGHT
+    } else {
+        PANE_TITLE_BAR_HEIGHT
+    }
+}
+
+pub(crate) struct PaneTitleLineLayout {
+    pub(crate) title_body: String,
+    pub(crate) subtitle: Option<(char, String, String, Option<Color>, String)>,
+}
+
+impl PaneTitleLineLayout {
+    pub(crate) fn title_width(&self) -> usize {
+        1 + self.title_body.chars().count()
+    }
+
+    pub(crate) fn subtitle_body(&self) -> String {
+        self.subtitle
+            .as_ref()
+            .map(|(icon, name, branch_tail, _, subpath_tail)| {
+                format!(" {icon} {name}{branch_tail}{subpath_tail}")
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn subtitle_width(&self) -> usize {
+        self.subtitle_body().chars().count()
+    }
+
+    pub(crate) fn total_width(&self) -> usize {
+        self.title_width() + self.subtitle_width()
+    }
+}
+
+pub(crate) fn pane_title_line_layout(
+    title: &str,
+    folder_name: Option<&str>,
+    git_summary: Option<&GitSummary>,
+    subpath: Option<&str>,
+    max_cols: usize,
+    inline_subtitle: bool,
+) -> PaneTitleLineLayout {
+    if inline_subtitle {
+        if let Some(folder) = folder_name.filter(|name| !name.is_empty()) {
+            let title_chars = title.chars().count();
+            let prefix_len = 1 + title_chars;
+            if prefix_len + 1 < max_cols {
+                let subtitle_max = max_cols.saturating_sub(prefix_len + 1);
+                if let Some(parts) =
+                    pane_subtitle_parts(folder, git_summary, subpath, subtitle_max)
+                {
+                    return PaneTitleLineLayout {
+                        title_body: title.to_string(),
+                        subtitle: Some(parts),
+                    };
+                }
+            }
+        }
+    }
+
+    PaneTitleLineLayout {
+        title_body: truncate_to_width(
+            title,
+            if inline_subtitle {
+                max_cols.saturating_sub(1).max(1)
+            } else {
+                max_cols
+            },
+        ),
+        subtitle: None,
+    }
+}
+
+fn pane_title_text_budget(area: Rect, show_right_edge: bool) -> Option<(u16, u16, usize)> {
+    let title_y = pane_title_y(area);
+    if area.width <= 1 || area.height == 0 {
+        return None;
+    }
+
+    let bar_width = area.width.saturating_sub(1);
+    if bar_width <= PANE_TITLE_LEFT_PADDING {
+        return None;
+    }
+
+    let available = bar_width.saturating_sub(pane_title_chrome_reserve(area.width, show_right_edge));
+    if available <= PANE_TITLE_LEFT_PADDING {
+        return None;
+    }
+
+    let text_area_width = available.saturating_sub(PANE_TITLE_LEFT_PADDING);
+    if text_area_width <= PANE_TITLE_TEXT_PADDING.saturating_mul(2) {
+        return None;
+    }
+
+    let title_max = text_area_width
+        .saturating_sub(PANE_TITLE_TEXT_PADDING.saturating_mul(2)) as usize;
+    Some((
+        area.x.saturating_add(PANE_TITLE_LEFT_PADDING),
+        title_y,
+        title_max,
+    ))
+}
 pub(crate) const PANE_TITLE_TEXT_PADDING: u16 = 1;
-/// Columns before title text: corner marker; leading title padding is in the rendered label.
-pub(crate) const PANE_TITLE_LEFT_PADDING: u16 = 1;
+/// Columns before title text: `╭─` prefix plus corner icon.
+pub(crate) const PANE_TITLE_LEFT_PADDING: u16 = 4;
 pub(crate) const PANE_CONTROLS_PADDING: u16 = 1;
 const PANE_CONTROL_ICON_COLUMNS: u16 = 1;
 const PANE_CONTROLS_CORNER_COLUMNS: u16 = 1;
@@ -151,7 +258,7 @@ pub(crate) fn pane_title_controls_width(show_right_edge: bool) -> u16 {
 }
 
 pub(crate) fn pane_title_controls_area(area: Rect, show_right_edge: bool) -> Option<Rect> {
-    if area.width < PANE_CONTROLS_MIN_WIDTH || area.height <= PANE_TITLE_BAR_HEIGHT {
+    if area.width < PANE_CONTROLS_MIN_WIDTH || area.height == 0 {
         return None;
     }
 
@@ -220,12 +327,12 @@ pub(crate) fn pane_title_y(area: Rect) -> u16 {
     area.y
 }
 
-pub(crate) fn pane_title_bar_area(area: Rect) -> Rect {
+pub(crate) fn pane_title_bar_area(area: Rect, title_bar_height: u16) -> Rect {
     Rect {
         x: area.x,
         y: area.y,
         width: area.width,
-        height: PANE_TITLE_BAR_HEIGHT.min(area.height),
+        height: title_bar_height.min(area.height),
     }
 }
 
@@ -241,63 +348,59 @@ pub(crate) fn pane_title_chrome_reserve(pane_area_width: u16, show_right_edge: b
     }
 }
 
-pub(crate) fn pane_inner_area(area: Rect, exposed: ExposedSides) -> Rect {
+pub(crate) fn pane_inner_area(area: Rect, exposed: ExposedSides, is_commander: bool) -> Rect {
     let left_inset = PANE_INNER_LEFT_MARGIN;
     let right_inset = if exposed.right {
         PANE_INNER_MARGIN
     } else {
         1 + PANE_INNER_MARGIN
     };
-    let top_chrome = PANE_TITLE_BAR_HEIGHT;
+    let top_chrome = pane_title_bar_height(is_commander);
+    let bottom_chrome = u16::from(!exposed.bottom);
     Rect {
         x: area.x.saturating_add(left_inset),
         y: area.y.saturating_add(top_chrome),
         width: area.width.saturating_sub(left_inset.saturating_add(right_inset)),
-        height: area.height.saturating_sub(top_chrome),
+        height: area
+            .height
+            .saturating_sub(top_chrome.saturating_add(bottom_chrome)),
     }
 }
 
 pub(crate) fn pane_subtitle_hit_area(
     area: Rect,
+    title: &str,
     folder_name: &str,
     git_summary: Option<&GitSummary>,
     subpath: Option<&str>,
     show_right_edge: bool,
+    inline_subtitle: bool,
+    title_bar_height: u16,
 ) -> Option<Rect> {
-    if folder_name.is_empty() || area.height <= PANE_TITLE_BAR_HEIGHT {
+    if folder_name.is_empty() || area.height <= title_bar_height {
         return None;
     }
 
-    let title_y = pane_title_y(area);
-    let subtitle_y = title_y.saturating_add(1);
-    if subtitle_y >= area.bottom() {
-        return None;
-    }
-
-    let bar_width = area.width.saturating_sub(1);
-    if bar_width <= PANE_TITLE_LEFT_PADDING {
-        return None;
-    }
-
-    let available = bar_width.saturating_sub(pane_title_chrome_reserve(area.width, show_right_edge));
-    if available <= PANE_TITLE_LEFT_PADDING {
-        return None;
-    }
-
-    let text_area_width = available.saturating_sub(PANE_TITLE_LEFT_PADDING);
-    if text_area_width <= PANE_TITLE_TEXT_PADDING.saturating_mul(2) {
-        return None;
-    }
-
-    let title_max = text_area_width
-        .saturating_sub(PANE_TITLE_TEXT_PADDING.saturating_mul(2)) as usize;
-    let subtitle_body = crate::git_status::truncate_pane_subtitle_body(
-        folder_name,
+    let (text_x, title_y, title_max) = pane_title_text_budget(area, show_right_edge)?;
+    let layout = pane_title_line_layout(
+        title,
+        Some(folder_name),
         git_summary,
         subpath,
         title_max,
+        inline_subtitle,
     );
+    let subtitle_body = layout.subtitle_body();
     if subtitle_body.is_empty() {
+        return None;
+    }
+
+    let subtitle_y = if inline_subtitle {
+        title_y
+    } else {
+        title_y.saturating_add(1)
+    };
+    if subtitle_y >= area.bottom() {
         return None;
     }
 
@@ -307,9 +410,9 @@ pub(crate) fn pane_subtitle_hit_area(
         .saturating_add(PANE_TITLE_TEXT_PADDING as usize * 2) as u16;
 
     Some(Rect {
-        x: area.x.saturating_add(PANE_TITLE_LEFT_PADDING),
+        x: text_x.saturating_add(layout.title_width() as u16),
         y: subtitle_y,
-        width: subtitle_width.min(text_area_width),
+        width: subtitle_width,
         height: 1,
     })
 }
@@ -318,30 +421,41 @@ pub(crate) fn pane_subtitle_hit_area(
 pub(crate) fn pane_subtitle_combobox_dropdown_area(
     pane_area: Rect,
     frame: Rect,
+    title: &str,
     folder_name: &str,
     git_summary: Option<&GitSummary>,
     subpath: Option<&str>,
     modal_width: u16,
     modal_height: u16,
+    inline_subtitle: bool,
+    title_bar_height: u16,
 ) -> Rect {
     if pane_area.width == 0 || pane_area.height == 0 {
         return pane_area;
     }
 
-    let subtitle_hit =
-        pane_subtitle_hit_area(pane_area, folder_name, git_summary, subpath, true);
+    let subtitle_hit = pane_subtitle_hit_area(
+        pane_area,
+        title,
+        folder_name,
+        git_summary,
+        subpath,
+        true,
+        inline_subtitle,
+        title_bar_height,
+    );
     let anchor_x = subtitle_hit
         .map(|area| area.x)
         .unwrap_or_else(|| pane_area.x.saturating_add(1 + PANE_TITLE_LEFT_PADDING));
     let anchor_width = subtitle_hit.map(|area| area.width).unwrap_or(modal_width);
 
     let width = modal_width.max(anchor_width).min(pane_area.width);
-    let max_height = pane_dropdown_max_height(pane_area);
+    let max_height = pane_dropdown_max_height(pane_area, title_bar_height);
     let height = modal_height.min(max_height).max(1);
 
     let y = pane_area
         .y
-        .saturating_add(PANE_TITLE_BAR_HEIGHT.min(pane_area.height));
+        .saturating_add(title_bar_height.min(pane_area.height));
     let x = anchor_x.min(pane_area.right().saturating_sub(width));
     let y = y.min(pane_area.bottom().saturating_sub(height));
 
@@ -363,24 +477,33 @@ pub(crate) fn pane_combobox_dropdown_area(
     anchor_title: &str,
     modal_width: u16,
     modal_height: u16,
+    title_bar_height: u16,
 ) -> Rect {
     if pane_area.width == 0 || pane_area.height == 0 {
         return pane_area;
     }
 
-    let title_hit = pane_title_hit_area(pane_area, anchor_title, true);
+    let title_hit = pane_title_hit_area(
+        pane_area,
+        anchor_title,
+        true,
+        None,
+        None,
+        None,
+        false,
+    );
     let anchor_x = title_hit
         .map(|area| area.x)
         .unwrap_or_else(|| pane_area.x.saturating_add(1 + PANE_TITLE_LEFT_PADDING));
     let anchor_width = title_hit.map(|area| area.width).unwrap_or(modal_width);
 
     let width = modal_width.max(anchor_width).min(pane_area.width);
-    let max_height = pane_dropdown_max_height(pane_area);
+    let max_height = pane_dropdown_max_height(pane_area, title_bar_height);
     let height = modal_height.min(max_height).max(1);
 
     let y = pane_area
         .y
-        .saturating_add(PANE_TITLE_BAR_HEIGHT.min(pane_area.height));
+        .saturating_add(title_bar_height.min(pane_area.height));
     let x = anchor_x.min(pane_area.right().saturating_sub(width));
     let y = y.min(pane_area.bottom().saturating_sub(height));
 
@@ -395,67 +518,84 @@ pub(crate) fn pane_combobox_dropdown_area(
     )
 }
 
-pub(crate) fn pane_title_hit_area(area: Rect, title: &str, show_right_edge: bool) -> Option<Rect> {
-    let title_y = pane_title_y(area);
-    if area.width <= 1 || area.height <= PANE_TITLE_BAR_HEIGHT {
-        return None;
-    }
-
-    let bar_width = area.width.saturating_sub(1);
-    if bar_width == 0 {
-        return None;
-    }
-
-    if bar_width <= PANE_TITLE_LEFT_PADDING {
-        return None;
-    }
-
-    let available = bar_width.saturating_sub(pane_title_chrome_reserve(area.width, show_right_edge));
-    if available == 0 {
-        return None;
-    }
-
-    let text_area_width = available.saturating_sub(PANE_TITLE_LEFT_PADDING);
-    if text_area_width <= PANE_TITLE_TEXT_PADDING.saturating_mul(2) {
-        return None;
-    }
-
-    let title_max = text_area_width
-        .saturating_sub(PANE_TITLE_TEXT_PADDING.saturating_mul(2)) as usize;
-    let rendered_title = truncate_to_width(title, title_max);
-    let title_width = rendered_title
-        .chars()
-        .count()
+pub(crate) fn pane_title_hit_area(
+    area: Rect,
+    title: &str,
+    show_right_edge: bool,
+    folder_name: Option<&str>,
+    git_summary: Option<&GitSummary>,
+    subpath: Option<&str>,
+    inline_subtitle: bool,
+) -> Option<Rect> {
+    let (text_x, title_y, title_max) = pane_title_text_budget(area, show_right_edge)?;
+    let layout = pane_title_line_layout(
+        title,
+        folder_name,
+        git_summary,
+        subpath,
+        title_max,
+        inline_subtitle,
+    );
+    let title_width = if inline_subtitle && layout.subtitle.is_some() {
+        layout.title_width()
+    } else {
+        layout.title_body.chars().count()
+    };
+    let title_width = title_width
         .saturating_add(PANE_TITLE_TEXT_PADDING as usize * 2) as u16;
 
     Some(Rect {
-        x: area.x.saturating_add(PANE_TITLE_LEFT_PADDING),
+        x: text_x,
         y: title_y,
-        width: title_width.min(text_area_width),
+        width: title_width,
         height: 1,
     })
 }
 
 impl Placement {
-    pub(crate) fn title_hit(&self, title: &str, _focused: bool, x: u16, y: u16) -> bool {
-        pane_title_hit_area(self.area, title, !self.exposed.right)
-            .is_some_and(|area| contains(area, x, y))
+    pub(crate) fn title_hit(
+        &self,
+        title: &str,
+        folder_name: Option<&str>,
+        git_summary: Option<&GitSummary>,
+        subpath: Option<&str>,
+        inline_subtitle: bool,
+        _focused: bool,
+        x: u16,
+        y: u16,
+    ) -> bool {
+        pane_title_hit_area(
+            self.area,
+            title,
+            !self.exposed.right,
+            folder_name,
+            git_summary,
+            subpath,
+            inline_subtitle,
+        )
+        .is_some_and(|area| contains(area, x, y))
     }
 
     pub(crate) fn subtitle_hit(
         &self,
+        title: &str,
         folder_name: &str,
         git_summary: Option<&GitSummary>,
         subpath: Option<&str>,
+        inline_subtitle: bool,
+        title_bar_height: u16,
         x: u16,
         y: u16,
     ) -> bool {
         pane_subtitle_hit_area(
             self.area,
+            title,
             folder_name,
             git_summary,
             subpath,
             !self.exposed.right,
+            inline_subtitle,
+            title_bar_height,
         )
         .is_some_and(|area| contains(area, x, y))
     }
@@ -470,7 +610,7 @@ impl Placement {
             return contains(area, x, y);
         }
 
-        if self.area.width < 6 || self.area.height <= PANE_TITLE_BAR_HEIGHT {
+        if self.area.width < 6 || self.area.height == 0 {
             return false;
         }
 
@@ -1816,9 +1956,10 @@ mod tests {
             "Pane [Terminal]",
             26,
             desired_height,
+            PANE_TITLE_BAR_HEIGHT,
         );
         assert!(area.bottom() <= frame.bottom());
-        assert!(area.height <= pane_dropdown_max_height(pane_area));
+        assert!(area.height <= pane_dropdown_max_height(pane_area, PANE_TITLE_BAR_HEIGHT));
         assert!(area.height < desired_height);
     }
 

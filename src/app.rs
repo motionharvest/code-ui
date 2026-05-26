@@ -21,9 +21,9 @@ use crate::{
         worktree_is_deletable,
     },
     layout::{
-        adjacent_overlap, load_persisted_layout, pane_inner_area, placement_is_adjacent,
-        save_persisted_layout, DebugContainer, DebugPlacement, ExposedSides, Node,
-        PersistedWorkspace, Placement, ResizeBoundary, SplitSide,
+        adjacent_overlap, load_persisted_layout, pane_inner_area, pane_title_bar_height,
+        placement_is_adjacent, save_persisted_layout, DebugContainer, DebugPlacement,
+        ExposedSides, Node, PersistedWorkspace, Placement, ResizeBoundary, SplitSide,
     },
     pane::{Pane, PaneMouseEventKind, PaneSelection},
     theme::{load_persisted_theme_index, save_persisted_theme, Theme, THEMES},
@@ -656,8 +656,9 @@ impl App {
         }));
 
         for placement in placements {
+            let is_commander = self.pane_is_commander(placement.pane_id);
             if let Some(pane) = self.pane_mut(placement.pane_id) {
-                let inner = pane_inner_area(placement.area, placement.exposed);
+                let inner = pane_inner_area(placement.area, placement.exposed, is_commander);
                 let content_cols = inner.width.max(1);
                 let content_rows = inner.height.max(1);
                 pane.resize(content_rows, content_cols);
@@ -690,8 +691,9 @@ impl App {
             .map(|cache| cache.placements.clone())
             .unwrap_or_else(|| self.compute_pane_placements(content));
         for placement in placements {
+            let is_commander = self.pane_is_commander(placement.pane_id);
             if let Some(pane) = self.pane_mut(placement.pane_id) {
-                let inner = pane_inner_area(placement.area, placement.exposed);
+                let inner = pane_inner_area(placement.area, placement.exposed, is_commander);
                 pane.resize(inner.height.max(1), inner.width.max(1));
             }
         }
@@ -1150,7 +1152,13 @@ impl App {
         self.pane_placements(Self::content_area(size))
             .into_iter()
             .find(|placement| placement.pane_id == pane_id)
-            .map(|placement| pane_inner_area(placement.area, placement.exposed))
+            .map(|placement| {
+                pane_inner_area(
+                    placement.area,
+                    placement.exposed,
+                    self.pane_is_commander(placement.pane_id),
+                )
+            })
     }
 
     fn pane_mouse_cell(inner: Rect, mouse_column: u16, mouse_row: u16) -> Option<(u16, u16)> {
@@ -2596,7 +2604,9 @@ impl App {
                                 })
                         })
                         .unwrap_or_else(|| (Self::content_area(size), "Pane".to_string()));
-                    let area = new_pane_picker_modal_area(pane_area, &anchor_title, size);
+                    let title_bar_height = pane_title_bar_height(self.pane_is_commander(pane_id));
+                    let area =
+                        new_pane_picker_modal_area(pane_area, &anchor_title, size, title_bar_height);
                     let layout = new_pane_picker_layout(area);
                     let list_area = layout.list;
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
@@ -2679,7 +2689,9 @@ impl App {
                                 })
                         })
                         .unwrap_or_else(|| (Self::content_area(size), "Pane".to_string()));
-                    let area = panel_settings_modal_area(pane_area, &anchor_title, size);
+                    let title_bar_height = pane_title_bar_height(self.pane_is_commander(pane_id));
+                    let area =
+                        panel_settings_modal_area(pane_area, &anchor_title, size, title_bar_height);
                     let inner = panel_settings_modal_inner(area);
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                         if contains(
@@ -2799,18 +2811,29 @@ impl App {
                     mut branch_error,
                     mut cursor,
                 } => {
-                    let (pane_area, _) = self
+                    let (pane_area, chrome_title) = self
                         .pane_placements(Self::content_area(size))
                         .into_iter()
                         .find(|placement| placement.pane_id == pane_id)
-                        .map(|placement| (placement.area, ()))
-                        .unwrap_or_else(|| (Self::content_area(size), ()));
+                        .and_then(|placement| {
+                            self.panes
+                                .iter()
+                                .find(|pane| pane.id == pane_id)
+                                .map(|pane| {
+                                    (
+                                        placement.area,
+                                        pane_chrome_title_label(&pane.title, &pane.command),
+                                    )
+                                })
+                        })
+                        .unwrap_or_else(|| (Self::content_area(size), "Pane".to_string()));
                     let subpath = current_path
                         .as_deref()
                         .and_then(relative_subpath_from_git_root);
                     let area = worktree_picker_modal_area(
                         pane_area,
                         size,
+                        &chrome_title,
                         &folder_name,
                         &git_summary,
                         subpath.as_deref(),
@@ -2951,12 +2974,37 @@ impl App {
             return Ok(());
         };
         let pane_title = pane_chrome_title_label(&pane_title, &pane_command);
+        let is_commander = self.pane_is_commander(placement.pane_id);
+        let inline_subtitle = !is_commander;
+        let title_bar_height = pane_title_bar_height(is_commander);
+        let pane_git_context = self
+            .panes
+            .iter()
+            .find(|pane| pane.id == placement.pane_id)
+            .and_then(|pane| {
+                pane.tmux_pane_path().and_then(|path| {
+                    query_git_summary(&path).map(|summary| {
+                        (
+                            display_folder_name(&path).unwrap_or_default(),
+                            summary,
+                            relative_subpath_from_git_root(&path),
+                        )
+                    })
+                })
+            });
+        let folder_name_for_title = pane_git_context
+            .as_ref()
+            .map(|(folder, _, _)| folder.as_str());
+        let git_summary_for_title = pane_git_context.as_ref().map(|(_, summary, _)| summary);
+        let subpath_for_title = pane_git_context
+            .as_ref()
+            .and_then(|(_, _, subpath)| subpath.as_deref());
 
         let was_focused = self.focused == placement.pane_id;
 
         // The common case is a plain click in terminal content. Focus it now
         // and skip the expensive divider/boundary walk entirely.
-        let inner = pane_inner_area(placement.area, placement.exposed);
+        let inner = pane_inner_area(placement.area, placement.exposed, is_commander);
         if let Some(button) = down_button {
             if contains(inner, mouse.column, mouse.row) {
                 self.focus_pane(placement.pane_id);
@@ -2992,7 +3040,16 @@ impl App {
 
         if clicked {
             self.text_selection = None;
-            let chrome_hit = placement.title_hit(&pane_title, was_focused, mouse.column, mouse.row)
+            let chrome_hit = placement.title_hit(
+                &pane_title,
+                folder_name_for_title,
+                git_summary_for_title,
+                subpath_for_title,
+                inline_subtitle,
+                was_focused,
+                mouse.column,
+                mouse.row,
+            )
                 || placement.maximize_hit(mouse.column, mouse.row)
                 || placement.close_hit(mouse.column, mouse.row);
             if !chrome_hit {
@@ -3025,26 +3082,14 @@ impl App {
         }
 
         if clicked {
-            if let Some((folder_name, git_summary, subpath)) = self
-                .panes
-                .iter()
-                .find(|pane| pane.id == placement.pane_id)
-                .and_then(|pane| {
-                    pane.tmux_pane_path().and_then(|path| {
-                        query_git_summary(&path).map(|summary| {
-                            (
-                                display_folder_name(&path).unwrap_or_default(),
-                                summary,
-                                relative_subpath_from_git_root(&path),
-                            )
-                        })
-                    })
-                })
-            {
+            if let Some((folder_name, git_summary, subpath)) = pane_git_context.as_ref() {
                 if placement.subtitle_hit(
-                    &folder_name,
-                    Some(&git_summary),
+                    &pane_title,
+                    folder_name,
+                    Some(git_summary),
                     subpath.as_deref(),
+                    inline_subtitle,
+                    title_bar_height,
                     mouse.column,
                     mouse.row,
                 ) {
@@ -3055,7 +3100,18 @@ impl App {
             }
         }
 
-        if clicked && placement.title_hit(&pane_title, was_focused, mouse.column, mouse.row) {
+        if clicked
+            && placement.title_hit(
+                &pane_title,
+                folder_name_for_title,
+                git_summary_for_title,
+                subpath_for_title,
+                inline_subtitle,
+                was_focused,
+                mouse.column,
+                mouse.row,
+            )
+        {
             self.focus_pane(placement.pane_id);
             if self.panes.len() > 1 {
                 self.drag_swap = Some(DragPaneSwap {
@@ -3076,7 +3132,7 @@ impl App {
                     return Ok(());
                 }
                 if let Some(pane) = self.pane_mut(placement.pane_id) {
-                    let inner = pane_inner_area(placement.area, placement.exposed);
+                    let inner = pane_inner_area(placement.area, placement.exposed, is_commander);
                     let Some((x, y)) = Self::pane_mouse_cell(inner, mouse.column, mouse.row) else {
                         return Ok(());
                     };
@@ -3091,7 +3147,7 @@ impl App {
                     return Ok(());
                 }
                 if let Some(pane) = self.pane_mut(placement.pane_id) {
-                    let inner = pane_inner_area(placement.area, placement.exposed);
+                    let inner = pane_inner_area(placement.area, placement.exposed, is_commander);
                     let Some((x, y)) = Self::pane_mouse_cell(inner, mouse.column, mouse.row) else {
                         return Ok(());
                     };
@@ -3498,7 +3554,7 @@ impl App {
         else {
             return;
         };
-        let inner = pane_inner_area(placement.area, placement.exposed);
+        let inner = pane_inner_area(placement.area, placement.exposed, true);
         if inner.width == 0 || inner.height == 0 {
             return;
         }
@@ -6159,6 +6215,7 @@ mod tests {
                 left: true,
                 right: true,
             },
+            true,
         );
         assert_eq!(app.panes[1].rows, expected.height.max(1));
         assert_eq!(app.panes[1].cols, expected.width.max(1));

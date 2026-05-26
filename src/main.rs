@@ -42,7 +42,7 @@ use ratatui::{
 
 use app::{App, MousePointerShape};
 use git_status::GitStatusCache;
-use layout::{clip_rect_to_frame, pane_borders, pane_inner_area};
+use layout::{clip_rect_to_frame, pane_borders, pane_inner_area, pane_title_bar_height};
 use theme::Theme;
 use ui::{
     commander_chrome_title_label, compute_top_bar_layout, pane_chrome_title_label,
@@ -393,6 +393,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         folder_name.as_deref(),
                         git_summary.as_ref(),
                         subpath.as_deref(),
+                        is_commander,
                         title_row_style,
                         title_row_selected,
                         edge_style,
@@ -400,9 +401,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         true,
                         is_maximized,
                         !placement.exposed.right,
+                        !placement.exposed.bottom,
                     );
 
-                    let inner = pane_inner_area(pane_area, placement.exposed);
+                    let inner = pane_inner_area(pane_area, placement.exposed, is_commander);
                     if inner.width > 0 && inner.height > 0 {
                         if in_swap_preview {
                             render_pane_swap_drop_overlay(f, inner, theme, title_row_style);
@@ -477,11 +479,14 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                                     let area = App::content_area(f.size());
                                     (area, "Pane".to_string())
                                 });
+                            let title_bar_height =
+                                pane_title_bar_height(app.pane_is_commander(*pane_id));
                             let availability = app.agent_availability_for_pane(*pane_id);
                             render_new_pane_picker_modal(
                                 f,
                                 pane_area,
                                 &anchor_title,
+                                title_bar_height,
                                 theme,
                                 name,
                                 name_error.as_deref(),
@@ -518,11 +523,14 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                                     let area = App::content_area(f.size());
                                     (area, "Pane".to_string())
                                 });
+                            let title_bar_height =
+                                pane_title_bar_height(app.pane_is_commander(*pane_id));
                             let availability = app.agent_availability_for_pane(*pane_id);
                             render_panel_settings_modal(
                                 f,
                                 pane_area,
                                 &anchor_title,
+                                title_bar_height,
                                 theme,
                                 name,
                                 name_error.as_deref(),
@@ -562,15 +570,29 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                             branch_error,
                             cursor,
                         } => {
-                            let (pane_area, _) = app
+                            let (pane_area, chrome_title) = app
                                 .pane_placements(App::content_area(f.size()))
                                 .into_iter()
                                 .find(|placement| placement.pane_id == *pane_id)
-                                .map(|placement| (placement.area, ()))
-                                .unwrap_or_else(|| (App::content_area(f.size()), ()));
+                                .and_then(|placement| {
+                                    app.panes
+                                        .iter()
+                                        .find(|pane| pane.id == *pane_id)
+                                        .map(|pane| {
+                                            (
+                                                placement.area,
+                                                pane_chrome_title_label(&pane.title, &pane.command),
+                                            )
+                                        })
+                                })
+                                .unwrap_or_else(|| {
+                                    let area = App::content_area(f.size());
+                                    (area, "Pane".to_string())
+                                });
                             render_worktree_picker_modal(
                                 f,
                                 pane_area,
+                                &chrome_title,
                                 folder_name,
                                 git_summary,
                                 theme,
