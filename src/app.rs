@@ -1401,6 +1401,7 @@ impl App {
         pane_id: usize,
         name: String,
         agent_index: usize,
+        force_session: bool,
     ) -> anyhow::Result<()> {
         let Some(pos) = self.panes.iter().position(|pane| pane.id == pane_id) else {
             return Ok(());
@@ -1426,7 +1427,13 @@ impl App {
                 pane.rows,
                 pane.cols,
                 pane.title != name,
-                pane.command != command || (pane.exited && !pane.is_stub()),
+                panel_settings_needs_session(
+                    &pane.command,
+                    pane.exited,
+                    pane.is_stub(),
+                    &command,
+                    force_session,
+                ),
             )
         };
 
@@ -1670,7 +1677,7 @@ impl App {
                                 return Ok(());
                             }
                             self.default_agent_index = agent_index;
-                            self.apply_panel_settings(pane_id, name, agent_index)?;
+                            self.apply_panel_settings(pane_id, name, agent_index, close_on_cancel)?;
                             self.modal = None;
                             return Ok(());
                         }
@@ -1728,7 +1735,7 @@ impl App {
                                 });
                                 return Ok(());
                             }
-                            self.apply_panel_settings(pane_id, name, agent_index)?;
+                            self.apply_panel_settings(pane_id, name, agent_index, false)?;
                             self.modal = None;
                             return Ok(());
                         }
@@ -2612,7 +2619,7 @@ impl App {
                                     return Ok(());
                                 }
                                 self.default_agent_index = agent_index;
-                                self.apply_panel_settings(pane_id, name, agent_index)?;
+                                self.apply_panel_settings(pane_id, name, agent_index, close_on_cancel)?;
                                 self.modal = None;
                                 return Ok(());
                             }
@@ -2710,7 +2717,7 @@ impl App {
                                 });
                                 return Ok(());
                             }
-                            self.apply_panel_settings(pane_id, name, agent_index)?;
+                            self.apply_panel_settings(pane_id, name, agent_index, false)?;
                             self.modal = None;
                             return Ok(());
                         }
@@ -6125,6 +6132,24 @@ mod tests {
     use crate::ui::agent_command_for_input;
 
     #[test]
+    fn new_pane_confirm_forces_session_for_placeholder_terminal() {
+        assert!(panel_settings_needs_session(
+            LOGIN_SHELL_SENTINEL,
+            false,
+            false,
+            LOGIN_SHELL_SENTINEL,
+            true,
+        ));
+        assert!(!panel_settings_needs_session(
+            LOGIN_SHELL_SENTINEL,
+            false,
+            false,
+            LOGIN_SHELL_SENTINEL,
+            false,
+        ));
+    }
+
+    #[test]
     fn outgoing_payload_is_forwarded_verbatim() {
         let outgoing =
             build_outgoing_payload("df -h", true, 1, 1, "terminal", LOGIN_SHELL_SENTINEL);
@@ -6923,6 +6948,18 @@ fn ranges_overlap_at(value: u16, start_a: u16, end_a: u16, start_b: u16, end_b: 
     let start = start_a.max(start_b);
     let end = end_a.min(end_b);
     value >= start && value < end
+}
+
+fn panel_settings_needs_session(
+    pane_command: &str,
+    pane_exited: bool,
+    pane_is_stub: bool,
+    selected_command: &str,
+    force_session: bool,
+) -> bool {
+    force_session
+        || pane_command != selected_command
+        || (pane_exited && !pane_is_stub)
 }
 
 fn normalize_stored_agent_command(command: String) -> String {
