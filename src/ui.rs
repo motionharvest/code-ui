@@ -26,6 +26,10 @@ pub(crate) fn pane_chrome_title_label(pane_title: &str, command: &str) -> String
     format!("{} [{}]", pane_title, agent_label_for_command(command))
 }
 
+pub(crate) fn commander_chrome_title_label() -> String {
+    "Commander [harness]".to_string()
+}
+
 /// Two-row title bar chrome shared by workspace panes and the Commander panel.
 pub(crate) fn render_panel_title_chrome(
     f: &mut ratatui::Frame<'_>,
@@ -191,12 +195,6 @@ pub(crate) fn render_panel_title_chrome(
 
 pub(crate) const COMMANDER_COMMAND: &str = "commander";
 pub(crate) const TOP_CHROME_ROWS: u16 = 1;
-pub(crate) const COMMANDER_PROMPT: &str = " Commander > ";
-const COMMANDER_FRAME_LEFT: &str = "│";
-const COMMANDER_FRAME_RIGHT: &str = "│";
-const COMMANDER_AFTER_ADD_PAD: u16 = 3;
-const COMMANDER_SHIFT_LEFT: u16 = 2;
-const TOP_BAR_RIGHT_GAP: u16 = 1;
 const RIGHT_CLUSTER_SEP: &str = " │ ";
 const APP_NAME: &str = "Code UI";
 const APP_VERSION: &str = "0.0.2";
@@ -226,8 +224,6 @@ fn workspace_tab_shows_menu(index: usize, active_workspace_index: usize) -> bool
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TopBarLayout {
     pub bar: Rect,
-    pub commander_frame: Rect,
-    pub commander_inner: Rect,
     pub right_cluster: Rect,
 }
 
@@ -265,8 +261,8 @@ fn right_cluster_width(usage_summary: Option<&str>) -> u16 {
 
 pub(crate) fn compute_top_bar_layout(
     size: Rect,
-    workspace_names: &[String],
-    active_workspace_index: usize,
+    _workspace_names: &[String],
+    _active_workspace_index: usize,
     usage_summary: Option<&str>,
 ) -> TopBarLayout {
     let bar = top_bar_area(size);
@@ -280,51 +276,9 @@ pub(crate) fn compute_top_bar_layout(
         height: 1,
     };
 
-    let add_area = workspace_add_button_area(bar, workspace_names, active_workspace_index);
-    let commander_left = add_area
-        .right()
-        .saturating_add(COMMANDER_AFTER_ADD_PAD)
-        .saturating_sub(COMMANDER_SHIFT_LEFT);
-    let commander_right = right_cluster
-        .x
-        .saturating_sub(TOP_BAR_RIGHT_GAP)
-        .max(commander_left);
-    let commander_width = commander_right.saturating_sub(commander_left);
-    let commander_frame = Rect {
-        x: commander_left,
-        y: bar.y,
-        width: commander_width,
-        height: 1,
-    };
-    let commander_inner = commander_inner_rect(commander_frame);
-
     TopBarLayout {
         bar,
-        commander_frame,
-        commander_inner,
         right_cluster,
-    }
-}
-
-fn commander_frame_inset() -> u16 {
-    COMMANDER_FRAME_LEFT.chars().count() as u16
-}
-
-fn commander_inner_rect(frame: Rect) -> Rect {
-    let inset = commander_frame_inset();
-    if frame.width <= inset.saturating_mul(2) || frame.height == 0 {
-        return Rect {
-            x: frame.x,
-            y: frame.y,
-            width: 0,
-            height: 0,
-        };
-    }
-    Rect {
-        x: frame.x.saturating_add(inset),
-        y: frame.y,
-        width: frame.width.saturating_sub(inset.saturating_mul(2)),
-        height: 1,
     }
 }
 
@@ -465,112 +419,6 @@ fn render_workspace_tab_chrome(
     }
 }
 
-fn render_commander_frame(
-    f: &mut ratatui::Frame<'_>,
-    layout: TopBarLayout,
-    theme: Theme,
-    commander_focused: bool,
-    commander_input: &str,
-) {
-    let frame = layout.commander_frame;
-    if frame.width < 2 || frame.height == 0 {
-        return;
-    }
-
-    let border_style = Style::default()
-        .fg(if commander_focused {
-            theme.accent
-        } else {
-            theme.muted
-        })
-        .bg(bg_color(theme));
-    let input_style = if commander_focused {
-        Style::default().fg(theme.accent).bg(bg_color(theme))
-    } else {
-        Style::default().fg(theme.foreground).bg(bg_color(theme))
-    };
-    let prompt_style = if commander_focused {
-        Style::default()
-            .fg(selected_tab_bg(theme))
-            .bg(bg_color(theme))
-    } else {
-        Style::default().fg(theme.muted).bg(bg_color(theme))
-    };
-
-    let pipe_width = commander_frame_inset();
-    if pipe_width > 0 && frame.width >= pipe_width {
-        f.render_widget(
-            Paragraph::new(COMMANDER_FRAME_LEFT).style(border_style),
-            Rect {
-                x: frame.x,
-                y: frame.y,
-                width: pipe_width,
-                height: 1,
-            },
-        );
-        f.render_widget(
-            Paragraph::new(COMMANDER_FRAME_RIGHT).style(border_style),
-            Rect {
-                x: frame.right().saturating_sub(pipe_width),
-                y: frame.y,
-                width: pipe_width,
-                height: 1,
-            },
-        );
-    }
-
-    let inner = layout.commander_inner;
-    if inner.width > 0 {
-        let prompt_width = COMMANDER_PROMPT.chars().count();
-        let input_width = inner.width.saturating_sub(prompt_width as u16) as usize;
-        let visible_input = if input_width == 0 {
-            String::new()
-        } else {
-            truncate_to_width(commander_input, input_width)
-        };
-        f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    COMMANDER_PROMPT,
-                    prompt_style,
-                ),
-                Span::styled(visible_input, input_style),
-            ]))
-            .alignment(Alignment::Left),
-            inner,
-        );
-    }
-}
-
-pub(crate) fn commander_input_cursor_position(
-    layout: TopBarLayout,
-    commander_input: &str,
-    commander_cursor: usize,
-) -> Option<(u16, u16)> {
-    let inner = layout.commander_inner;
-    if inner.width == 0 || inner.height == 0 {
-        return None;
-    }
-    let prompt_width = COMMANDER_PROMPT.chars().count();
-    let input_width = inner.width.saturating_sub(prompt_width as u16) as usize;
-    if input_width == 0 {
-        return None;
-    }
-    let visible = truncate_to_width(commander_input, input_width);
-    let visible_chars = visible.chars().count();
-    let cursor_in_visible = commander_cursor.min(visible_chars);
-    let cursor_x = inner
-        .x
-        .saturating_add(prompt_width as u16)
-        .saturating_add(cursor_in_visible as u16)
-        .min(inner.right().saturating_sub(1));
-    Some((cursor_x, inner.y))
-}
-
-pub(crate) fn workspace_commander_input_hit(layout: TopBarLayout, x: u16, y: u16) -> bool {
-    contains(layout.commander_frame, x, y)
-}
-
 /// Truncate to a maximum number of terminal cells (counted as Unicode scalar
 /// values, matching ratatui's default monospace assumption).
 fn place_row(inner: Rect, y: u16, height: u16) -> (Rect, u16) {
@@ -652,10 +500,15 @@ pub(crate) struct AgentPreset {
     pub binary: Option<&'static str>,
 }
 
-pub(crate) const AGENT_PRESETS: [AgentPreset; 5] = [
+pub(crate) const AGENT_PRESETS: [AgentPreset; 6] = [
     AgentPreset {
         label: "Terminal",
         command: LOGIN_SHELL_SENTINEL,
+        binary: None,
+    },
+    AgentPreset {
+        label: "Commander",
+        command: COMMANDER_COMMAND,
         binary: None,
     },
     AgentPreset {
@@ -997,8 +850,6 @@ pub(crate) fn render_workspace_sidebar(
     workspace_names: &[String],
     _workspace_summaries: &[String],
     active_workspace_index: usize,
-    commander_focused: bool,
-    commander_input: &str,
     sidebar_workspace_selected_index: Option<usize>,
     sidebar_add_button_selected: bool,
 ) {
@@ -1059,13 +910,6 @@ pub(crate) fn render_workspace_sidebar(
         theme,
         workspace_names,
         active_workspace_index,
-    );
-    render_commander_frame(
-        f,
-        layout,
-        theme,
-        commander_focused,
-        commander_input,
     );
 
     let add_area = workspace_add_button_area(sidebar_area, workspace_names, active_workspace_index);
@@ -1331,11 +1175,64 @@ pub(crate) fn panel_settings_confirm_button_area(area: Rect) -> Rect {
     }
 }
 
+const NEW_PANE_TITLE_PREFIX: &str = "─ ";
+const NEW_PANE_TITLE_SUFFIX: &str = " ─";
+/// Rows below the pane's top edge where the picker modal begins.
+const NEW_PANE_PICKER_Y_INSET_FROM_PANE_TOP: u16 = 0;
+/// Columns to shift the picker left from the title-aligned anchor.
+const NEW_PANE_PICKER_X_SHIFT_LEFT: u16 = 2;
+
 pub(crate) struct NewPanePickerLayout {
-    pub hint: Rect,
-    pub name_label: Rect,
-    pub name_input: Rect,
+    pub title_row: Rect,
     pub list: Rect,
+}
+
+fn new_pane_picker_title_area(modal_area: Rect) -> Rect {
+    Rect {
+        x: modal_area.x.saturating_add(1),
+        y: modal_area.y,
+        width: modal_area.width.saturating_sub(2),
+        height: 1,
+    }
+}
+
+fn new_pane_picker_title_prefix_cols() -> usize {
+    NEW_PANE_TITLE_PREFIX.chars().count()
+}
+
+pub(crate) fn new_pane_picker_title_name_prefix_cols() -> usize {
+    new_pane_picker_title_prefix_cols()
+}
+
+fn new_pane_picker_title_suffix_cols() -> usize {
+    NEW_PANE_TITLE_SUFFIX.chars().count()
+}
+
+fn new_pane_picker_title_name_capacity(title_width: u16) -> usize {
+    title_width
+        .saturating_sub(
+            (new_pane_picker_title_prefix_cols() + new_pane_picker_title_suffix_cols()) as u16,
+        )
+        .max(1) as usize
+}
+
+pub(crate) fn new_pane_picker_name_cursor_position(
+    title_row: Rect,
+    name: &str,
+    cursor: usize,
+    name_selected: bool,
+) -> (u16, u16) {
+    let prefix = new_pane_picker_title_prefix_cols();
+    let cursor_col = if name_selected {
+        name.chars().count()
+    } else {
+        cursor.min(name.chars().count())
+    };
+    let x = title_row
+        .x
+        .saturating_add((prefix + cursor_col) as u16)
+        .min(title_row.right().saturating_sub(1));
+    (x, title_row.y)
 }
 
 pub(crate) fn new_pane_picker_modal_area(
@@ -1344,30 +1241,28 @@ pub(crate) fn new_pane_picker_modal_area(
     frame: Rect,
 ) -> Rect {
     let width = 26.min(pane_area.width);
-    let desired = AGENT_PRESETS.len() as u16 + 9;
+    let desired = AGENT_PRESETS.len() as u16 + 2;
     let height = desired.min(pane_dropdown_max_height(pane_area)).max(1);
-    pane_combobox_dropdown_area(pane_area, frame, anchor_title, width, height)
+    let mut area = pane_combobox_dropdown_area(pane_area, frame, anchor_title, width, height);
+    area.y = pane_area
+        .y
+        .saturating_add(NEW_PANE_PICKER_Y_INSET_FROM_PANE_TOP)
+        .min(pane_area.bottom().saturating_sub(height));
+    area.x = area
+        .x
+        .saturating_sub(NEW_PANE_PICKER_X_SHIFT_LEFT)
+        .max(pane_area.x);
+    clip_rect_to_frame(area, frame)
 }
 
 pub(crate) fn new_pane_picker_layout(modal_area: Rect) -> NewPanePickerLayout {
+    let title_row = new_pane_picker_title_area(modal_area);
     let inner = Block::default()
         .borders(Borders::ALL)
-        .title("─ New Pane ─")
+        .border_type(BorderType::Rounded)
         .inner(modal_area);
-    let y = inner.y;
-    let (hint, y) = place_row(inner, y, 1);
-    let (name_label, y) = place_row(inner, y, 1);
-    let remaining = inner.bottom().saturating_sub(y);
-    let list_min = 1;
-    let name_h = 3.min(remaining.saturating_sub(list_min));
-    let (name_input, y) = place_row(inner, y, name_h);
-    let (list, _) = place_row(inner, y, inner.bottom().saturating_sub(y));
-    NewPanePickerLayout {
-        hint,
-        name_label,
-        name_input,
-        list,
-    }
+    let (list, _) = place_row(inner, inner.y, inner.height);
+    NewPanePickerLayout { title_row, list }
 }
 
 pub(crate) fn render_new_pane_picker_modal(
@@ -1389,7 +1284,6 @@ pub(crate) fn render_new_pane_picker_modal(
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .title("─ New Pane ─")
         .style(Style::default().fg(theme.foreground).bg(bg_color(theme)))
         .border_style(Style::default().fg(theme.accent));
     f.render_widget(block, area);
@@ -1397,41 +1291,29 @@ pub(crate) fn render_new_pane_picker_modal(
     let layout = new_pane_picker_layout(area);
     let list_style = Style::default().fg(theme.foreground).bg(bg_color(theme));
 
-    if layout.hint.height > 0 {
+    let title_row = clip_rect_to_frame(layout.title_row, frame);
+    if title_row.height > 0 && title_row.width > 0 {
+        let name_capacity = new_pane_picker_title_name_capacity(title_row.width);
+        let visible_name = truncate_to_width(name, name_capacity);
+        let chrome_style = Style::default().fg(theme.muted).bg(bg_color(theme));
+        let mut name_style = if name_selected {
+            Style::default().fg(bg_color(theme)).bg(theme.accent)
+        } else if name_error.is_some() {
+            Style::default().fg(Color::Red).bg(bg_color(theme))
+        } else {
+            Style::default().fg(theme.foreground).bg(bg_color(theme))
+        };
+        if name_error.is_some() && !name_selected {
+            name_style = name_style.add_modifier(Modifier::UNDERLINED);
+        }
         f.render_widget(
-            Paragraph::new("Type name, L/R cursor, U/D agent")
-                .style(Style::default().fg(theme.muted).bg(bg_color(theme))),
-            clip_rect_to_frame(layout.hint, frame),
-        );
-    }
-
-    if layout.name_label.height > 0 {
-        f.render_widget(
-            Paragraph::new("Name").style(Style::default().fg(theme.foreground).bg(bg_color(theme))),
-            clip_rect_to_frame(layout.name_label, frame),
-        );
-    }
-
-    let name_area = clip_rect_to_frame(layout.name_input, frame);
-    let mut name_inner = Rect::default();
-    if name_area.height > 0 {
-        let name_block = Block::default()
-            .borders(Borders::ALL)
-            .style(Style::default().fg(theme.foreground).bg(bg_color(theme)))
-            .border_style(if name_error.is_some() {
-                Style::default().fg(Color::Red)
-            } else {
-                Style::default().fg(theme.accent)
-            });
-        name_inner = name_block.inner(name_area);
-        f.render_widget(name_block, name_area);
-        f.render_widget(
-            Paragraph::new(name.to_string()).style(if name_selected {
-                Style::default().fg(bg_color(theme)).bg(theme.accent)
-            } else {
-                Style::default().fg(theme.foreground).bg(bg_color(theme))
-            }),
-            clip_rect_to_frame(name_inner, frame),
+            Paragraph::new(Line::from(vec![
+                Span::styled(NEW_PANE_TITLE_PREFIX, chrome_style),
+                Span::styled(visible_name, name_style),
+                Span::styled(NEW_PANE_TITLE_SUFFIX, chrome_style),
+            ]))
+            .style(Style::default().bg(bg_color(theme))),
+            title_row,
         );
     }
 
@@ -1465,16 +1347,10 @@ pub(crate) fn render_new_pane_picker_modal(
 
     render_lines_in_area(f, list_area, lines, list_style, frame);
 
-    if name_inner.height > 0 {
-        let clamped_cursor = if name_selected {
-            name.chars().count()
-        } else {
-            cursor.min(name.chars().count())
-        };
-        let cursor_x = name_inner.x.saturating_add(
-            clamped_cursor.min(name_inner.width.saturating_sub(1) as usize) as u16,
-        );
-        f.set_cursor(cursor_x, name_inner.y);
+    if title_row.height > 0 {
+        let (cursor_x, cursor_y) =
+            new_pane_picker_name_cursor_position(title_row, name, cursor, name_selected);
+        f.set_cursor(cursor_x, cursor_y);
     }
 }
 

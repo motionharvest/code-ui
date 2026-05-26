@@ -45,11 +45,11 @@ use git_status::GitStatusCache;
 use layout::{clip_rect_to_frame, pane_borders, pane_inner_area};
 use theme::Theme;
 use ui::{
-    commander_input_cursor_position, compute_top_bar_layout, pane_chrome_title_label,
+    commander_chrome_title_label, compute_top_bar_layout, pane_chrome_title_label,
     render_help_modal, render_new_pane_picker_modal, render_panel_settings_modal,
     render_panel_title_chrome, render_theme_modal, render_top_chrome,
     render_worktree_picker_modal, render_workspace_settings_modal, render_workspace_sidebar,
-    bg_color,
+    bg_color, COMMANDER_COMMAND,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -244,6 +244,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
         }
 
         if dirty {
+            app.prepare_commander_palette_video(last_size);
+            let mut commander_chat_metrics = None;
             terminal.draw(|f| {
                 let theme = if app.modal == Some(ui::Modal::Theme) {
                     app.preview_theme()
@@ -273,8 +275,6 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                     &workspace_names,
                     &workspace_summaries,
                     app.active_workspace_index(),
-                    app.commander_focused(),
-                    app.commander_input(),
                     app.sidebar_workspace_focused(),
                     app.sidebar_add_button_focused(),
                 );
@@ -305,20 +305,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                 let placements = app.pane_placements(App::content_area(f.size()));
                 let swap_preview_target = app.pane_swap_preview_target();
                 let modal_is_none = app.modal.is_none();
-                let commander_focused = app.commander_focused();
-                let focused_pane_id = (!commander_focused
-                    && app.sidebar_workspace_focused().is_none()
+                let focused_pane_id = (app.sidebar_workspace_focused().is_none()
                     && !app.sidebar_add_button_focused())
                 .then_some(app.focused);
-                if modal_is_none && commander_focused {
-                    if let Some((x, y)) = commander_input_cursor_position(
-                        top_layout,
-                        app.commander_input(),
-                        app.commander_cursor(),
-                    ) {
-                        f.set_cursor(x, y);
-                    }
-                }
 
                 for placement in placements {
                     let focused = focused_pane_id == Some(placement.pane_id);
@@ -351,6 +340,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         placement.area
                     };
 
+                    // Clear the first-paint gate even when the placement rect is
+                    // temporarily zero-sized so PTY output is not blocked forever.
+                    pane.mark_painted();
+
                     if pane_area.width == 0 || pane_area.height == 0 {
                         continue;
                     }
@@ -371,11 +364,23 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         .style(Style::default().bg(bg_color(theme)))
                         .border_style(edge_style);
                     f.render_widget(block, pane_area);
-                    pane.mark_painted();
 
-                    let git_summary = git_cache.summary_for_pane(pane);
-                    let folder_name = git_cache.folder_name_for_pane(pane);
-                    let title = pane_chrome_title_label(&pane.title, &pane.command);
+                    let is_commander = pane.command == COMMANDER_COMMAND;
+                    let git_summary = if is_commander {
+                        None
+                    } else {
+                        git_cache.summary_for_pane(pane)
+                    };
+                    let folder_name = if is_commander {
+                        None
+                    } else {
+                        git_cache.folder_name_for_pane(pane)
+                    };
+                    let title = if is_commander {
+                        commander_chrome_title_label()
+                    } else {
+                        pane_chrome_title_label(&pane.title, &pane.command)
+                    };
                     render_panel_title_chrome(
                         f,
                         pane_area,
@@ -398,6 +403,19 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                             continue;
                         }
 
+                        if is_commander {
+                            let metrics = render_commander_panel_content(
+                                f,
+                                app,
+                                inner,
+                                theme,
+                                focused,
+                                modal_is_none,
+                            );
+                            commander_chat_metrics = Some(metrics);
+                            continue;
+                        }
+
                         let content_area = clip_rect_to_frame(inner, f.size());
 
                         let pane_view =
@@ -409,7 +427,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                             Style::default().bg(bg_color(theme)),
                         );
 
-                        if modal_is_none && focused && !commander_focused {
+                        if modal_is_none && focused {
                             if let Some((x, y)) = pane.cursor_position_in(content_area) {
                                 f.set_cursor(x, y);
                             }
@@ -566,6 +584,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                     }
                 }
             })?;
+            if let Some((viewport, total)) = commander_chat_metrics {
+                app.set_commander_chat_metrics(viewport, total);
+            }
             dirty = false;
         }
 
@@ -928,6 +949,428 @@ fn color_distance_sq(a: (u8, u8, u8), b: (u8, u8, u8)) -> u32 {
     let dg = i32::from(a.1) - i32::from(b.1);
     let db = i32::from(a.2) - i32::from(b.2);
     (dr * dr + dg * dg + db * db) as u32
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChatSide {
+    Left,
+    Right,
+}
+
+#[derive(Clone)]
+struct ChatRenderLine {
+    side: ChatSide,
+    text: String,
+    fg: Color,
+    bg: Color,
+    is_tail: bool,
+}
+
+fn render_commander_panel_content(
+    f: &mut Frame<'_>,
+    app: &App,
+    inner: Rect,
+    theme: Theme,
+    focused: bool,
+    modal_is_none: bool,
+) -> (u16, usize) {
+    let content_height = inner.height;
+    let commander_input = app.commander_input();
+    let clamped_cursor = app.commander_cursor().min(commander_input.chars().count());
+    let full_input = format!("> {}", commander_input);
+    let cursor_char_index = 2 + clamped_cursor;
+    let (wrapped_lines, cursor_row, cursor_col) =
+        hard_wrap_with_cursor(&full_input, cursor_char_index, inner.width);
+    let total_input_lines = wrapped_lines.len() as u16;
+    let input_height = total_input_lines.clamp(1, content_height);
+    let input_top = inner.bottom().saturating_sub(input_height);
+    let visible_start = total_input_lines.saturating_sub(input_height);
+    let visible_input = wrapped_lines[visible_start as usize..].join("\n");
+
+    let logs_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: input_top.saturating_sub(inner.y),
+    };
+
+    let chat_metrics = if logs_area.height > 0 {
+        let [top_third, middle_third, bottom_third] = split_rect_into_thirds(logs_area);
+
+        if middle_third.height > 0 {
+            if let Some(frame) = app.commander_palette_video_frame() {
+                render_ascii_character_overlay(f, middle_third, frame, theme);
+            }
+        }
+
+        let chat_area = if bottom_third.height > 0 {
+            bottom_third
+        } else if middle_third.height > 0 {
+            middle_third
+        } else {
+            top_third
+        };
+        if chat_area.height > 0 && chat_area.y > logs_area.y && logs_area.width > 0 {
+            let divider = "─".repeat(logs_area.width as usize);
+            f.render_widget(
+                Paragraph::new(divider)
+                    .style(Style::default().fg(theme.muted).bg(bg_color(theme))),
+                Rect {
+                    x: logs_area.x,
+                    y: chat_area.y.saturating_sub(1),
+                    width: logs_area.width,
+                    height: 1,
+                },
+            );
+        }
+        let chat_lines = build_commander_chat_lines(app.commander_history(), chat_area.width, theme);
+        render_commander_chat_overlay(
+            f,
+            chat_area,
+            &chat_lines,
+            app.commander_chat_offset_from_bottom(),
+            theme,
+        );
+        (chat_area.height, chat_lines.len())
+    } else {
+        (0, 0)
+    };
+
+    let input_area = Rect {
+        x: inner.x,
+        y: input_top,
+        width: inner.width,
+        height: input_height,
+    };
+    let input_style = if focused {
+        Style::default().fg(theme.accent).bg(bg_color(theme))
+    } else {
+        Style::default().fg(theme.foreground).bg(bg_color(theme))
+    };
+    f.render_widget(Paragraph::new(visible_input).style(input_style), input_area);
+
+    if modal_is_none && focused {
+        let visible_cursor_row = cursor_row.saturating_sub(visible_start as usize) as u16;
+        let cursor_x = input_area
+            .x
+            .saturating_add((cursor_col as u16).min(input_area.width.saturating_sub(1)));
+        let cursor_y = input_area
+            .y
+            .saturating_add(visible_cursor_row.min(input_area.height.saturating_sub(1)));
+        f.set_cursor(cursor_x, cursor_y);
+    }
+
+    chat_metrics
+}
+
+fn render_commander_chat_overlay(
+    f: &mut Frame<'_>,
+    area: Rect,
+    lines: &[ChatRenderLine],
+    scroll_offset_from_bottom: usize,
+    theme: Theme,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let max_lines = area.height as usize;
+    let end = lines.len().saturating_sub(scroll_offset_from_bottom);
+    let start = end.saturating_sub(max_lines);
+    let visible = lines
+        .iter()
+        .skip(start)
+        .take(max_lines)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    for (row, line) in visible.into_iter().enumerate() {
+        let y = area.y.saturating_add(row as u16);
+        if y >= area.bottom() {
+            break;
+        }
+        let text_width = line.text.chars().count().min(area.width as usize).max(1) as u16;
+        let x = match line.side {
+            ChatSide::Left => area.x,
+            ChatSide::Right => area.right().saturating_sub(text_width),
+        };
+        let style = if line.is_tail {
+            Style::default().fg(line.bg).bg(bg_color(theme))
+        } else {
+            Style::default().fg(line.fg).bg(line.bg)
+        };
+        f.render_widget(
+            Paragraph::new(line.text).style(style),
+            Rect {
+                x,
+                y,
+                width: text_width,
+                height: 1,
+            },
+        );
+    }
+}
+
+fn render_ascii_character_overlay(f: &mut Frame<'_>, area: Rect, frame: &str, theme: Theme) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let style = Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD);
+    for (row, line) in frame.lines().take(area.height as usize).enumerate() {
+        let mut run = String::new();
+        let mut run_start = 0usize;
+        let mut col = 0usize;
+        for ch in line.chars().take(area.width as usize) {
+            if ch == ' ' {
+                if !run.is_empty() {
+                    f.render_widget(
+                        Paragraph::new(run.clone()).style(style),
+                        Rect {
+                            x: area.x.saturating_add(run_start as u16),
+                            y: area.y.saturating_add(row as u16),
+                            width: run.chars().count() as u16,
+                            height: 1,
+                        },
+                    );
+                    run.clear();
+                }
+            } else {
+                if run.is_empty() {
+                    run_start = col;
+                }
+                run.push(ch);
+            }
+            col += 1;
+        }
+        if !run.is_empty() {
+            f.render_widget(
+                Paragraph::new(run).style(style),
+                Rect {
+                    x: area.x.saturating_add(run_start as u16),
+                    y: area.y.saturating_add(row as u16),
+                    width: col.saturating_sub(run_start) as u16,
+                    height: 1,
+                },
+            );
+        }
+    }
+}
+
+fn build_commander_chat_lines(history: &[String], width: u16, theme: Theme) -> Vec<ChatRenderLine> {
+    let total_width = width.max(1) as usize;
+    let (user_bg, user_fg, commander_bg, commander_fg) = if theme.passthrough {
+        (Color::Blue, Color::White, Color::DarkGray, Color::White)
+    } else {
+        (
+            theme.accent,
+            bg_color(theme),
+            theme.muted,
+            theme.foreground,
+        )
+    };
+
+    let mut out = Vec::<ChatRenderLine>::new();
+    let max_inner_width = total_width.saturating_sub(6).max(8);
+    let mut last_side: Option<ChatSide> = None;
+
+    for entry in history {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let (side, speaker, text, bubble_bg, bubble_fg) =
+            if let Some(text) = trimmed.strip_prefix("You: ") {
+                (ChatSide::Right, "You", text.trim(), user_bg, user_fg)
+            } else if let Some(text) = trimmed.strip_prefix("Commander: ") {
+                (
+                    ChatSide::Left,
+                    "Commander",
+                    text.trim(),
+                    commander_bg,
+                    commander_fg,
+                )
+            } else {
+                out.push(ChatRenderLine {
+                    side: ChatSide::Left,
+                    text: trimmed.to_string(),
+                    fg: theme.muted,
+                    bg: bg_color(theme),
+                    is_tail: false,
+                });
+                continue;
+            };
+
+        if text.is_empty() {
+            continue;
+        }
+
+        if last_side.is_some() && last_side != Some(side) {
+            out.push(ChatRenderLine {
+                side: ChatSide::Left,
+                text: String::new(),
+                fg: theme.foreground,
+                bg: bg_color(theme),
+                is_tail: false,
+            });
+        }
+        out.push(ChatRenderLine {
+            side,
+            text: format!("{speaker}:"),
+            fg: theme.muted,
+            bg: bg_color(theme),
+            is_tail: false,
+        });
+
+        let wrapped = hard_wrap_text(text, max_inner_width);
+        let inner_width = wrapped
+            .iter()
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(0);
+
+        for line in wrapped {
+            let padding = inner_width.saturating_sub(line.chars().count());
+            let bubble_text = format!(" {}{} ", line, " ".repeat(padding));
+            out.push(ChatRenderLine {
+                side,
+                text: bubble_text,
+                fg: bubble_fg,
+                bg: bubble_bg,
+                is_tail: false,
+            });
+        }
+
+        let tail_char = match side {
+            ChatSide::Right => "◥",
+            ChatSide::Left => "◤",
+        };
+        out.push(ChatRenderLine {
+            side,
+            text: tail_char.to_string(),
+            fg: bubble_bg,
+            bg: bg_color(theme),
+            is_tail: true,
+        });
+        out.push(ChatRenderLine {
+            side: ChatSide::Left,
+            text: String::new(),
+            fg: theme.foreground,
+            bg: bg_color(theme),
+            is_tail: false,
+        });
+        last_side = Some(side);
+    }
+
+    out
+}
+
+fn hard_wrap_text(text: &str, width: usize) -> Vec<String> {
+    let wrap_width = width.max(1);
+    let mut lines = vec![String::new()];
+    let mut col = 0usize;
+    for ch in text.chars() {
+        if ch == '\n' {
+            lines.push(String::new());
+            col = 0;
+            continue;
+        }
+        if col >= wrap_width {
+            lines.push(String::new());
+            col = 0;
+        }
+        if let Some(line) = lines.last_mut() {
+            line.push(ch);
+        }
+        col += 1;
+    }
+    lines
+}
+
+fn split_rect_into_thirds(area: Rect) -> [Rect; 3] {
+    if area.height == 0 {
+        return [area, area, area];
+    }
+
+    let base = area.height / 3;
+    let remainder = area.height % 3;
+    let h0 = base;
+    let h1 = base;
+    let h2 = base + remainder;
+    let y1 = area.y.saturating_add(h0);
+    let y2 = y1.saturating_add(h1);
+
+    [
+        Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: h0,
+        },
+        Rect {
+            x: area.x,
+            y: y1,
+            width: area.width,
+            height: h1,
+        },
+        Rect {
+            x: area.x,
+            y: y2,
+            width: area.width,
+            height: h2,
+        },
+    ]
+}
+
+fn hard_wrap_with_cursor(
+    text: &str,
+    cursor_char_index: usize,
+    width: u16,
+) -> (Vec<String>, usize, usize) {
+    let wrap_width = width.max(1) as usize;
+    let mut lines = vec![String::new()];
+    let mut row = 0usize;
+    let mut col = 0usize;
+    let mut chars_seen = 0usize;
+    let mut cursor_row = 0usize;
+    let mut cursor_col = 0usize;
+
+    let mut set_cursor_if_match = |seen: usize, row: usize, col: usize| {
+        if seen == cursor_char_index {
+            cursor_row = row;
+            cursor_col = col;
+        }
+    };
+    set_cursor_if_match(0, row, col);
+
+    for ch in text.chars() {
+        if ch == '\n' {
+            lines.push(String::new());
+            row += 1;
+            col = 0;
+        } else {
+            if col >= wrap_width {
+                lines.push(String::new());
+                row += 1;
+                col = 0;
+            }
+            if let Some(line) = lines.last_mut() {
+                line.push(ch);
+            }
+            col += 1;
+        }
+
+        chars_seen += 1;
+        set_cursor_if_match(chars_seen, row, col);
+    }
+
+    if cursor_char_index > chars_seen {
+        cursor_row = row;
+        cursor_col = col;
+    }
+
+    (lines, cursor_row, cursor_col)
 }
 
 #[cfg(test)]

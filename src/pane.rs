@@ -78,10 +78,15 @@ pub(crate) struct Pane {
     cached_view: Option<Text<'static>>,
     view_dirty: bool,
     first_paint_pending: bool,
+    /// Commander panels are UI-only and do not own a tmux session or PTY child.
+    stub: bool,
 }
 
 impl Drop for Pane {
     fn drop(&mut self) {
+        if self.stub {
+            return;
+        }
         unsafe {
             libc::kill(self.child.as_raw(), libc::SIGTERM);
         }
@@ -90,6 +95,42 @@ impl Drop for Pane {
 }
 
 impl Pane {
+    pub(crate) fn new_commander(id: usize, rows: u16, cols: u16) -> Self {
+        let (_tx, rx) = mpsc::channel();
+        Self {
+            id,
+            title: "Commander".to_string(),
+            command: "commander".to_string(),
+            resume_command: None,
+            last_command: None,
+            agent_binary: None,
+            exited: false,
+            relaunch_failed: false,
+            parser: vt100::Parser::new(rows, cols, 0),
+            writer: File::open("/dev/null").unwrap_or_else(|_| {
+                File::create("/dev/null").expect("open /dev/null for commander stub pane")
+            }),
+            rx,
+            child: Pid::from_raw(0),
+            tmux_session: String::new(),
+            cols,
+            rows,
+            scrollback: 0,
+            scrollback_max: 0,
+            last_replayed_command: None,
+            input_buffer: String::new(),
+            input_cursor: 0,
+            cached_view: None,
+            view_dirty: false,
+            first_paint_pending: false,
+            stub: true,
+        }
+    }
+
+    pub(crate) fn is_stub(&self) -> bool {
+        self.stub
+    }
+
     pub(crate) fn new(
         id: usize,
         title: impl Into<String>,
@@ -165,6 +206,7 @@ impl Pane {
                     cached_view: None,
                     view_dirty: true,
                     first_paint_pending: true,
+                    stub: false,
                 };
                 pane.replay_tmux_history();
                 pane.sync_scrollback();
@@ -207,7 +249,7 @@ impl Pane {
     /// Drain any pending PTY output into the parser. Returns true if any bytes
     /// were processed (i.e. the rendered view may have changed).
     pub(crate) fn pump(&mut self) -> bool {
-        if self.first_paint_pending {
+        if self.stub || self.first_paint_pending {
             return false;
         }
         let mut processed = false;
@@ -249,6 +291,9 @@ impl Pane {
     /// Permanently close the persistent session backing this pane. This is
     /// used when the user closes/replaces a pane, not when the whole app exits.
     pub(crate) fn terminate_session(&self) {
+        if self.stub {
+            return;
+        }
         let _ = Command::new("tmux")
             .args(["kill-session", "-t", &self.tmux_session])
             .stdout(Stdio::null())
@@ -266,6 +311,9 @@ impl Pane {
     /// original agent so persistence can bring the pane back where the agent
     /// left off on the next launch.
     pub(crate) fn relaunch_as_shell(&mut self) -> anyhow::Result<()> {
+        if self.stub {
+            return Ok(());
+        }
         let command = self.command.clone();
         let resume_command = self.resume_command.clone();
         let last_command = self.last_command.clone();
@@ -386,6 +434,9 @@ impl Pane {
     }
 
     pub(crate) fn send(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        if self.stub {
+            return Ok(());
+        }
         self.writer.write_all(bytes)?;
         self.writer.flush()?;
         Ok(())

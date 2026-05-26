@@ -29,11 +29,11 @@ use crate::{
     ui::{
         default_agent_index, help_close_button_area,
         help_debug_toggle_button_area, help_modal_area, new_pane_picker_layout,
-        new_pane_picker_modal_area, pane_chrome_title_label,
+        new_pane_picker_modal_area, new_pane_picker_title_name_prefix_cols, pane_chrome_title_label,
         panel_settings_agent_list_area, panel_settings_cancel_button_area,
         panel_settings_close_button_area, panel_settings_confirm_button_area,
         panel_settings_modal_area, panel_settings_modal_inner, panel_settings_name_input_area,
-        compute_top_bar_layout, workspace_add_button_hit, workspace_commander_input_hit,
+        compute_top_bar_layout, workspace_add_button_hit,
         workspace_hit_index, workspace_menu_hit_index, workspace_settings_action_hit_index,
         workspace_settings_modal_area, workspace_settings_name_input_area, Modal,
         PanelSettingsFocus, WorktreePickerFocus, AGENT_PRESETS, COMMANDER_COMMAND, TOP_CHROME_ROWS,
@@ -67,7 +67,6 @@ pub(crate) struct App {
     pub(crate) theme_preview_index: usize,
     debug_container_boxes: bool,
     mouse_capture_enabled: bool,
-    commander_focused: bool,
     sidebar_workspace_focused: Option<usize>,
     sidebar_add_button_focused: bool,
     commander: CommanderState,
@@ -345,7 +344,9 @@ pub(crate) enum MousePointerShape {
 }
 
 impl App {
-    const NEW_PANE_PLACEHOLDER_COMMAND: &'static str = "cat";
+    /// Temporary pane command used while the new-pane picker is open. Must stay
+    /// alive (unlike `cat`) so the slot is not blank/exited before the user confirms.
+    const NEW_PANE_PLACEHOLDER_COMMAND: &'static str = LOGIN_SHELL_SENTINEL;
     const DUPLICATE_PANE_NAME_ERROR: &'static str = "Name already exists. Pick another.";
 
     fn pane_name_exists_for_other(&self, pane_id: usize, candidate: &str) -> bool {
@@ -430,11 +431,6 @@ impl App {
                     .and_then(|state| state.commands.get(&id).cloned())
                     .unwrap_or_else(|| AGENT_PRESETS[default_agent_index].command.to_string());
                 let command = normalize_stored_agent_command(command);
-                let command = if command == COMMANDER_COMMAND {
-                    AGENT_PRESETS[default_agent_index].command.to_string()
-                } else {
-                    command
-                };
                 let resume_command = persisted
                     .as_ref()
                     .and_then(|state| state.resume_commands.get(&id).cloned());
@@ -444,16 +440,22 @@ impl App {
                 let initial_scroll_offset = persisted
                     .as_ref()
                     .and_then(|state| state.scroll_offsets.get(&id).copied());
-                Pane::new(
-                    id,
-                    title,
-                    command,
-                    resume_command,
-                    last_command,
-                    content_rows,
-                    content_cols,
-                    initial_scroll_offset,
-                )
+                if command == COMMANDER_COMMAND {
+                    let mut pane = Pane::new_commander(id, content_rows, content_cols);
+                    pane.title = title;
+                    Ok(pane)
+                } else {
+                    Pane::new(
+                        id,
+                        title,
+                        command,
+                        resume_command,
+                        last_command,
+                        content_rows,
+                        content_cols,
+                        initial_scroll_offset,
+                    )
+                }
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
 
@@ -496,7 +498,6 @@ impl App {
             theme_preview_index: theme_index,
             debug_container_boxes: parse_debug_flag("SPLIT_TUI_DEBUG_CONTAINERS"),
             mouse_capture_enabled: true,
-            commander_focused: false,
             sidebar_workspace_focused: None,
             sidebar_add_button_focused: false,
             commander: CommanderState {
@@ -538,6 +539,17 @@ impl App {
         };
         app.rebuild_hit_test_cache();
         Ok(app)
+    }
+
+    fn commander_pane_id_in_layout(&self, layout: &Node) -> Option<usize> {
+        let mut ids = Vec::new();
+        layout.collect_leaf_ids(&mut ids);
+        ids.into_iter()
+            .find(|&id| self.pane_is_commander(id))
+    }
+
+    fn commander_pane_id_for_active_layout(&self) -> Option<usize> {
+        self.commander_pane_id_in_layout(&self.layout)
     }
 
     pub(crate) fn body_area(size: Rect) -> Rect {
@@ -590,10 +602,6 @@ impl App {
 
     pub(crate) fn active_workspace_index(&self) -> usize {
         self.active_workspace
-    }
-
-    pub(crate) fn commander_focused(&self) -> bool {
-        self.commander_focused
     }
 
     pub(crate) fn sidebar_workspace_focused(&self) -> Option<usize> {
@@ -703,6 +711,9 @@ impl App {
         }
         let mut handoff_updates = Vec::new();
         for pane in &mut self.panes {
+            if pane.is_stub() {
+                continue;
+            }
             if pane.pump() {
                 if pane.command != COMMANDER_COMMAND {
                     let text = pane.recent_plain_text();
@@ -712,7 +723,7 @@ impl App {
                 }
                 any = true;
             }
-            if pane.exited && !pane.relaunch_failed {
+            if pane.exited && !pane.relaunch_failed && !pane.is_stub() {
                 match pane.relaunch_as_shell() {
                     Ok(()) => any = true,
                     Err(_) => pane.relaunch_failed = true,
@@ -773,7 +784,6 @@ impl App {
             return;
         }
         if workspace_index == self.active_workspace {
-            self.commander_focused = false;
             self.sidebar_workspace_focused = None;
             self.sidebar_add_button_focused = false;
             self.drag_resize = None;
@@ -789,7 +799,6 @@ impl App {
         self.drag_resize = None;
         self.drag_swap = None;
         self.drag_pane_mouse = None;
-        self.commander_focused = false;
         self.sidebar_workspace_focused = None;
         self.sidebar_add_button_focused = false;
         self.resize(size.height, size.width);
@@ -904,16 +913,23 @@ impl App {
 
         let title = format!("Pane {}", pane_id + 1);
         let default_index = self.first_available_agent_for_pane(pane_id, self.default_agent_index);
-        self.panes.push(Pane::new(
-            pane_id,
-            title,
-            AGENT_PRESETS[default_index].command,
-            None,
-            None,
-            1,
-            1,
-            None,
-        )?);
+        let command = AGENT_PRESETS[default_index].command;
+        if command == COMMANDER_COMMAND {
+            let mut pane = Pane::new_commander(pane_id, 1, 1);
+            pane.title = title;
+            self.panes.push(pane);
+        } else {
+            self.panes.push(Pane::new(
+                pane_id,
+                title,
+                command,
+                None,
+                None,
+                1,
+                1,
+                None,
+            )?);
+        }
 
         self.workspaces.push(WorkspaceState {
             name: format!("Workspace {}", self.workspaces.len() + 1),
@@ -923,7 +939,6 @@ impl App {
         });
         self.active_workspace = self.workspaces.len().saturating_sub(1);
         self.load_active_workspace_state();
-        self.commander_focused = false;
         self.sidebar_workspace_focused = None;
         self.sidebar_add_button_focused = false;
         self.drag_pane_mouse = None;
@@ -999,7 +1014,6 @@ impl App {
         self.drag_resize = None;
         self.drag_swap = None;
         self.drag_pane_mouse = None;
-        self.commander_focused = false;
         self.sidebar_workspace_focused = None;
         self.sidebar_add_button_focused = false;
         self.resize(size.height, size.width);
@@ -1039,28 +1053,15 @@ impl App {
         Ok(false)
     }
 
-    fn focus_commander_from_sidebar(&mut self, size: Rect) {
-        self.commander_focused = true;
-        self.sidebar_workspace_focused = None;
-        self.sidebar_add_button_focused = false;
-        self.drag_resize = None;
-        self.drag_swap = None;
-        self.drag_pane_mouse = None;
-        self.resize(size.height, size.width);
-        self.persist_layout();
-    }
-
     fn focus_workspace_tab_from_sidebar(&mut self, workspace_index: usize) {
         if workspace_index >= self.workspaces.len() {
             return;
         }
-        self.commander_focused = false;
         self.sidebar_workspace_focused = Some(workspace_index);
         self.sidebar_add_button_focused = false;
     }
 
     fn focus_workspace_add_button_from_sidebar(&mut self) {
-        self.commander_focused = false;
         self.sidebar_workspace_focused = None;
         self.sidebar_add_button_focused = true;
     }
@@ -1070,7 +1071,6 @@ impl App {
             return;
         };
         self.switch_workspace(workspace_index, size);
-        self.commander_focused = false;
         self.sidebar_workspace_focused = Some(workspace_index);
         self.sidebar_add_button_focused = false;
     }
@@ -1083,34 +1083,29 @@ impl App {
     }
 
     fn sidebar_item_count(&self) -> usize {
-        2 + self.workspaces.len()
+        1 + self.workspaces.len()
     }
 
     fn sidebar_add_button_index(&self) -> usize {
-        self.workspaces.len().saturating_add(1)
+        self.workspaces.len()
     }
 
     fn sidebar_item_index(&self) -> Option<usize> {
-        if self.commander_focused {
-            Some(0)
-        } else if self.sidebar_add_button_focused {
+        if self.sidebar_add_button_focused {
             Some(self.sidebar_add_button_index())
         } else {
             self.sidebar_workspace_focused
-                .map(|workspace_index| workspace_index.saturating_add(1))
         }
     }
 
-    fn focus_sidebar_item(&mut self, size: Rect, item_index: usize) {
-        if item_index == 0 {
-            self.focus_commander_from_sidebar(size);
-            return;
-        }
+    fn focus_sidebar_item(&mut self, _size: Rect, item_index: usize) {
         if item_index == self.sidebar_add_button_index() {
             self.focus_workspace_add_button_from_sidebar();
             return;
         }
-        self.focus_workspace_tab_from_sidebar(item_index.saturating_sub(1));
+        if item_index < self.workspaces.len() {
+            self.focus_workspace_tab_from_sidebar(item_index);
+        }
     }
 
     fn move_sidebar_focus(&mut self, size: Rect, step: isize) {
@@ -1130,10 +1125,7 @@ impl App {
     }
 
     fn handle_ctrl_arrow_focus(&mut self, size: Rect, side: SplitSide) {
-        if self.commander_focused
-            || self.sidebar_workspace_focused.is_some()
-            || self.sidebar_add_button_focused
-        {
+        if self.sidebar_workspace_focused.is_some() || self.sidebar_add_button_focused {
             match side {
                 SplitSide::Left => self.move_sidebar_focus(size, -1),
                 SplitSide::Right => self.move_sidebar_focus(size, 1),
@@ -1144,8 +1136,8 @@ impl App {
         }
 
         let moved = self.focus_adjacent(size, side);
-        if !moved && side == SplitSide::Left {
-            self.focus_commander_from_sidebar(size);
+        if !moved && side == SplitSide::Left && Self::sidebar_is_visible(size) {
+            self.focus_workspace_tab_from_sidebar(self.active_workspace);
         } else if !moved && side == SplitSide::Top && Self::sidebar_is_visible(size) {
             self.focus_workspace_tab_from_sidebar(self.active_workspace);
         }
@@ -1349,6 +1341,9 @@ impl App {
     }
 
     pub(crate) fn close_pane(&mut self) {
+        if self.pane_is_commander(self.focused) {
+            return;
+        }
         let mut current_workspace_panes = Vec::new();
         self.layout.collect_leaf_ids(&mut current_workspace_panes);
         if current_workspace_panes.len() <= 1 {
@@ -1407,6 +1402,9 @@ impl App {
         name: String,
         agent_index: usize,
     ) -> anyhow::Result<()> {
+        if self.pane_is_commander(pane_id) {
+            return Ok(());
+        }
         let Some(pos) = self.panes.iter().position(|pane| pane.id == pane_id) else {
             return Ok(());
         };
@@ -1423,32 +1421,41 @@ impl App {
             return Ok(());
         }
 
-        let (rows, cols, command_changed, title_changed) = {
+        let (rows, cols, title_changed, needs_session) = {
             let pane = &self.panes[pos];
             (
                 pane.rows,
                 pane.cols,
-                pane.command != command,
                 pane.title != name,
+                pane.command != command || (pane.exited && !pane.is_stub()),
             )
         };
 
-        if !command_changed && !title_changed {
+        if !needs_session {
+            if title_changed {
+                self.panes[pos].title = name;
+                self.focus_pane(pane_id);
+                self.persist_layout();
+            }
             return Ok(());
         }
 
-        if !command_changed {
-            self.panes[pos].title = name;
-            self.focus_pane(pane_id);
-            self.persist_layout();
-            return Ok(());
-        }
-
-        // Changing the agent of a pane discards any prior session state.
+        // Changing the agent of a pane discards any prior session state. Also
+        // respawn when the command is unchanged but the PTY child already exited.
         self.panes[pos].terminate_session();
-        self.panes[pos] = Pane::new(pane_id, name, command, None, None, rows, cols, None)?;
+        self.panes[pos] = if command == COMMANDER_COMMAND {
+            let mut pane = Pane::new_commander(pane_id, rows, cols);
+            pane.title = name;
+            pane
+        } else {
+            Pane::new(pane_id, name, command, None, None, rows, cols, None)?
+        };
         self.focus_pane(pane_id);
         self.persist_layout();
+        self.resize(
+            self.last_terminal_size.height,
+            self.last_terminal_size.width,
+        );
         Ok(())
     }
 
@@ -2145,7 +2152,7 @@ impl App {
                     source_pane_id,
                     close_on_cancel: true,
                     cursor: pane_name.chars().count(),
-                    name_selected: true,
+                    name_selected: false,
                     name: pane_name,
                     name_error: None,
                     agent_index,
@@ -2578,9 +2585,6 @@ impl App {
                         .unwrap_or_else(|| (Self::content_area(size), "Pane".to_string()));
                     let area = new_pane_picker_modal_area(pane_area, &anchor_title, size);
                     let layout = new_pane_picker_layout(area);
-                    let name_inner = ratatui::widgets::Block::default()
-                        .borders(ratatui::widgets::Borders::ALL)
-                        .inner(layout.name_input);
                     let list_area = layout.list;
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                         if contains(list_area, mouse.column, mouse.row) {
@@ -2589,11 +2593,42 @@ impl App {
                                 && self.agent_available_for_pane(pane_id, selected)
                             {
                                 agent_index = selected;
+                                if self.pane_name_exists_for_other(pane_id, &name) {
+                                    self.modal = Some(Modal::NewPanePicker {
+                                        pane_id,
+                                        source_pane_id,
+                                        close_on_cancel,
+                                        name,
+                                        name_error: Some(
+                                            Self::DUPLICATE_PANE_NAME_ERROR.to_string(),
+                                        ),
+                                        cursor,
+                                        name_selected,
+                                        agent_index,
+                                    });
+                                    return Ok(());
+                                }
+                                self.default_agent_index = agent_index;
+                                self.apply_panel_settings(pane_id, name, agent_index)?;
+                                self.modal = None;
+                                return Ok(());
                             }
-                        } else if contains(name_inner, mouse.column, mouse.row) {
-                            let click_col = mouse.column.saturating_sub(name_inner.x) as usize;
-                            cursor = click_col.min(name.chars().count());
+                        } else if contains(layout.title_row, mouse.column, mouse.row) {
+                            let prefix_cols = new_pane_picker_title_name_prefix_cols();
+                            let click_col =
+                                mouse.column.saturating_sub(layout.title_row.x) as usize;
+                            cursor = click_col
+                                .saturating_sub(prefix_cols)
+                                .min(name.chars().count());
                             name_selected = false;
+                        } else if !contains(area, mouse.column, mouse.row) {
+                            if close_on_cancel {
+                                self.focus_pane(pane_id);
+                                self.close_pane();
+                                self.focus_pane(source_pane_id);
+                            }
+                            self.modal = None;
+                            return Ok(());
                         }
                     }
                     self.modal = Some(Modal::NewPanePicker {
@@ -2864,31 +2899,6 @@ impl App {
             return Ok(());
         }
 
-        let top_layout = self.top_bar_layout(size, None);
-        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            && workspace_commander_input_hit(top_layout, mouse.column, mouse.row)
-        {
-            self.focus_commander_from_sidebar(size);
-            self.text_selection = None;
-            return Ok(());
-        }
-
-        if self.commander_focused
-            && workspace_commander_input_hit(top_layout, mouse.column, mouse.row)
-        {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => {
-                    self.commander_scroll_up();
-                    return Ok(());
-                }
-                MouseEventKind::ScrollDown => {
-                    self.commander_scroll_down();
-                    return Ok(());
-                }
-                _ => {}
-            }
-        }
-
         let clicked = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
         let down_button = match mouse.kind {
             MouseEventKind::Down(button) => Some(button),
@@ -2897,14 +2907,14 @@ impl App {
         let Some(placement) = self.placement_at(size, mouse.column, mouse.row) else {
             match mouse.kind {
                 MouseEventKind::ScrollUp => {
-                    if self.commander_focused {
+                    if self.focused_pane_is_commander() {
                         self.commander_scroll_up();
                     } else if let Some(pane) = self.focused_pane_mut() {
                         pane.scroll_up();
                     }
                 }
                 MouseEventKind::ScrollDown => {
-                    if self.commander_focused {
+                    if self.focused_pane_is_commander() {
                         self.commander_scroll_down();
                     } else if let Some(pane) = self.focused_pane_mut() {
                         pane.scroll_down();
@@ -2933,6 +2943,9 @@ impl App {
         if let Some(button) = down_button {
             if contains(inner, mouse.column, mouse.row) {
                 self.focus_pane(placement.pane_id);
+                if self.pane_is_commander(placement.pane_id) {
+                    return Ok(());
+                }
                 if button == MouseButton::Left && !mouse.modifiers.contains(KeyModifiers::SHIFT) {
                     let Some(cell) = Self::pane_mouse_cell(inner, mouse.column, mouse.row) else {
                         return Ok(());
@@ -3042,6 +3055,7 @@ impl App {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
                 if self.pane_is_commander(placement.pane_id) {
+                    self.commander_scroll_up();
                     return Ok(());
                 }
                 if let Some(pane) = self.pane_mut(placement.pane_id) {
@@ -3056,6 +3070,7 @@ impl App {
             }
             MouseEventKind::ScrollDown => {
                 if self.pane_is_commander(placement.pane_id) {
+                    self.commander_scroll_down();
                     return Ok(());
                 }
                 if let Some(pane) = self.pane_mut(placement.pane_id) {
@@ -3113,9 +3128,19 @@ impl App {
         }
         self.next_pane_id = self.next_pane_id.saturating_add(1);
 
-        let title = format!("Pane {}", new_id + 1);
-        self.panes
-            .push(Pane::new(new_id, title, command, None, None, 1, 1, None)?);
+        let title = if command == COMMANDER_COMMAND {
+            "Commander".to_string()
+        } else {
+            format!("Pane {}", new_id + 1)
+        };
+        if command == COMMANDER_COMMAND {
+            let mut pane = Pane::new_commander(new_id, 1, 1);
+            pane.title = title;
+            self.panes.push(pane);
+        } else {
+            self.panes
+                .push(Pane::new(new_id, title, command, None, None, 1, 1, None)?);
+        }
 
         if self.layout.split_leaf(pane_id, side, new_id) {
             self.resize(terminal_size.height, terminal_size.width);
@@ -3380,7 +3405,7 @@ impl App {
     }
 
     pub(crate) fn focused_pane_is_commander(&self) -> bool {
-        self.commander_focused
+        self.pane_is_commander(self.focused)
     }
 
     pub(crate) fn pane_is_commander(&self, pane_id: usize) -> bool {
@@ -3399,7 +3424,80 @@ impl App {
         self.commander.cursor
     }
 
-    #[cfg(test)]
+    pub(crate) fn commander_busy(&self) -> bool {
+        self.commander.busy
+    }
+
+    pub(crate) fn commander_history(&self) -> &[String] {
+        &self.commander.history
+    }
+
+    pub(crate) fn commander_phase_label(&self) -> &'static str {
+        if self.commander.busy {
+            return "thinking";
+        }
+        match self.commander.phase {
+            CommanderPhase::Discussing => "planning",
+            CommanderPhase::AwaitingApproval => "awaiting /approve",
+            CommanderPhase::Executing => "executing",
+        }
+    }
+
+    pub(crate) fn commander_palette_video_frame(&self) -> Option<&str> {
+        if self.commander_palette_video.child.is_some()
+            && !self.commander_palette_video.frame_text.trim().is_empty()
+        {
+            Some(self.commander_palette_video.frame_text.as_str())
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn set_commander_palette_video_size(&mut self, rows: u16, cols: u16) {
+        let rows = rows.max(1);
+        let cols = cols.max(1);
+        if rows == self.commander_palette_video.rows && cols == self.commander_palette_video.cols {
+            return;
+        }
+        self.commander_palette_video.rows = rows;
+        self.commander_palette_video.cols = cols;
+        self.commander_palette_video
+            .parser
+            .set_size(commander_palette_video_source_rows(rows), cols);
+        self.commander_palette_video.frame_text.clear();
+        if self.commander_palette_video.child.is_some() {
+            self.start_commander_palette_video();
+        }
+    }
+
+    pub(crate) fn prepare_commander_palette_video(&mut self, size: Rect) {
+        let Some(commander_id) = self.commander_pane_id_for_active_layout() else {
+            return;
+        };
+        let Some(placement) = self
+            .pane_placements(Self::content_area(size))
+            .into_iter()
+            .find(|placement| placement.pane_id == commander_id)
+        else {
+            return;
+        };
+        let inner = pane_inner_area(placement.area, placement.exposed);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+
+        let input_height = 1u16;
+        let logs_height = inner.height.saturating_sub(input_height);
+        if logs_height == 0 {
+            return;
+        }
+        let middle_height = logs_height / 3;
+        if middle_height == 0 {
+            return;
+        }
+        self.set_commander_palette_video_size(middle_height, inner.width);
+    }
+
     pub(crate) fn commander_chat_offset_from_bottom(&self) -> usize {
         self.commander.chat_offset_from_bottom
     }
@@ -3424,7 +3522,6 @@ impl App {
         self.commander.chat_pinned_to_bottom = true;
     }
 
-    #[cfg(test)]
     pub(crate) fn set_commander_chat_metrics(&mut self, viewport_lines: u16, total_lines: usize) {
         self.commander.chat_viewport_lines = viewport_lines;
         self.commander.chat_total_lines = total_lines;
@@ -4829,10 +4926,11 @@ impl App {
         if command != COMMANDER_COMMAND {
             return true;
         }
-        !self
-            .panes
+        let mut ids = Vec::new();
+        self.layout.collect_leaf_ids(&mut ids);
+        !ids
             .iter()
-            .any(|pane| pane.id != pane_id && pane.command == COMMANDER_COMMAND)
+            .any(|&id| id != pane_id && self.pane_is_commander(id))
     }
 
     fn first_available_agent_for_pane(&self, pane_id: usize, preferred: usize) -> usize {
@@ -4862,7 +4960,6 @@ impl App {
     }
 
     fn focus_pane(&mut self, pane_id: usize) {
-        self.commander_focused = false;
         self.sidebar_workspace_focused = None;
         self.sidebar_add_button_focused = false;
         self.drag_pane_mouse = None;
@@ -4873,10 +4970,9 @@ impl App {
     }
 
     fn focus_commander_pane(&mut self) {
-        self.commander_focused = true;
-        self.sidebar_workspace_focused = None;
-        self.sidebar_add_button_focused = false;
-        self.drag_pane_mouse = None;
+        if let Some(pane_id) = self.commander_pane_id_for_active_layout() {
+            self.focus_pane(pane_id);
+        }
     }
 
     pub(crate) fn toggle_maximize(&mut self) {
@@ -5069,7 +5165,7 @@ impl App {
             source_pane_id: pane_id,
             close_on_cancel: false,
             cursor: name.chars().count(),
-            name_selected: true,
+            name_selected: false,
             name,
             name_error: None,
             agent_index,
@@ -5984,7 +6080,6 @@ mod tests {
             theme_preview_index: 0,
             debug_container_boxes: false,
             mouse_capture_enabled: true,
-            commander_focused: true,
             sidebar_workspace_focused: None,
             sidebar_add_button_focused: false,
             commander: CommanderState {
