@@ -14,11 +14,15 @@ use crossterm::event::{
 use ratatui::layout::{Direction, Rect};
 
 use crate::{
-    git_status::query_git_summary,
+    git_status::{
+        commit_selected_files, list_changed_files, query_git_summary, run_worktree_checks,
+        CheckResults,
+    },
     git_worktree::{
-        branch_base_from_pane_name, create_worktree, delete_worktree, display_folder_name,
-        git_root, list_worktrees, next_available_branch, relative_subpath_from_git_root,
-        worktree_is_deletable,
+        branch_base_from_pane_name, create_worktree_from_base, default_integration_branch,
+        delete_local_branch, delete_worktree, display_folder_name, git_root, list_worktrees,
+        merge_branch_into, relative_subpath_from_git_root, worktree_git_snapshot,
+        WorktreeGitSnapshot,
     },
     layout::{
         adjacent_overlap, load_persisted_layout, pane_inner_area, pane_title_bar_height,
@@ -30,7 +34,7 @@ use crate::{
     ui::{
         default_agent_index, help_close_button_area,
         help_debug_toggle_button_area, help_modal_area, new_pane_picker_layout,
-        new_pane_picker_modal_area, new_pane_picker_title_name_prefix_cols, pane_chrome_title_label,
+        new_pane_picker_modal_area, new_pane_picker_title_name_prefix_cols,
         panel_settings_agent_list_area, panel_settings_cancel_button_area,
         panel_settings_close_button_area, panel_settings_confirm_button_area,
         panel_settings_modal_area, panel_settings_modal_inner, panel_settings_name_input_area,
@@ -38,9 +42,16 @@ use crate::{
         workspace_hit_index, workspace_menu_hit_index, workspace_settings_action_hit_index,
         workspace_settings_modal_area, workspace_settings_name_input_area, Modal,
         PanelSettingsFocus, WorktreePickerFocus, AGENT_PRESETS, COMMANDER_COMMAND, TOP_CHROME_ROWS,
-        worktree_picker_branch_layout, worktree_picker_delete_confirm_action_hit_index,
-        worktree_picker_delete_hit_index, worktree_picker_item_count, worktree_picker_list_hit_index,
-        worktree_picker_modal_area,
+        worktree_picker_item_count, worktree_picker_list_hit_index, worktree_picker_modal_area,
+        worktree_picker_status_column_hit,
+    },
+    worktree_lifecycle::{
+        agent_branch_name, worktree_display_name, WorktreeAction,
+        WorktreeLifecycleState, WorktreeRuntimeFlag,
+    },
+    worktree_ui::{
+        action_for_row, suggested_commit_message, NewWorktreeField, WorktreeListColumn,
+        WorktreeSubmodal, worktree_row_state,
     },
     utils::{arrow_key_to_split_side, contains, key_to_bytes, LOGIN_SHELL_SENTINEL},
 };
@@ -1905,238 +1916,10 @@ impl App {
                     });
                     return Ok(());
                 }
-                Modal::WorktreePicker {
-                    pane_id,
-                    folder_name,
-                    git_summary,
-                    repo_root,
-                    mut entries,
-                    mut entry_summaries,
-                    current_path,
-                    mut selected_index,
-                    mut focus,
-                    mut delete_target_index,
-                    mut delete_action_index,
-                    mut branch_name,
-                    mut branch_error,
-                    mut cursor,
-                } => {
-                    let item_count = worktree_picker_item_count(&entries);
-                    let selected_entry_index = selected_index.checked_sub(1);
-                    let selected_deletable = selected_entry_index.is_some_and(|idx| {
-                        entries
-                            .get(idx)
-                            .is_some_and(|entry| worktree_is_deletable(entry, &repo_root, current_path.as_deref()))
-                    });
-                    match key.code {
-                        KeyCode::Esc => match focus {
-                            WorktreePickerFocus::DeleteConfirm => {
-                                focus = WorktreePickerFocus::List;
-                                delete_target_index = None;
-                                delete_action_index = 1;
-                            }
-                            WorktreePickerFocus::BranchName => {
-                                focus = WorktreePickerFocus::List;
-                                branch_error = None;
-                            }
-                            WorktreePickerFocus::DeleteButton => {
-                                focus = WorktreePickerFocus::List;
-                            }
-                            WorktreePickerFocus::List => {
-                                self.modal = None;
-                                return Ok(());
-                            }
-                        },
-                        KeyCode::Up if focus == WorktreePickerFocus::DeleteConfirm => {
-                            delete_action_index = 0;
-                        }
-                        KeyCode::Down if focus == WorktreePickerFocus::DeleteConfirm => {
-                            delete_action_index = 1;
-                        }
-                        KeyCode::Up
-                            if matches!(
-                                focus,
-                                WorktreePickerFocus::List | WorktreePickerFocus::DeleteButton
-                            ) =>
-                        {
-                            selected_index = if selected_index == 0 {
-                                item_count.saturating_sub(1)
-                            } else {
-                                selected_index - 1
-                            };
-                            if focus == WorktreePickerFocus::DeleteButton {
-                                let deletable = selected_index.checked_sub(1).is_some_and(|idx| {
-                                    entries.get(idx).is_some_and(|entry| {
-                                        worktree_is_deletable(entry, &repo_root, current_path.as_deref())
-                                    })
-                                });
-                                if !deletable {
-                                    focus = WorktreePickerFocus::List;
-                                }
-                            }
-                        }
-                        KeyCode::Down
-                            if matches!(
-                                focus,
-                                WorktreePickerFocus::List | WorktreePickerFocus::DeleteButton
-                            ) =>
-                        {
-                            selected_index = (selected_index + 1) % item_count.max(1);
-                            if focus == WorktreePickerFocus::DeleteButton {
-                                let deletable = selected_index.checked_sub(1).is_some_and(|idx| {
-                                    entries.get(idx).is_some_and(|entry| {
-                                        worktree_is_deletable(entry, &repo_root, current_path.as_deref())
-                                    })
-                                });
-                                if !deletable {
-                                    focus = WorktreePickerFocus::List;
-                                }
-                            }
-                        }
-                        KeyCode::Left if focus == WorktreePickerFocus::DeleteButton => {
-                            focus = WorktreePickerFocus::List;
-                        }
-                        KeyCode::Right
-                            if focus == WorktreePickerFocus::List && selected_deletable =>
-                        {
-                            focus = WorktreePickerFocus::DeleteButton;
-                        }
-                        KeyCode::Backspace if focus == WorktreePickerFocus::BranchName => {
-                            remove_char_before_cursor(&mut branch_name, &mut cursor);
-                            branch_error = None;
-                        }
-                        KeyCode::Delete if focus == WorktreePickerFocus::BranchName => {
-                            remove_char_at_cursor(&mut branch_name, cursor);
-                            branch_error = None;
-                        }
-                        KeyCode::Char(c)
-                            if focus == WorktreePickerFocus::BranchName
-                                && !key.modifiers.contains(KeyModifiers::CONTROL)
-                                && !key.modifiers.contains(KeyModifiers::ALT) =>
-                        {
-                            insert_char_at_cursor(&mut branch_name, &mut cursor, c);
-                            branch_error = None;
-                        }
-                        KeyCode::Left if focus == WorktreePickerFocus::BranchName => {
-                            cursor = cursor.saturating_sub(1);
-                        }
-                        KeyCode::Right if focus == WorktreePickerFocus::BranchName => {
-                            cursor = (cursor + 1).min(branch_name.chars().count());
-                        }
-                        KeyCode::Enter => match focus {
-                            WorktreePickerFocus::DeleteConfirm => {
-                                if delete_action_index == 1 {
-                                    focus = WorktreePickerFocus::List;
-                                    delete_target_index = None;
-                                    delete_action_index = 1;
-                                } else if let Some(entry_index) = delete_target_index {
-                                    if let Some(entry) = entries.get(entry_index) {
-                                        let force = entry_summaries
-                                            .get(entry_index)
-                                            .and_then(|summary| summary.as_ref())
-                                            .is_some_and(|summary| summary.has_changes());
-                                        match delete_worktree(&repo_root, &entry.path, force) {
-                                            Ok(()) => {
-                                                entries = list_worktrees(&repo_root);
-                                                entry_summaries =
-                                                    Self::summaries_for_worktrees(&entries);
-                                                selected_index = selected_index.min(
-                                                    worktree_picker_item_count(&entries)
-                                                        .saturating_sub(1),
-                                                );
-                                                focus = WorktreePickerFocus::List;
-                                                delete_target_index = None;
-                                                delete_action_index = 1;
-                                                branch_error = None;
-                                            }
-                                            Err(error) => {
-                                                branch_error = Some(error.to_string());
-                                                focus = WorktreePickerFocus::List;
-                                                delete_target_index = None;
-                                                delete_action_index = 1;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            WorktreePickerFocus::DeleteButton => {
-                                if let Some(entry_index) = selected_entry_index {
-                                    if entries.get(entry_index).is_some_and(|entry| {
-                                        worktree_is_deletable(entry, &repo_root, current_path.as_deref())
-                                    }) {
-                                        focus = WorktreePickerFocus::DeleteConfirm;
-                                        delete_target_index = Some(entry_index);
-                                        delete_action_index = 1;
-                                    }
-                                }
-                            }
-                            WorktreePickerFocus::List if selected_index == 0 => {
-                                focus = WorktreePickerFocus::BranchName;
-                                branch_error = None;
-                            }
-                            WorktreePickerFocus::List => {
-                                if let Some(entry) = entries.get(selected_index - 1) {
-                                    if let Err(error) =
-                                        self.switch_pane_to_worktree(pane_id, &entry.path)
-                                    {
-                                        branch_error = Some(error.to_string());
-                                    } else {
-                                        self.modal = None;
-                                        return Ok(());
-                                    }
-                                }
-                            }
-                            WorktreePickerFocus::BranchName => {
-                                let branch = branch_name.trim();
-                                if branch.is_empty() {
-                                    branch_error = Some("branch name required".to_string());
-                                } else if let Some(repo_root_path) = current_path
-                                    .as_ref()
-                                    .and_then(|path| git_root(path))
-                                    .or_else(|| {
-                                        self.panes
-                                            .iter()
-                                            .find(|pane| pane.id == pane_id)
-                                            .and_then(|pane| pane.tmux_pane_path())
-                                            .and_then(|path| git_root(&path))
-                                    })
-                                {
-                                    match create_worktree(&repo_root_path, branch) {
-                                        Ok(path) => {
-                                            if let Err(error) =
-                                                self.switch_pane_to_worktree(pane_id, &path)
-                                            {
-                                                branch_error = Some(error.to_string());
-                                            } else {
-                                                self.modal = None;
-                                                return Ok(());
-                                            }
-                                        }
-                                        Err(error) => branch_error = Some(error.to_string()),
-                                    }
-                                } else {
-                                    branch_error = Some("git repository not found".to_string());
-                                }
-                            }
-                        },
-                        _ => {}
-                    }
-                    self.modal = Some(Modal::WorktreePicker {
-                        pane_id,
-                        folder_name,
-                        git_summary,
-                        repo_root,
-                        entries,
-                        entry_summaries,
-                        current_path,
-                        selected_index,
-                        focus,
-                        delete_target_index,
-                        delete_action_index,
-                        branch_name,
-                        branch_error,
-                        cursor,
-                    });
+                modal @ Modal::WorktreePicker { .. } => {
+                    // Outer match already took `modal`; handler expects it on `self.modal`.
+                    self.modal = Some(modal);
+                    self.handle_worktree_picker_key(key)?;
                     return Ok(());
                 }
             }
@@ -2465,41 +2248,12 @@ impl App {
                         action_index,
                     });
                 }
-                Modal::WorktreePicker {
-                    pane_id,
-                    folder_name,
-                    git_summary,
-                    repo_root,
-                    entries,
-                    entry_summaries,
-                    current_path,
-                    selected_index,
-                    focus,
-                    delete_target_index,
-                    delete_action_index,
-                    mut branch_name,
-                    branch_error: _,
-                    mut cursor,
-                } if focus == WorktreePickerFocus::BranchName => {
+                modal @ Modal::WorktreePicker { .. } => {
+                    self.modal = Some(modal);
                     for ch in text.chars() {
-                        insert_char_at_cursor(&mut branch_name, &mut cursor, ch);
+                        let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty());
+                        let _ = self.handle_worktree_picker_key(key);
                     }
-                    self.modal = Some(Modal::WorktreePicker {
-                        pane_id,
-                        folder_name,
-                        git_summary,
-                        repo_root,
-                        entries,
-                        entry_summaries,
-                        current_path,
-                        selected_index,
-                        focus,
-                        delete_target_index,
-                        delete_action_index,
-                        branch_name,
-                        branch_error: None,
-                        cursor,
-                    });
                 }
                 other => {
                     self.modal = Some(other);
@@ -2642,7 +2396,7 @@ impl App {
                                 .map(|pane| {
                                     (
                                         placement.area,
-                                        pane_chrome_title_label(&pane.title, &pane.command),
+                                        pane.chrome_title_label(),
                                     )
                                 })
                         })
@@ -2727,7 +2481,7 @@ impl App {
                                 .map(|pane| {
                                     (
                                         placement.area,
-                                        pane_chrome_title_label(&pane.title, &pane.command),
+                                        pane.chrome_title_label(),
                                     )
                                 })
                         })
@@ -2843,31 +2597,36 @@ impl App {
                     folder_name,
                     git_summary,
                     repo_root,
+                    target_branch,
                     entries,
                     entry_summaries,
+                    entry_snapshots,
+                    entry_states,
                     current_path,
                     mut selected_index,
-                    mut focus,
-                    mut delete_target_index,
-                    mut delete_action_index,
-                    branch_name,
-                    mut branch_error,
-                    mut cursor,
-                } => {
+                    mut list_column,
+                    focus,
+                    submodal,
+                    delete_target_index,
+                    delete_action_index,
+                    runtime_flags,
+                    check_results,
+                    error_message,
+                    cursor,
+                } if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                    && matches!(submodal, WorktreeSubmodal::None) =>
+                {
                     let (pane_area, chrome_title) = self
                         .pane_placements(Self::content_area(size))
                         .into_iter()
                         .find(|placement| placement.pane_id == pane_id)
                         .and_then(|placement| {
-                            self.panes
-                                .iter()
-                                .find(|pane| pane.id == pane_id)
-                                .map(|pane| {
-                                    (
-                                        placement.area,
-                                        pane_chrome_title_label(&pane.title, &pane.command),
-                                    )
-                                })
+                            self.panes.iter().find(|pane| pane.id == pane_id).map(|pane| {
+                                (
+                                    placement.area,
+                                    pane.chrome_title_label(),
+                                )
+                            })
                         })
                         .unwrap_or_else(|| (Self::content_area(size), "Pane".to_string()));
                     let subpath = current_path
@@ -2881,92 +2640,48 @@ impl App {
                         &git_summary,
                         subpath.as_deref(),
                         &entries,
-                        &entry_summaries,
+                        &entry_states,
+                        &repo_root,
                         focus,
+                        &submodal,
                     );
-                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                        match focus {
-                            WorktreePickerFocus::DeleteConfirm => {
-                                if let Some(selected) =
-                                    worktree_picker_delete_confirm_action_hit_index(
-                                        area,
-                                        mouse.column,
-                                        mouse.row,
-                                    )
-                                {
-                                    delete_action_index = selected;
-                                }
-                            }
-                            WorktreePickerFocus::List | WorktreePickerFocus::DeleteButton => {
-                                if let Some(entry_index) = worktree_picker_delete_hit_index(
-                                    area,
-                                    &entries,
-                                    &entry_summaries,
-                                    &repo_root,
-                                    current_path.as_deref(),
-                                    mouse.column,
-                                    mouse.row,
-                                ) {
-                                    selected_index = entry_index + 1;
-                                    focus = WorktreePickerFocus::DeleteConfirm;
-                                    delete_target_index = Some(entry_index);
-                                    delete_action_index = 1;
-                                } else if let Some(hit) = worktree_picker_list_hit_index(
-                                    area,
-                                    &entries,
-                                    mouse.column,
-                                    mouse.row,
-                                ) {
-                                    if hit == selected_index {
-                                        if hit == 0 {
-                                            focus = WorktreePickerFocus::BranchName;
-                                            branch_error = None;
-                                        } else if let Some(entry) = entries.get(hit - 1) {
-                                            if let Err(error) =
-                                                self.switch_pane_to_worktree(pane_id, &entry.path)
-                                            {
-                                                branch_error = Some(error.to_string());
-                                            } else {
-                                                self.modal = None;
-                                                return Ok(());
-                                            }
-                                        }
-                                    } else {
-                                        selected_index = hit;
-                                        focus = WorktreePickerFocus::List;
-                                    }
-                                }
-                            }
-                            WorktreePickerFocus::BranchName => {
-                                let (_, _, name_area) = worktree_picker_branch_layout(area);
-                                let name_inner = ratatui::widgets::Block::default()
-                                    .borders(ratatui::widgets::Borders::ALL)
-                                    .inner(name_area);
-                                if contains(name_inner, mouse.column, mouse.row) {
-                                    let click_col =
-                                        mouse.column.saturating_sub(name_inner.x) as usize;
-                                    cursor = click_col.min(branch_name.chars().count());
-                                }
-                            }
-                        }
+                    if let Some(hit) =
+                        worktree_picker_status_column_hit(area, &entries, mouse.column, mouse.row)
+                    {
+                        selected_index = hit;
+                        list_column = WorktreeListColumn::Status;
+                    } else if let Some(hit) =
+                        worktree_picker_list_hit_index(area, &entries, mouse.column, mouse.row)
+                    {
+                        selected_index = hit;
+                        list_column = WorktreeListColumn::Name;
                     }
                     self.modal = Some(Modal::WorktreePicker {
                         pane_id,
                         folder_name,
                         git_summary,
                         repo_root,
+                        target_branch,
                         entries,
                         entry_summaries,
+                        entry_snapshots,
+                        entry_states,
                         current_path,
                         selected_index,
+                        list_column,
                         focus,
+                        submodal,
                         delete_target_index,
                         delete_action_index,
-                        branch_name,
-                        branch_error,
+                        runtime_flags,
+                        check_results,
+                        error_message,
                         cursor,
                     });
                     return Ok(());
+                }
+                other => {
+                    self.modal = Some(other);
                 }
             }
         }
@@ -3008,15 +2723,14 @@ impl App {
             return Ok(());
         };
 
-        let Some((pane_title, pane_command)) = self
+        let Some(pane_title) = self
             .panes
             .iter()
             .find(|pane| pane.id == placement.pane_id)
-            .map(|pane| (pane.title.clone(), pane.command.clone()))
+            .map(|pane| pane.chrome_title_label())
         else {
             return Ok(());
         };
-        let pane_title = pane_chrome_title_label(&pane_title, &pane_command);
         let is_commander = self.pane_is_commander(placement.pane_id);
         let inline_subtitle = !is_commander;
         let title_bar_height = pane_title_bar_height(is_commander);
@@ -3093,6 +2807,7 @@ impl App {
                 mouse.column,
                 mouse.row,
             )
+                || placement.refresh_hit(mouse.column, mouse.row)
                 || placement.maximize_hit(mouse.column, mouse.row)
                 || placement.close_hit(mouse.column, mouse.row);
             if !chrome_hit {
@@ -3110,6 +2825,18 @@ impl App {
                     return Ok(());
                 }
             }
+        }
+
+        if clicked && placement.refresh_hit(mouse.column, mouse.row) {
+            self.focus_pane(placement.pane_id);
+            if let Some(pane) = self
+                .panes
+                .iter_mut()
+                .find(|pane| pane.id == placement.pane_id)
+            {
+                pane.refresh_terminal()?;
+            }
+            return Ok(());
         }
 
         if clicked && placement.maximize_hit(mouse.column, mouse.row) {
@@ -5321,6 +5048,528 @@ impl App {
         });
     }
 
+    fn handle_worktree_picker_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
+        let Some(mut picker) = self.modal.take() else {
+            return Ok(());
+        };
+        let Modal::WorktreePicker {
+            pane_id,
+            folder_name,
+            git_summary,
+            repo_root,
+            mut target_branch,
+            mut entries,
+            mut entry_summaries,
+            mut entry_snapshots,
+            mut entry_states,
+            current_path,
+            mut selected_index,
+            mut list_column,
+            mut focus,
+            mut submodal,
+            mut delete_target_index,
+            mut delete_action_index,
+            mut runtime_flags,
+            mut check_results,
+            mut error_message,
+            mut cursor,
+        } = picker
+        else {
+            self.modal = Some(picker);
+            return Ok(());
+        };
+
+        let item_count = worktree_picker_item_count(&entries);
+        let close_modal = |app: &mut Self| {
+            app.modal = None;
+        };
+
+        match &mut submodal {
+            WorktreeSubmodal::NewWorktree {
+                name,
+                base_branch,
+                branch,
+                field,
+                error,
+                ..
+            } => match key.code {
+                KeyCode::Esc => submodal = WorktreeSubmodal::None,
+                KeyCode::Tab => *field = field.next(),
+                KeyCode::Backspace => {
+                    let target = match field {
+                        NewWorktreeField::Name => name,
+                        NewWorktreeField::Base => base_branch,
+                        NewWorktreeField::Branch => branch,
+                    };
+                    remove_char_before_cursor(target, &mut cursor);
+                    *error = None;
+                }
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    let target = match field {
+                        NewWorktreeField::Name => name,
+                        NewWorktreeField::Base => base_branch,
+                        NewWorktreeField::Branch => branch,
+                    };
+                    insert_char_at_cursor(target, &mut cursor, c);
+                    *error = None;
+                }
+                KeyCode::Enter => {
+                    let slug = name.trim();
+                    if slug.is_empty() {
+                        *error = Some("name required".to_string());
+                    } else {
+                        let base = base_branch.trim();
+                        let new_branch = branch.trim();
+                        if new_branch.is_empty() {
+                            *error = Some("branch required".to_string());
+                        } else {
+                            match create_worktree_from_base(
+                                &repo_root,
+                                slug,
+                                if base.is_empty() {
+                                    target_branch.as_str()
+                                } else {
+                                    base
+                                },
+                                new_branch,
+                            ) {
+                                Ok(path) => {
+                                    if let Err(e) = self.switch_pane_to_worktree(pane_id, &path) {
+                                        *error = Some(e.to_string());
+                                    } else {
+                                        close_modal(self);
+                                        return Ok(());
+                                    }
+                                }
+                                Err(e) => *error = Some(e.to_string()),
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            },
+            WorktreeSubmodal::RunAgent { task, .. } => match key.code {
+                KeyCode::Esc => submodal = WorktreeSubmodal::None,
+                KeyCode::Backspace => remove_char_before_cursor(task, &mut cursor),
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    insert_char_at_cursor(task, &mut cursor, c);
+                }
+                KeyCode::Enter if !task.trim().is_empty() => {
+                    if let Some(entry_index) = selected_index.checked_sub(1) {
+                        if let Some(entry) = entries.get(entry_index) {
+                            let _ = self.switch_pane_to_worktree(pane_id, &entry.path);
+                            runtime_flags.retain(|(p, _)| !crate::git_worktree::paths_equal(p, &entry.path));
+                            runtime_flags.push((entry.path.clone(), WorktreeRuntimeFlag::Running));
+                            let outgoing = build_outgoing_payload(
+                                task.trim(),
+                                true,
+                                1,
+                                1,
+                                &worktree_display_name(entry, &repo_root),
+                                "agent",
+                            );
+                            let _ = self.deliver_payload_with_retries(pane_id, &outgoing, true, false);
+                        }
+                    }
+                    close_modal(self);
+                    return Ok(());
+                }
+                _ => {}
+            },
+            WorktreeSubmodal::CommitReview {
+                files,
+                file_cursor,
+                select_all_tracked,
+                select_all_untracked,
+                ..
+            } => match key.code {
+                KeyCode::Esc => submodal = WorktreeSubmodal::None,
+                KeyCode::Char('a') => {
+                    let on = files.iter().any(|f| !f.selected);
+                    for file in files.iter_mut() {
+                        if !file.large {
+                            file.selected = on;
+                        }
+                    }
+                }
+                KeyCode::Char('t') => {
+                    *select_all_tracked = !*select_all_tracked;
+                    for file in files.iter_mut() {
+                        if !file.untracked && !file.large {
+                            file.selected = *select_all_tracked;
+                        }
+                    }
+                }
+                KeyCode::Char('u') => {
+                    *select_all_untracked = !*select_all_untracked;
+                    for file in files.iter_mut() {
+                        if file.untracked && !file.large {
+                            file.selected = *select_all_untracked;
+                        }
+                    }
+                }
+                KeyCode::Char(' ') | KeyCode::Enter => {
+                    if key.code == KeyCode::Char(' ') {
+                        if let Some(file) = files.get_mut(*file_cursor) {
+                            if !file.large {
+                                file.selected = !file.selected;
+                            }
+                        }
+                    } else if files.iter().any(|f| f.selected) {
+                        submodal = WorktreeSubmodal::CommitMessage {
+                            files: files.clone(),
+                            message: suggested_commit_message(files),
+                            cursor: 0,
+                        };
+                    } else {
+                        error_message = Some("Select at least one file".to_string());
+                    }
+                }
+                KeyCode::Up => *file_cursor = file_cursor.saturating_sub(1),
+                KeyCode::Down => {
+                    *file_cursor = (*file_cursor + 1).min(files.len().saturating_sub(1));
+                }
+                _ => {}
+            },
+            WorktreeSubmodal::CommitMessage { files, message, .. } => match key.code {
+                KeyCode::Esc => {
+                    submodal = WorktreeSubmodal::CommitReview {
+                        files: files.clone(),
+                        scroll: 0,
+                        file_cursor: 0,
+                        select_all_tracked: true,
+                        select_all_untracked: false,
+                    };
+                }
+                KeyCode::Backspace => remove_char_before_cursor(message, &mut cursor),
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    insert_char_at_cursor(message, &mut cursor, c);
+                }
+                KeyCode::Enter if !message.trim().is_empty() => {
+                    if let Some(entry_index) = selected_index.checked_sub(1) {
+                        if let Some(entry) = entries.get(entry_index) {
+                            let msg = message.trim().to_string();
+                            match commit_selected_files(&entry.path, files, &msg) {
+                                Ok(()) => {
+                                    runtime_flags.retain(|(p, _)| {
+                                        !crate::git_worktree::paths_equal(p, &entry.path)
+                                    });
+                                    runtime_flags.push((
+                                        entry.path.clone(),
+                                        WorktreeRuntimeFlag::Checking,
+                                    ));
+                                    let results = run_worktree_checks(&entry.path);
+                                    runtime_flags.retain(|(p, _)| {
+                                        !crate::git_worktree::paths_equal(p, &entry.path)
+                                    });
+                                    if results.any_failed() {
+                                        check_results.insert(entry_index, results.clone());
+                                        runtime_flags.push((
+                                            entry.path.clone(),
+                                            WorktreeRuntimeFlag::ChecksFailed,
+                                        ));
+                                        submodal = WorktreeSubmodal::ChecksFailed {
+                                            entry_index,
+                                            results,
+                                        };
+                                    } else {
+                                        check_results.insert(entry_index, results);
+                                        submodal = WorktreeSubmodal::None;
+                                    }
+                                    let path =
+                                        current_path.clone().unwrap_or(entry.path.clone());
+                                    (
+                                        entries,
+                                        entry_summaries,
+                                        entry_snapshots,
+                                        entry_states,
+                                        target_branch,
+                                    ) = Self::worktree_picker_data(
+                                        &repo_root,
+                                        &path,
+                                        &runtime_flags,
+                                        &check_results,
+                                    );
+                                }
+                                Err(e) => error_message = Some(e.to_string()),
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            },
+            WorktreeSubmodal::MergeConfirm { entry_index } => match key.code {
+                KeyCode::Esc => submodal = WorktreeSubmodal::None,
+                KeyCode::Enter => {
+                    if let Some(entry) = entries.get(*entry_index) {
+                        match merge_branch_into(
+                            &repo_root,
+                            &entry.path,
+                            &entry.branch,
+                            &target_branch,
+                        ) {
+                            Ok(()) => {
+                                let path =
+                                    current_path.clone().unwrap_or(entry.path.clone());
+                                (
+                                    entries,
+                                    entry_summaries,
+                                    entry_snapshots,
+                                    entry_states,
+                                    target_branch,
+                                ) = Self::worktree_picker_data(
+                                    &repo_root,
+                                    &path,
+                                    &runtime_flags,
+                                    &check_results,
+                                );
+                                submodal = WorktreeSubmodal::None;
+                            }
+                            Err(e) => error_message = Some(e.to_string()),
+                        }
+                    }
+                }
+                _ => {}
+            },
+            WorktreeSubmodal::ChecksFailed { entry_index, results } => match key.code {
+                KeyCode::Esc => submodal = WorktreeSubmodal::None,
+                KeyCode::Enter => {
+                    if let Some(entry) = entries.get(*entry_index) {
+                        let fresh = run_worktree_checks(&entry.path);
+                        *results = fresh.clone();
+                        check_results.insert(*entry_index, fresh.clone());
+                        runtime_flags.retain(|(p, _)| {
+                            !crate::git_worktree::paths_equal(p, &entry.path)
+                        });
+                        if fresh.any_failed() {
+                            runtime_flags.push((
+                                entry.path.clone(),
+                                WorktreeRuntimeFlag::ChecksFailed,
+                            ));
+                        }
+                        let path = current_path.clone().unwrap_or(entry.path.clone());
+                        (
+                            entries,
+                            entry_summaries,
+                            entry_snapshots,
+                            entry_states,
+                            target_branch,
+                        ) = Self::worktree_picker_data(
+                            &repo_root,
+                            &path,
+                            &runtime_flags,
+                            &check_results,
+                        );
+                    }
+                }
+                _ => {}
+            },
+            WorktreeSubmodal::None => match key.code {
+                KeyCode::Esc => match focus {
+                    WorktreePickerFocus::DeleteConfirm => {
+                        focus = WorktreePickerFocus::List;
+                        delete_target_index = None;
+                        delete_action_index = 1;
+                    }
+                    _ => {
+                        close_modal(self);
+                        return Ok(());
+                    }
+                },
+                KeyCode::Left => list_column = WorktreeListColumn::Name,
+                KeyCode::Right => list_column = WorktreeListColumn::Status,
+                KeyCode::Up if focus == WorktreePickerFocus::DeleteConfirm => {
+                    delete_action_index = delete_action_index.saturating_sub(1);
+                }
+                KeyCode::Down if focus == WorktreePickerFocus::DeleteConfirm => {
+                    delete_action_index = (delete_action_index + 1).min(2);
+                }
+                KeyCode::Up if focus == WorktreePickerFocus::List => {
+                    selected_index = if selected_index == 0 {
+                        item_count.saturating_sub(1)
+                    } else {
+                        selected_index - 1
+                    };
+                }
+                KeyCode::Down if focus == WorktreePickerFocus::List => {
+                    selected_index = (selected_index + 1) % item_count.max(1);
+                }
+                KeyCode::Enter => {
+                    if focus == WorktreePickerFocus::DeleteConfirm {
+                        match delete_action_index {
+                            2 => {
+                                focus = WorktreePickerFocus::List;
+                                delete_target_index = None;
+                            }
+                            1 => {
+                                focus = WorktreePickerFocus::List;
+                                delete_target_index = None;
+                            }
+                            0 => {
+                                if let Some(entry_index) = delete_target_index {
+                                    if let Some(entry) = entries.get(entry_index) {
+                                        let force = entry_summaries
+                                            .get(entry_index)
+                                            .and_then(|s| s.as_ref())
+                                            .is_some_and(|s| s.has_changes());
+                                        if delete_worktree(&repo_root, &entry.path, force).is_ok() {
+                                            let _ = delete_local_branch(
+                                                &repo_root,
+                                                &entry.branch,
+                                                true,
+                                            );
+                                            let path = current_path.clone().unwrap_or(
+                                                repo_root.clone(),
+                                            );
+                                            (
+                                                entries,
+                                                entry_summaries,
+                                                entry_snapshots,
+                                                entry_states,
+                                                target_branch,
+                                            ) = Self::worktree_picker_data(
+                                                &repo_root,
+                                                &path,
+                                                &runtime_flags,
+                                                &check_results,
+                                            );
+                                        }
+                                        focus = WorktreePickerFocus::List;
+                                        delete_target_index = None;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    } else if list_column == WorktreeListColumn::Name {
+                        if selected_index == 0 {
+                            let slug = branch_base_from_pane_name(
+                                self.panes
+                                    .iter()
+                                    .find(|p| p.id == pane_id)
+                                    .map(|p| p.title.as_str())
+                                    .unwrap_or("worktree"),
+                            );
+                            submodal = WorktreeSubmodal::NewWorktree {
+                                name: slug.clone(),
+                                base_branch: target_branch.clone(),
+                                branch: agent_branch_name(&slug),
+                                field: NewWorktreeField::Name,
+                                error: None,
+                                cursor: slug.chars().count(),
+                            };
+                        } else if let Some(entry) = entries.get(selected_index - 1) {
+                            if let Err(e) = self.switch_pane_to_worktree(pane_id, &entry.path) {
+                                error_message = Some(e.to_string());
+                            } else {
+                                close_modal(self);
+                                return Ok(());
+                            }
+                        }
+                    } else if let Some(state) = entry_states.get(selected_index) {
+                        if let Some(action) = action_for_row(*state) {
+                            match action {
+                                WorktreeAction::RunAgent => {
+                                    submodal = WorktreeSubmodal::RunAgent {
+                                        task: String::new(),
+                                        cursor: 0,
+                                    };
+                                }
+                                WorktreeAction::Commit => {
+                                    if let Some(entry) = entries.get(selected_index - 1) {
+                                        submodal = WorktreeSubmodal::CommitReview {
+                                            files: list_changed_files(&entry.path),
+                                            scroll: 0,
+                                            file_cursor: 0,
+                                            select_all_tracked: true,
+                                            select_all_untracked: false,
+                                        };
+                                    }
+                                }
+                                WorktreeAction::Merge => {
+                                    if let Some(idx) = selected_index.checked_sub(1) {
+                                        submodal = WorktreeSubmodal::MergeConfirm {
+                                            entry_index: idx,
+                                        };
+                                    }
+                                }
+                                WorktreeAction::Delete => {
+                                    if let Some(idx) = selected_index.checked_sub(1) {
+                                        focus = WorktreePickerFocus::DeleteConfirm;
+                                        delete_target_index = Some(idx);
+                                        delete_action_index = 0;
+                                    }
+                                }
+                                WorktreeAction::Inspect => {
+                                    if let Some(idx) = selected_index.checked_sub(1) {
+                                        if let Some(results) = check_results.get(&idx) {
+                                            submodal = WorktreeSubmodal::ChecksFailed {
+                                                entry_index: idx,
+                                                results: results.clone(),
+                                            };
+                                        }
+                                    }
+                                }
+                                WorktreeAction::Refresh => {
+                                    let path = current_path
+                                        .clone()
+                                        .unwrap_or(repo_root.clone());
+                                    (
+                                        entries,
+                                        entry_summaries,
+                                        entry_snapshots,
+                                        entry_states,
+                                        target_branch,
+                                    ) = Self::worktree_picker_data(
+                                        &repo_root,
+                                        &path,
+                                        &runtime_flags,
+                                        &check_results,
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            },
+        }
+
+        self.modal = Some(Modal::WorktreePicker {
+            pane_id,
+            folder_name,
+            git_summary,
+            repo_root,
+            target_branch,
+            entries,
+            entry_summaries,
+            entry_snapshots,
+            entry_states,
+            current_path,
+            selected_index,
+            list_column,
+            focus,
+            submodal,
+            delete_target_index,
+            delete_action_index,
+            runtime_flags,
+            check_results,
+            error_message,
+            cursor,
+        });
+        Ok(())
+    }
+
     fn open_worktree_picker(&mut self, pane_id: usize) {
         let Some(pane) = self.panes.iter().find(|pane| pane.id == pane_id) else {
             return;
@@ -5339,26 +5588,94 @@ impl App {
             return;
         }
 
-        let entries = list_worktrees(&repo_root);
-        let entry_summaries = Self::summaries_for_worktrees(&entries);
-        let branch_name = next_available_branch(&repo_root, &branch_base_from_pane_name(&pane.title));
-        let cursor = branch_name.chars().count();
+        let (
+            entries,
+            entry_summaries,
+            entry_snapshots,
+            entry_states,
+            target_branch,
+        ) = Self::worktree_picker_data(&repo_root, &current_path, &[], &Default::default());
+
         self.modal = Some(Modal::WorktreePicker {
             pane_id,
             folder_name,
             git_summary,
             repo_root,
+            target_branch,
             entries,
             entry_summaries,
+            entry_snapshots,
+            entry_states,
             current_path: Some(current_path),
             selected_index: 0,
+            list_column: WorktreeListColumn::Name,
             focus: WorktreePickerFocus::List,
+            submodal: WorktreeSubmodal::None,
             delete_target_index: None,
             delete_action_index: 1,
-            branch_name,
-            branch_error: None,
-            cursor,
+            runtime_flags: Vec::new(),
+            check_results: std::collections::HashMap::new(),
+            error_message: None,
+            cursor: 0,
         });
+    }
+
+    fn worktree_picker_data(
+        repo_root: &Path,
+        current_path: &Path,
+        runtime_flags: &[(std::path::PathBuf, WorktreeRuntimeFlag)],
+        check_results: &std::collections::HashMap<usize, CheckResults>,
+    ) -> (
+        Vec<crate::git_worktree::WorktreeInfo>,
+        Vec<Option<crate::git_status::GitSummary>>,
+        Vec<WorktreeGitSnapshot>,
+        Vec<WorktreeLifecycleState>,
+        String,
+    ) {
+        let target_branch = default_integration_branch(repo_root);
+        let entries = list_worktrees(repo_root);
+        let entry_summaries = Self::summaries_for_worktrees(&entries);
+        let entry_snapshots: Vec<_> = entries
+            .iter()
+            .enumerate()
+            .map(|(idx, entry)| {
+                let clean = entry_summaries
+                    .get(idx)
+                    .and_then(|s| s.as_ref())
+                    .is_none_or(|s| !s.has_changes());
+                let checks = check_results
+                    .get(&idx)
+                    .map(|r| r.all_passed());
+                worktree_git_snapshot(
+                    repo_root,
+                    &entry.path,
+                    &entry.branch,
+                    &target_branch,
+                    clean,
+                    checks,
+                )
+            })
+            .collect();
+        let item_count = 1 + entries.len();
+        let mut entry_states = Vec::with_capacity(item_count);
+        for idx in 0..item_count {
+            entry_states.push(worktree_row_state(
+                idx,
+                &entries,
+                &entry_summaries,
+                &entry_snapshots,
+                repo_root,
+                Some(current_path),
+                runtime_flags,
+            ));
+        }
+        (
+            entries,
+            entry_summaries,
+            entry_snapshots,
+            entry_states,
+            target_branch,
+        )
     }
 
     fn summaries_for_worktrees(entries: &[crate::git_worktree::WorktreeInfo]) -> Vec<Option<crate::git_status::GitSummary>> {

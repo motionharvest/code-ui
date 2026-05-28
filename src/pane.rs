@@ -9,9 +9,10 @@ use std::{
 };
 
 use crate::{
-    ui::{agent_binary_for_command, agent_command_for_input},
+    ui::{agent_binary_for_command, agent_command_for_input, pane_chrome_title_label},
     utils::{resolve_login_shell_command, LOGIN_SHELL_SENTINEL},
 };
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton};
 use nix::{
     pty::{forkpty, ForkptyResult, Winsize},
@@ -129,6 +130,10 @@ impl Pane {
 
     pub(crate) fn is_stub(&self) -> bool {
         self.stub
+    }
+
+    pub(crate) fn chrome_title_label(&self) -> String {
+        pane_chrome_title_label(&self.title, &self.command)
     }
 
     pub(crate) fn new(
@@ -380,20 +385,7 @@ impl Pane {
     }
 
     pub(crate) fn tmux_pane_path(&self) -> Option<std::path::PathBuf> {
-        let output = Command::new("tmux")
-            .args([
-                "display-message",
-                "-p",
-                "-t",
-                &self.tmux_session,
-                "#{pane_current_path}",
-            ])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let path = tmux_format_message(&self.tmux_session, "#{pane_current_path}")?;
         if path.is_empty() {
             return None;
         }
@@ -468,6 +460,30 @@ impl Pane {
         }
         self.writer.write_all(bytes)?;
         self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Interrupt the running process, recall the previous shell line, and run it.
+    pub(crate) fn refresh_terminal(&mut self) -> anyhow::Result<()> {
+        if self.stub {
+            return Ok(());
+        }
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        use crate::utils::key_to_bytes;
+
+        const KEY_DELAY: Duration = Duration::from_millis(100);
+        let keys = [
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        ];
+        for (index, key) in keys.into_iter().enumerate() {
+            if index > 0 {
+                thread::sleep(KEY_DELAY);
+            }
+            self.send(&key_to_bytes(key))?;
+        }
         Ok(())
     }
 
@@ -1092,27 +1108,28 @@ fn tmux_send_keys_x(session: &str, command_args: &[&str]) -> bool {
     tmux_run(&args)
 }
 
-fn read_tmux_scroll_position(session: &str) -> usize {
+fn tmux_format_message(session: &str, format: &str) -> Option<String> {
     let target = tmux_target(session);
-    let Ok(output) = Command::new("tmux")
+    let output = Command::new("tmux")
         .args([
             "display-message",
             "-p",
             "-t",
             target.as_str(),
             "-F",
-            "#{scroll_position}",
+            format,
         ])
         .output()
-    else {
-        return 0;
-    };
+        .ok()?;
     if !output.status.success() {
-        return 0;
+        return None;
     }
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse()
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn read_tmux_scroll_position(session: &str) -> usize {
+    tmux_format_message(session, "#{scroll_position}")
+        .and_then(|value| value.parse().ok())
         .unwrap_or(0)
 }
 

@@ -72,6 +72,159 @@ impl GitSummary {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FileChangeKind {
+    Modified,
+    Added,
+    Deleted,
+    Renamed,
+    Untracked,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ChangedFile {
+    pub path: String,
+    pub kind: FileChangeKind,
+    pub untracked: bool,
+    pub large: bool,
+    pub selected: bool,
+}
+
+pub(crate) fn list_changed_files(worktree_path: &Path) -> Vec<ChangedFile> {
+    let Some(cwd) = worktree_path.to_str() else {
+        return Vec::new();
+    };
+    let output = match Command::new("git")
+        .args(["-C", cwd, "status", "--porcelain"])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut files = Vec::new();
+    for line in text.lines() {
+        if line.len() < 4 {
+            continue;
+        }
+        let x = line.as_bytes()[0] as char;
+        let y = line.as_bytes()[1] as char;
+        let path = line[3..].trim();
+        if path.is_empty() {
+            continue;
+        }
+        let (kind, untracked) = if x == '?' && y == '?' {
+            (FileChangeKind::Untracked, true)
+        } else if x == 'A' || y == 'A' {
+            (FileChangeKind::Added, false)
+        } else if x == 'D' || y == 'D' {
+            (FileChangeKind::Deleted, false)
+        } else if x == 'R' {
+            (FileChangeKind::Renamed, false)
+        } else {
+            (FileChangeKind::Modified, false)
+        };
+        let large = untracked
+            && crate::git_worktree::is_large_untracked_path(worktree_path, path);
+        let selected = !untracked && !large;
+        files.push(ChangedFile {
+            path: path.to_string(),
+            kind,
+            untracked,
+            large,
+            selected,
+        });
+    }
+    files
+}
+
+pub(crate) fn commit_selected_files(
+    worktree_path: &Path,
+    files: &[ChangedFile],
+    message: &str,
+) -> anyhow::Result<()> {
+    let Some(cwd) = worktree_path.to_str() else {
+        anyhow::bail!("invalid worktree path");
+    };
+    for file in files.iter().filter(|f| f.selected) {
+        let status = Command::new("git")
+            .args(["-C", cwd, "add", "--", &file.path])
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("failed to stage {}", file.path);
+        }
+    }
+    let status = Command::new("git")
+        .args(["-C", cwd, "commit", "-m", message])
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("commit failed");
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CheckResults {
+    pub lint_ok: Option<bool>,
+    pub tests_ok: Option<bool>,
+    pub typecheck_ok: Option<bool>,
+    pub detail: String,
+}
+
+impl CheckResults {
+    pub(crate) fn all_passed(&self) -> bool {
+        self.lint_ok.unwrap_or(true)
+            && self.tests_ok.unwrap_or(true)
+            && self.typecheck_ok.unwrap_or(true)
+    }
+
+    pub(crate) fn any_failed(&self) -> bool {
+        self.lint_ok == Some(false)
+            || self.tests_ok == Some(false)
+            || self.typecheck_ok == Some(false)
+    }
+}
+
+pub(crate) fn run_worktree_checks(worktree_path: &Path) -> CheckResults {
+    let manifest = worktree_path.join("Cargo.toml");
+    if !manifest.exists() {
+        return CheckResults {
+            lint_ok: None,
+            tests_ok: None,
+            typecheck_ok: Some(true),
+            detail: "No Cargo.toml; skipped checks.".to_string(),
+        };
+    }
+    let Some(cwd) = worktree_path.to_str() else {
+        return CheckResults::default();
+    };
+
+    let typecheck_ok = Command::new("cargo")
+        .args(["check", "--quiet"])
+        .current_dir(cwd)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    let tests_ok = Command::new("cargo")
+        .args(["test", "--quiet"])
+        .current_dir(cwd)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    CheckResults {
+        lint_ok: None,
+        tests_ok: Some(tests_ok),
+        typecheck_ok: Some(typecheck_ok),
+        detail: if typecheck_ok && tests_ok {
+            "cargo check and cargo test passed".to_string()
+        } else {
+            "cargo check or cargo test failed".to_string()
+        },
+    }
+}
+
 pub(crate) fn format_worktree_changes(summary: &GitSummary) -> String {
     let mut out = String::new();
     if summary.unstaged > 0 {

@@ -6,6 +6,8 @@ mod pane;
 mod theme;
 mod ui;
 mod utils;
+mod worktree_lifecycle;
+mod worktree_ui;
 
 use std::{
     env,
@@ -45,7 +47,7 @@ use git_status::GitStatusCache;
 use layout::{clip_rect_to_frame, pane_borders, pane_inner_area, pane_title_bar_height};
 use theme::Theme;
 use ui::{
-    commander_chrome_title_label, compute_top_bar_layout, pane_chrome_title_label,
+    commander_chrome_title_label, compute_top_bar_layout,
     render_help_modal, render_new_pane_picker_modal, render_panel_settings_modal,
     render_panel_title_chrome, render_theme_modal, render_top_chrome,
     render_worktree_picker_modal, render_workspace_settings_modal, render_workspace_sidebar,
@@ -384,7 +386,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                     let title = if is_commander {
                         commander_chrome_title_label()
                     } else {
-                        pane_chrome_title_label(&pane.title, &pane.command)
+                        pane.chrome_title_label()
                     };
                     render_panel_title_chrome(
                         f,
@@ -472,7 +474,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                                         .map(|pane| {
                                             (
                                                 placement.area,
-                                                pane_chrome_title_label(&pane.title, &pane.command),
+                                                pane.chrome_title_label(),
                                             )
                                         })
                                 })
@@ -516,7 +518,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                                         .map(|pane| {
                                             (
                                                 placement.area,
-                                                pane_chrome_title_label(&pane.title, &pane.command),
+                                                pane.chrome_title_label(),
                                             )
                                         })
                                 })
@@ -560,16 +562,19 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                             folder_name,
                             git_summary,
                             repo_root,
+                            target_branch,
                             entries,
                             entry_summaries,
+                            entry_snapshots,
+                            entry_states,
                             current_path,
                             selected_index,
+                            list_column,
                             focus,
+                            submodal,
                             delete_target_index,
                             delete_action_index,
-                            branch_name,
-                            branch_error,
-                            cursor,
+                            ..
                         } => {
                             let (pane_area, chrome_title) = app
                                 .pane_placements(App::content_area(f.size()))
@@ -582,7 +587,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                                         .map(|pane| {
                                             (
                                                 placement.area,
-                                                pane_chrome_title_label(&pane.title, &pane.command),
+                                                pane.chrome_title_label(),
                                             )
                                         })
                                 })
@@ -599,15 +604,17 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                                 theme,
                                 entries,
                                 entry_summaries,
+                                entry_snapshots,
+                                entry_states,
                                 repo_root,
+                                target_branch,
                                 current_path.as_deref(),
                                 *selected_index,
+                                *list_column,
                                 *focus,
+                                submodal,
                                 *delete_target_index,
                                 *delete_action_index,
-                                branch_name,
-                                branch_error.as_deref(),
-                                *cursor,
                             );
                         }
                     }
@@ -629,7 +636,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                     })
                     | Some(ui::Modal::WorkspaceSettings { .. })
                     | Some(ui::Modal::WorktreePicker {
-                        focus: ui::WorktreePickerFocus::BranchName,
+                        submodal:
+                            crate::worktree_ui::WorktreeSubmodal::NewWorktree { .. }
+                            | crate::worktree_ui::WorktreeSubmodal::RunAgent { .. }
+                            | crate::worktree_ui::WorktreeSubmodal::CommitMessage { .. },
                         ..
                     })
             );

@@ -11,6 +11,19 @@ pub(crate) struct WorktreeInfo {
     pub folder_name: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub(crate) struct WorktreeGitSnapshot {
+    pub ahead: usize,
+    pub behind: usize,
+    pub merged_into_target: bool,
+    pub merge_conflicted: bool,
+    pub rebase_in_progress: bool,
+    pub merge_ready: bool,
+    pub merge_dry_run_ok: bool,
+}
+
+const LARGE_FILE_BYTES: u64 = 5 * 1024 * 1024;
+
 pub(crate) fn git_root(cwd: &Path) -> Option<PathBuf> {
     let cwd = cwd.to_str()?;
     let output = Command::new("git")
@@ -232,9 +245,211 @@ pub(crate) fn ensure_codeui_gitignored(git_root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub(crate) fn default_integration_branch(git_root: &Path) -> String {
+    for name in ["main", "master"] {
+        if branch_exists(git_root, name) {
+            return name.to_string();
+        }
+    }
+    "main".to_string()
+}
+
+pub(crate) fn sibling_worktree_path_for_name(git_root: &Path, name: &str) -> PathBuf {
+    let parent = git_root
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(".."));
+    let repo_name = git_root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "repo".to_string());
+    let slug = name.trim().replace('/', "-");
+    parent.join(format!("{repo_name}-{slug}"))
+}
+
+pub(crate) fn next_available_worktree_path_for_name(git_root: &Path, name: &str) -> PathBuf {
+    let base = sibling_worktree_path_for_name(git_root, name);
+    if !base.exists() {
+        return base;
+    }
+    for n in 1..1000 {
+        let candidate = {
+            let parent = base.parent().unwrap_or_else(|| Path::new(".."));
+            let stem = base
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("worktree");
+            parent.join(format!("{stem}-{n}"))
+        };
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    base
+}
+
+pub(crate) fn ahead_behind(git_root: &Path, branch: &str, target: &str) -> (usize, usize) {
+    let Some(root) = git_root.to_str() else {
+        return (0, 0);
+    };
+    if branch == target {
+        return (0, 0);
+    }
+    let output = Command::new("git")
+        .args([
+            "-C",
+            root,
+            "rev-list",
+            "--left-right",
+            "--count",
+            &format!("{target}...{branch}"),
+        ])
+        .output();
+    let Ok(output) = output else {
+        return (0, 0);
+    };
+    if !output.status.success() {
+        return (0, 0);
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut parts = text.split_whitespace();
+    let behind = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let ahead = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    (ahead, behind)
+}
+
+pub(crate) fn branch_merged_into(git_root: &Path, branch: &str, target: &str) -> bool {
+    if branch == target {
+        return false;
+    }
+    let Some(root) = git_root.to_str() else {
+        return false;
+    };
+    let output = Command::new("git")
+        .args(["-C", root, "branch", "--merged", target])
+        .output();
+    let Ok(output) = output else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .map(|line| line.strip_prefix('*').unwrap_or(line).trim())
+        .any(|line| line == branch)
+}
+
+fn git_path_exists(worktree_path: &Path, name: &str) -> bool {
+    let Some(cwd) = worktree_path.to_str() else {
+        return false;
+    };
+    let Some(output) = Command::new("git")
+        .args(["-C", cwd, "rev-parse", "--git-path", name])
+        .output()
+        .ok()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    !path.is_empty() && Path::new(&path).exists()
+}
+
+pub(crate) fn merge_in_progress(worktree_path: &Path) -> bool {
+    git_path_exists(worktree_path, "MERGE_HEAD")
+}
+
+pub(crate) fn rebase_in_progress(worktree_path: &Path) -> bool {
+    git_path_exists(worktree_path, "rebase-merge")
+        || git_path_exists(worktree_path, "rebase-apply")
+}
+
+pub(crate) fn merge_conflicted(worktree_path: &Path) -> bool {
+    let Some(cwd) = worktree_path.to_str() else {
+        return false;
+    };
+    let output = Command::new("git")
+        .args(["-C", cwd, "diff", "--name-only", "--diff-filter=U"])
+        .output();
+    let Ok(output) = output else {
+        return false;
+    };
+    output.status.success() && !output.stdout.is_empty()
+}
+
+pub(crate) fn merge_dry_run_ok(git_root: &Path, branch: &str, target: &str) -> bool {
+    if branch == target {
+        return true;
+    }
+    let Some(root) = git_root.to_str() else {
+        return false;
+    };
+    let output = Command::new("git")
+        .args([
+            "-C",
+            root,
+            "merge-tree",
+            "--merge-base",
+            target,
+            branch,
+        ])
+        .output();
+    let Ok(output) = output else {
+        return true;
+    };
+    output.status.success()
+}
+
+pub(crate) fn worktree_git_snapshot(
+    git_root: &Path,
+    worktree_path: &Path,
+    branch: &str,
+    target: &str,
+    clean: bool,
+    checks_passed: Option<bool>,
+) -> WorktreeGitSnapshot {
+    let (ahead, behind) = ahead_behind(git_root, branch, target);
+    let merged_into_target = branch_merged_into(git_root, branch, target);
+    let rebase = rebase_in_progress(worktree_path);
+    let conflicted = merge_conflicted(worktree_path) || merge_in_progress(worktree_path);
+    let merge_dry_run_ok = merge_dry_run_ok(git_root, branch, target);
+    let checks_ok = checks_passed.unwrap_or(true);
+    let merge_ready = clean
+        && ahead > 0
+        && behind == 0
+        && merge_dry_run_ok
+        && checks_ok
+        && !merged_into_target
+        && !conflicted;
+
+    WorktreeGitSnapshot {
+        ahead,
+        behind,
+        merged_into_target,
+        merge_conflicted: conflicted,
+        rebase_in_progress: rebase,
+        merge_ready,
+        merge_dry_run_ok,
+    }
+}
+
 pub(crate) fn create_worktree(git_root: &Path, branch: &str) -> anyhow::Result<PathBuf> {
+    create_worktree_from_base(git_root, branch, branch, branch)
+}
+
+pub(crate) fn create_worktree_from_base(
+    git_root: &Path,
+    name: &str,
+    base_branch: &str,
+    new_branch: &str,
+) -> anyhow::Result<PathBuf> {
     ensure_codeui_gitignored(git_root)?;
-    let worktree_path = next_available_worktree_path(git_root, branch);
+    let worktree_path = next_available_worktree_path_for_name(git_root, name);
 
     let Some(root) = git_root.to_str() else {
         anyhow::bail!("invalid git root path");
@@ -250,14 +465,74 @@ pub(crate) fn create_worktree(git_root: &Path, branch: &str) -> anyhow::Result<P
             "worktree",
             "add",
             "-b",
-            branch,
+            new_branch,
             path,
+            base_branch,
         ])
         .status()?;
     if !status.success() {
         anyhow::bail!("failed to create worktree");
     }
     Ok(worktree_path)
+}
+
+pub(crate) fn merge_branch_into(
+    git_root: &Path,
+    worktree_path: &Path,
+    branch: &str,
+    target: &str,
+) -> anyhow::Result<()> {
+    let Some(root) = git_root.to_str() else {
+        anyhow::bail!("invalid git root path");
+    };
+    let status = Command::new("git")
+        .args(["-C", root, "checkout", target])
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("failed to checkout {target}");
+    }
+    let status = Command::new("git")
+        .args(["-C", root, "merge", "--no-ff", branch])
+        .status()?;
+    if !status.success() {
+        let _ = Command::new("git")
+            .args(["-C", root, "merge", "--abort"])
+            .status();
+        anyhow::bail!("merge failed");
+    }
+    let Some(path) = worktree_path.to_str() else {
+        return Ok(());
+    };
+    let _ = Command::new("git")
+        .args(["-C", path, "checkout", branch])
+        .status();
+    Ok(())
+}
+
+pub(crate) fn delete_local_branch(git_root: &Path, branch: &str, force: bool) -> anyhow::Result<()> {
+    let Some(root) = git_root.to_str() else {
+        anyhow::bail!("invalid git root path");
+    };
+    let mut args = vec!["-C", root, "branch"];
+    if force {
+        args.push("-D");
+    } else {
+        args.push("-d");
+    }
+    args.push(branch);
+    let status = Command::new("git").args(args).status()?;
+    if !status.success() {
+        anyhow::bail!("failed to delete branch {branch}");
+    }
+    Ok(())
+}
+
+pub(crate) fn is_large_untracked_path(worktree_path: &Path, rel_path: &str) -> bool {
+    let path = worktree_path.join(rel_path);
+    path.metadata()
+        .ok()
+        .map(|meta| meta.len() >= LARGE_FILE_BYTES)
+        .unwrap_or(false)
 }
 
 pub(crate) fn delete_worktree(
