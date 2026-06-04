@@ -10,6 +10,7 @@ mod worktree_lifecycle;
 mod worktree_ui;
 
 use std::{
+    collections::BTreeSet,
     env,
     io::{self, Write},
     process::Command,
@@ -44,7 +45,10 @@ use ratatui::{
 
 use app::{App, MousePointerShape};
 use git_status::GitStatusCache;
-use layout::{clip_rect_to_frame, pane_borders, pane_inner_area, pane_title_bar_height};
+use layout::{
+    clip_rect_to_frame, pane_borders, pane_inner_area, pane_title_bar_height,
+    placement_is_adjacent, SplitSide,
+};
 use theme::Theme;
 use ui::{
     commander_chrome_title_label, compute_top_bar_layout,
@@ -310,6 +314,24 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                 let focused_pane_id = (app.sidebar_workspace_focused().is_none()
                     && !app.sidebar_add_button_focused())
                 .then_some(app.focused);
+                let mut suppress_right_edge_for = BTreeSet::new();
+                if let Some(focused_id) = focused_pane_id {
+                    if let Some(focused_placement) =
+                        placements.iter().find(|placement| placement.pane_id == focused_id)
+                    {
+                        for placement in &placements {
+                            if placement.pane_id != focused_id
+                                && placement_is_adjacent(
+                                    placement.area,
+                                    focused_placement.area,
+                                    SplitSide::Right,
+                                )
+                            {
+                                suppress_right_edge_for.insert(placement.pane_id);
+                            }
+                        }
+                    }
+                }
 
                 for placement in placements {
                     let focused = focused_pane_id == Some(placement.pane_id);
@@ -360,8 +382,16 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         Style::default().fg(outline_color).bg(bg_color(theme));
                     let edge_style = title_row_style;
 
+                    let mut borders = pane_borders(placement.exposed);
+                    if focused && !placement.exposed.left {
+                        borders |= Borders::LEFT;
+                    }
+                    if suppress_right_edge_for.contains(&placement.pane_id) {
+                        borders &= !Borders::RIGHT;
+                    }
+
                     let block = Block::default()
-                        .borders(pane_borders(placement.exposed))
+                        .borders(borders)
                         .border_type(BorderType::Plain)
                         .style(Style::default().bg(bg_color(theme)))
                         .border_style(edge_style);
