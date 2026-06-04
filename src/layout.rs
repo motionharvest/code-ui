@@ -309,8 +309,6 @@ pub(crate) fn pane_close_button_area(area: Rect, show_right_edge: bool) -> Optio
             .saturating_add(PANE_CONTROL_ICON_COLUMNS)
             .saturating_add(PANE_CONTROLS_PADDING)
             .saturating_add(PANE_CONTROL_ICON_COLUMNS)
-            .saturating_add(PANE_CONTROLS_PADDING)
-            .saturating_add(PANE_CONTROL_ICON_COLUMNS)
             .saturating_add(PANE_CONTROLS_PADDING),
         y: controls.y,
         width: PANE_CONTROL_ICON_COLUMNS,
