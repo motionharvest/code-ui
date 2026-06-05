@@ -508,7 +508,7 @@ impl App {
             theme_index,
             default_agent_index,
             theme_preview_index: theme_index,
-            debug_container_boxes: parse_debug_flag("SPLIT_TUI_DEBUG_CONTAINERS"),
+            debug_container_boxes: debug_container_boxes_enabled(),
             mouse_capture_enabled: true,
             sidebar_workspace_focused: None,
             sidebar_add_button_focused: false,
@@ -6762,7 +6762,7 @@ mod tests {
              status: needs_tests\n\
              summary: Implemented parser changes.\n\
              changed_files: src/app.rs, src/pane.rs\n\
-             tests: cargo test commander_ --bin split_tui passed\n\
+             tests: cargo test commander_ --bin code-ui passed\n\
              risks: Needs full test suite.\n\
              next: Run cargo test.\n\
              END_COMMANDER_HANDOFF",
@@ -7361,6 +7361,11 @@ fn shift_sidebar_item_index(current: usize, total_items: usize, step: isize) -> 
         return current.saturating_sub(amount).min(max_index);
     }
     current.saturating_add(step as usize).min(max_index)
+}
+
+fn debug_container_boxes_enabled() -> bool {
+    parse_debug_flag("CODE_UI_DEBUG_CONTAINERS")
+        || parse_debug_flag("SPLIT_TUI_DEBUG_CONTAINERS")
 }
 
 fn parse_debug_flag(name: &str) -> bool {

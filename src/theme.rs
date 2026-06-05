@@ -590,19 +590,27 @@ pub(crate) const THEMES: &[Theme] = &[
     },
 ];
 
-fn theme_persistence_path() -> Option<PathBuf> {
+fn theme_config_dir(name: &str) -> Option<PathBuf> {
     let home = env::var_os("HOME")?;
-    Some(
-        PathBuf::from(home)
-            .join(".config")
-            .join("split_tui")
-            .join("theme"),
-    )
+    Some(PathBuf::from(home).join(".config").join(name))
+}
+
+fn theme_persistence_path() -> Option<PathBuf> {
+    theme_config_dir("code-ui").map(|dir| dir.join("theme"))
+}
+
+fn legacy_theme_persistence_path() -> Option<PathBuf> {
+    theme_config_dir("split_tui").map(|dir| dir.join("theme"))
 }
 
 pub(crate) fn load_persisted_theme_index() -> Option<usize> {
     let path = theme_persistence_path()?;
-    let name = fs::read_to_string(path).ok()?.trim().to_string();
+    let legacy = legacy_theme_persistence_path()?;
+    let name = fs::read_to_string(&path)
+        .or_else(|_| fs::read_to_string(&legacy))
+        .ok()?
+        .trim()
+        .to_string();
     THEMES.iter().position(|theme| theme.name == name)
 }
 

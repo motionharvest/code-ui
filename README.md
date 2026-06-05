@@ -2,13 +2,13 @@
 
 Code UI is a terminal-based split-pane harness for running multiple coding agents side by side. Each pane is backed by a persistent **tmux** session with a PTY, so agents keep running when you switch panes or workspaces. Layout, pane titles, agent commands, scroll position, and resume hints are saved per project under `.codeui/`.
 
-The Rust crate is named `split_tui`; the built binary is `split_tui`.
+The command-line binary is **`code-ui`** (Rust crate `code_ui`).
 
 ## Requirements
 
 | Requirement | Why |
 |-------------|-----|
-| **Rust** (2021 edition) | Build and run from source |
+| **Rust + Zig** | Only if building from source (Zig builds the terminal renderer) |
 | **tmux** | Every agent pane attaches to a dedicated tmux session |
 | **git** | Git status in pane chrome; git worktree picker and lifecycle actions |
 | **Unix-like OS** (Linux, macOS, WSL) | PTY/tmux integration (`nix`, `libc`) |
@@ -26,30 +26,50 @@ The built-in **Commander** pane is a harness UI (not a separate binary); it coor
 
 ## Installation
 
-Clone the repository and build:
+### Prebuilt binary (recommended)
+
+After a [GitHub Release](https://github.com/motionharvest/code-ui/releases) exists for your platform:
 
 ```bash
-git clone <repository-url> code-ui
+curl -fsSL https://raw.githubusercontent.com/motionharvest/code-ui/main/install.sh | bash
+```
+
+Install a specific version:
+
+```bash
+CODE_UI_VERSION=v0.1.0 curl -fsSL https://raw.githubusercontent.com/motionharvest/code-ui/main/install.sh | bash
+```
+
+Custom install location (default `~/.local/bin`):
+
+```bash
+INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/motionharvest/code-ui/main/install.sh | bash
+```
+
+Ensure `tmux` and `git` are installed, then run from a **project root** (your git repo):
+
+```bash
+cd /path/to/your/project
+code-ui
+```
+
+### Build from source
+
+```bash
+git clone git@github.com:motionharvest/code-ui.git
 cd code-ui
 cargo build --release
 ```
 
-The release binary is at `target/release/split_tui`.
+The binary is at `target/release/code-ui`.
 
-To install into `~/.cargo/bin`:
+Install into `~/.cargo/bin`:
 
 ```bash
 cargo install --path .
 ```
 
-Run from your **project root** (the git repo you are working in) so layout and session state persist to `.codeui/state`:
-
-```bash
-cd /path/to/your/project
-split_tui
-```
-
-Or during development:
+### Development
 
 ```bash
 cargo run
@@ -57,21 +77,23 @@ cargo run
 ./reload.sh
 ```
 
-`reload.sh` stops any running `split_tui` process, rebuilds if needed, and relaunches via `cargo run`.
+`reload.sh` stops any running `code-ui` process, rebuilds if needed, and relaunches via `cargo run`.
+
+See [RELEASING.md](RELEASING.md) for how maintainers publish new versions.
 
 ## Building
 
 | Command | Output |
 |---------|--------|
-| `cargo build` | Debug binary: `target/debug/split_tui` |
-| `cargo build --release` | Optimized binary: `target/release/split_tui` |
+| `cargo build` | Debug binary: `target/debug/code-ui` |
+| `cargo build --release` | Optimized binary: `target/release/code-ui` |
 | `cargo test` | Run unit tests |
 
 ## Configuration and persistence
 
 - **Layout & panes** — `./.codeui/state` in the current working directory (workspaces, splits, pane titles, agent commands, resume hints, scroll offsets). `.codeui/` is added to `.gitignore` in repos when worktrees are created.
-- **Theme** — `~/.config/split_tui/theme` (theme name on disk).
-- **Debug layout boxes** — set `SPLIT_TUI_DEBUG_CONTAINERS=1` to show container debug overlays (also toggled with `D` in the shortcuts modal).
+- **Theme** — `~/.config/code-ui/theme` (migrates automatically from `~/.config/split_tui/theme` if present).
+- **Debug layout boxes** — set `CODE_UI_DEBUG_CONTAINERS=1` to show container debug overlays (also toggled with `D` in the shortcuts modal).
 
 Press **Ctrl+Space** in the app to open the shortcuts help overlay (same list as below).
 
@@ -157,7 +179,7 @@ Pane titles show `↑N` while you are viewing history above the live bottom.
 ### Themes
 
 - Multiple built-in themes (including passthrough modes that leave terminal colors unchanged).
-- Theme choice persists under `~/.config/split_tui/theme`.
+- Theme choice persists under `~/.config/code-ui/theme`.
 - Open the theme modal with **T**; preview with arrow keys and digits, confirm with Enter.
 
 ### Text selection and copy
