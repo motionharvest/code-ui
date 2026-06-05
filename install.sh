@@ -62,7 +62,7 @@ download_release() {
 
   local tmpdir
   tmpdir="$(mktemp -d)"
-  trap 'rm -rf "${tmpdir}"' EXIT
+  trap 'rm -rf -- "$tmpdir"' RETURN
 
   echo "Downloading ${url} ..."
   curl -fsSL "${url}" -o "${tmpdir}/${asset}"
@@ -74,6 +74,8 @@ download_release() {
 
   mkdir -p "${INSTALL_DIR}"
   install -m 0755 "${tmpdir}/code-ui" "${INSTALL_DIR}/code-ui"
+  rm -rf -- "${tmpdir}"
+  trap - RETURN
 }
 
 main() {
