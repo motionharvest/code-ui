@@ -6,3 +6,5 @@ target
 **/mutants.out*/
 .codeui
 .codeui/*
+vendor/libghostty-vt/.zig-cache/
+vendor/libghostty-vt/zig-out/

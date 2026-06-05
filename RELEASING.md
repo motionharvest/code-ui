@@ -60,6 +60,31 @@ cd code-ui
 cargo install --path .
 ```
 
+## Watching GitHub Actions
+
+Pushing a tag like `v0.1.0` **starts the workflow automatically**. You do not click anything else to begin.
+
+1. Open your repo on GitHub: https://github.com/motionharvest/code-ui
+2. Click the **Actions** tab.
+3. Click the **Release** workflow run (yellow = running, red = failed, green = success).
+4. Open each matrix job (e.g. `x86_64-unknown-linux-gnu`) and expand **Build release binary** to read logs if something failed.
+
+When all four build jobs succeed, the **Publish GitHub Release** job uploads tarballs to https://github.com/motionharvest/code-ui/releases
+
+If a release failed, fix the problem on `main`, then either:
+
+- **Re-run**: Actions → failed run → **Re-run all jobs** (only works if the tag commit already contains the fix), or
+- **New tag**: bump to `v0.1.1`, commit fix, `git tag v0.1.1 && git push origin v0.1.1`
+
+To re-use `v0.1.0` after a fix:
+
+```bash
+git tag -d v0.1.0
+git push origin :refs/tags/v0.1.0
+git tag v0.1.0
+git push origin v0.1.0
+```
+
 ## First release checklist
 
 - [ ] `Cargo.toml` version set
