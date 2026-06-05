@@ -1,93 +1,150 @@
 # Code UI
 
-Code UI is a terminal-based split-pane harness for running multiple coding agents side by side. Each pane is backed by a persistent **tmux** session with a PTY, so agents keep running when you switch panes or workspaces. Layout, pane titles, agent commands, scroll position, and resume hints are saved per project under `.codeui/`.
+Run several coding agents in one terminal window — side by side, like split-screen TV.
 
-The command-line binary is **`code-ui`** (Rust crate `code_ui`).
+---
 
-## Requirements
+## Get started (3 steps)
 
-| Requirement | Why |
-|-------------|-----|
-| **Rust + Zig** | Only if building from source (Zig builds the terminal renderer) |
-| **tmux** | Every agent pane attaches to a dedicated tmux session |
-| **git** | Git status in pane chrome; git worktree picker and lifecycle actions |
-| **Unix-like OS** (Linux, macOS, WSL) | PTY/tmux integration (`nix`, `libc`) |
-| **UTF-8 terminal** with mouse support | TUI rendering, resizing, text selection |
+You need: **Linux**, **macOS**, or **WSL** (Windows Subsystem for Linux). A normal Mac or Linux laptop is fine.
 
-**Optional agent CLIs** (install only what you use):
+### Step 1 — Install two helper tools
 
-- `pi` — Pi agent
-- `agent` — Cursor CLI agent
-- `codex` — Codex
-- `opencode` — OpenCode
-- Your login shell — plain terminal panes
+Code UI needs **tmux** and **git**. You only do this once.
 
-The built-in **Commander** pane is a harness UI (not a separate binary); it coordinates workspaces and agent panes from within the app.
+**Ubuntu / Debian / WSL:**
 
-## Installation
+```bash
+sudo apt update
+sudo apt install -y tmux git
+```
 
-### Prebuilt binary (recommended)
+**macOS** (install [Homebrew](https://brew.sh) first if you do not have it):
 
-After a [GitHub Release](https://github.com/motionharvest/code-ui/releases) exists for your platform:
+```bash
+brew install tmux git
+```
+
+**Fedora:**
+
+```bash
+sudo dnf install -y tmux git
+```
+
+### Step 2 — Install Code UI
+
+Copy this whole line, paste it into your terminal, press Enter:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/motionharvest/code-ui/main/install.sh | bash
 ```
 
-Install a specific version:
+Wait until it says **Installed**. That downloads Code UI and puts the `code-ui` command on your computer.
+
+**Want a specific version?** (optional)
 
 ```bash
-CODE_UI_VERSION=v0.1.0 curl -fsSL https://raw.githubusercontent.com/motionharvest/code-ui/main/install.sh | bash
+CODE_UI_VERSION=v0.1.1 curl -fsSL https://raw.githubusercontent.com/motionharvest/code-ui/main/install.sh | bash
 ```
 
-Custom install location (default `~/.local/bin`):
+### Step 3 — Open Code UI in your project
+
+1. Open a terminal.
+2. Go to the folder of the project you are working on (it should be a git repo):
 
 ```bash
-INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/motionharvest/code-ui/main/install.sh | bash
+cd /path/to/your/project
 ```
 
-Ensure `tmux` and `git` are installed, then run from a **project root** (your git repo):
+3. Start Code UI:
+
+```bash
+code-ui
+```
+
+That is it. You should see the split-pane UI.
+
+---
+
+## If `code-ui` is not found
+
+The installer puts the app in `~/.local/bin`. If your shell says `command not found`, run this once:
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+On **zsh** (default on newer macOS), use `~/.zshrc` instead of `~/.bashrc`.
+
+Then try again:
 
 ```bash
 cd /path/to/your/project
 code-ui
 ```
 
-### Build from source
+---
+
+## Optional: coding agents
+
+You do **not** need these to open Code UI. Install only the agents you actually use:
+
+| Agent | Install separately |
+|-------|-------------------|
+| Cursor CLI | `agent` |
+| Codex | `codex` |
+| OpenCode | `opencode` |
+| Pi | `pi` |
+| Plain shell | nothing extra |
+
+You can always add a normal **Terminal** pane with no agent.
+
+---
+
+## What is Code UI?
+
+- **Split panes** — run multiple agents (or shells) in one window.
+- **Keeps running** — switch panes or close the UI; work continues in tmux behind the scenes.
+- **Remembers your layout** — saved in `.codeui/` inside each project (you do not commit this folder).
+- **Press Ctrl+Space** inside the app for keyboard shortcuts.
+
+Works best in a modern terminal (Ghostty, WezTerm, Kitty, Alacritty, Windows Terminal, etc.) with a mouse.
+
+---
+
+## More help
+
+| Problem | What to try |
+|---------|-------------|
+| Install script fails | Check internet; see [Releases](https://github.com/motionharvest/code-ui/releases) to download a zip manually |
+| Blank or broken UI | Make your terminal window bigger; use a UTF-8 terminal |
+| Agents missing | Install that agent’s CLI (table above); use a **Terminal** pane meanwhile |
+
+**Manual download:** [github.com/motionharvest/code-ui/releases](https://github.com/motionharvest/code-ui/releases) — pick the file for your computer, unzip, move `code-ui` somewhere on your `PATH`.
+
+---
+
+## For developers
+
+Building from source needs **Rust** and **Zig** (not needed for the install script above).
 
 ```bash
 git clone git@github.com:motionharvest/code-ui.git
 cd code-ui
 cargo build --release
+./target/release/code-ui
 ```
-
-The binary is at `target/release/code-ui`.
-
-Install into `~/.cargo/bin`:
-
-```bash
-cargo install --path .
-```
-
-### Development
-
-```bash
-cargo run
-# or
-./reload.sh
-```
-
-`reload.sh` stops any running `code-ui` process, rebuilds if needed, and relaunches via `cargo run`.
-
-See [RELEASING.md](RELEASING.md) for how maintainers publish new versions.
-
-## Building
 
 | Command | Output |
 |---------|--------|
-| `cargo build` | Debug binary: `target/debug/code-ui` |
-| `cargo build --release` | Optimized binary: `target/release/code-ui` |
-| `cargo test` | Run unit tests |
+| `cargo build` | `target/debug/code-ui` |
+| `cargo build --release` | `target/release/code-ui` |
+| `cargo test` | run tests |
+| `cargo install --path .` | install to `~/.cargo/bin` |
+| `./reload.sh` | rebuild and restart during dev |
+
+Publishing releases: [RELEASING.md](RELEASING.md).
 
 ## Configuration and persistence
 
