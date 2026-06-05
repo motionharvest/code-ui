@@ -1243,8 +1243,10 @@ Drag pane contents: Select text\n\
 Shift+Left/Right: Adjust selection by character\n\
 Ctrl+C: Copy selection, or interrupt if nothing is selected\n\
 Ctrl+Shift+M: Toggle mouse capture\n\
+Wheel / PageUp/PageDown: Scroll pane history (3 lines per wheel notch)\n\
 Shift+PageUp/PageDown: Scroll by page\n\
-Shift+Home/End: Scroll to top/bottom",
+Shift+Home/End: Scroll to top/bottom\n\
+Esc: Return to live output when scrolled up",
     )
     .style(Style::default().fg(theme.foreground).bg(bg_color(theme)));
     let shortcuts_area = Rect {

@@ -29,7 +29,7 @@ use crate::{
         placement_is_adjacent, save_persisted_layout, DebugContainer, DebugPlacement,
         ExposedSides, Node, PersistedWorkspace, Placement, ResizeBoundary, SplitSide,
     },
-    pane::{Pane, PaneMouseEventKind, PaneSelection},
+    pane::{Pane, PaneMouseEventKind, PaneSelection, MOUSE_SCROLL_LINES},
     theme::{load_persisted_theme_index, save_persisted_theme, Theme, THEMES},
     ui::{
         default_agent_index, help_close_button_area,
@@ -2043,6 +2043,21 @@ impl App {
             self.last_quit_key_press = Some(now);
         }
 
+        if self.modal.is_none()
+            && !self.focused_pane_is_commander()
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+            && !key.modifiers.contains(KeyModifiers::SHIFT)
+            && key.code == KeyCode::Esc
+        {
+            if let Some(pane) = self.focused_pane_mut() {
+                if pane.scrolled_up() {
+                    pane.scroll_bottom();
+                    return Ok(());
+                }
+            }
+        }
+
         if key.modifiers.contains(KeyModifiers::SHIFT) {
             if !self.focused_pane_is_commander() {
                 match key.code {
@@ -2174,6 +2189,16 @@ impl App {
         let bytes = key_to_bytes(key.clone());
         if !bytes.is_empty() {
             if let Some(pane) = self.focused_pane_mut() {
+                if pane.tmux_copy_mode_active() {
+                    pane.leave_tmux_copy_mode();
+                    // Tmux copy-mode uses plain `q` to exit; don't forward it.
+                    if matches!(key.code, KeyCode::Char('q'))
+                        && !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT)
+                    {
+                        return Ok(());
+                    }
+                }
                 pane.send(&bytes)?;
                 pane.track_key_event(key);
             }
@@ -2270,6 +2295,7 @@ impl App {
         } else if self.sidebar_workspace_focused.is_some() || self.sidebar_add_button_focused {
             return Ok(());
         } else if let Some(pane) = self.focused_pane_mut() {
+            pane.leave_tmux_copy_mode();
             pane.send_paste(&text)?;
             pane.track_paste(&text);
         }
@@ -2708,14 +2734,14 @@ impl App {
                     if self.focused_pane_is_commander() {
                         self.commander_scroll_up();
                     } else if let Some(pane) = self.focused_pane_mut() {
-                        pane.scroll_up();
+                        pane.scroll_up(MOUSE_SCROLL_LINES);
                     }
                 }
                 MouseEventKind::ScrollDown => {
                     if self.focused_pane_is_commander() {
                         self.commander_scroll_down();
                     } else if let Some(pane) = self.focused_pane_mut() {
-                        pane.scroll_down();
+                        pane.scroll_down(MOUSE_SCROLL_LINES);
                     }
                 }
                 _ => {}
@@ -2906,7 +2932,11 @@ impl App {
                     let Some((x, y)) = Self::pane_mouse_cell(inner, mouse.column, mouse.row) else {
                         return Ok(());
                     };
-                    if !pane.scroll_up() {
+                    // Always try harness scroll first. Do not use `scrolled_up() || scroll_up()`
+                    // — short-circuit would skip scroll_up after the first notch.
+                    if pane.scroll_up(MOUSE_SCROLL_LINES) {
+                        // Harness scrollback (Herdr-style); no tmux copy-mode.
+                    } else if !pane.scrolled_up() {
                         let _ = pane.send_mouse_wheel(true, x, y)?;
                     }
                 }
@@ -2921,7 +2951,9 @@ impl App {
                     let Some((x, y)) = Self::pane_mouse_cell(inner, mouse.column, mouse.row) else {
                         return Ok(());
                     };
-                    if !pane.scroll_down() {
+                    if pane.scrolled_up() {
+                        let _ = pane.scroll_down(MOUSE_SCROLL_LINES);
+                    } else {
                         let _ = pane.send_mouse_wheel(false, x, y)?;
                     }
                 }

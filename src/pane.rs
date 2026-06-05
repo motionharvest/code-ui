@@ -1,14 +1,18 @@
 use std::{
+    ffi::CString,
     fs::File,
     io::{Read, Write},
-    os::fd::{AsRawFd, FromRawFd, OwnedFd},
-    process::{Command, Stdio},
+    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+    path::PathBuf,
     sync::mpsc::{self, Receiver, TryRecvError},
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use crate::{
+    ghostty::{
+        self, MODE_BRACKETED_PASTE, MODE_MOUSE_ALTERNATE_SCROLL, MODE_MOUSE_SGR, MODE_MOUSE_UTF8,
+    },
     ui::{agent_binary_for_command, agent_command_for_input, pane_chrome_title_label},
     utils::{resolve_login_shell_command, LOGIN_SHELL_SENTINEL},
 };
@@ -19,16 +23,51 @@ use nix::{
     sys::wait::{waitpid, WaitPidFlag},
     unistd::{dup, execvp, Pid},
 };
-use ratatui::{
-    layout::Rect,
-    style::{Color, Modifier, Style},
-    text::{Line, Span, Text},
-};
-use vt100::{MouseProtocolEncoding, MouseProtocolMode};
+use ratatui::{layout::Rect, Frame};
 
-/// Match tmux `history-limit` and `capture-pane` replay depth.
-const TMUX_HISTORY_LIMIT: &str = "50000";
-const TMUX_HISTORY_LIMIT_USIZE: usize = 50_000;
+/// Ghostty scrollback line capacity (Herdr-style harness-owned history).
+const SCROLLBACK_LINES: usize = 50_000;
+
+/// Mouse wheel scroll step (Herdr default is 3 lines per notch).
+pub(crate) const MOUSE_SCROLL_LINES: usize = 3;
+
+const PANE_TERM: &str = "xterm-256color";
+const PANE_COLORTERM: &str = "truecolor";
+
+const MODE_MOUSE_X10: u16 = 9;
+const MODE_MOUSE_PRESS_RELEASE: u16 = 1000;
+const MODE_MOUSE_BUTTON_MOTION: u16 = 1002;
+const MODE_MOUSE_ANY_MOTION: u16 = 1003;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ScrollMetrics {
+    pub offset_from_bottom: usize,
+    pub max_offset_from_bottom: usize,
+    pub viewport_rows: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MouseProtocolMode {
+    None,
+    Press,
+    PressRelease,
+    ButtonMotion,
+    AnyMotion,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MouseProtocolEncoding {
+    Default,
+    Utf8,
+    Sgr,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InputState {
+    bracketed_paste: bool,
+    mouse_protocol_mode: MouseProtocolMode,
+    mouse_protocol_encoding: MouseProtocolEncoding,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PaneMouseEventKind {
@@ -46,40 +85,26 @@ pub(crate) struct PaneSelection {
 pub(crate) struct Pane {
     pub(crate) id: usize,
     pub(crate) title: String,
-    /// Canonical agent command (e.g. "codex", "pi", or the shell sentinel).
-    /// Used for agent-index lookup and the settings UI. The line actually
-    /// exec'd may differ if a `resume_command` was supplied.
     pub(crate) command: String,
-    /// Captured resume hint (e.g. "codex resume abc-123"). Populated when the
-    /// child process exits and the pane's output contained a recognizable
-    /// resume line. Persisted so the pane can be brought back on next launch.
     pub(crate) resume_command: Option<String>,
-    /// Most recent command submitted by the user in this pane.
     pub(crate) last_command: Option<String>,
-    /// Binary token used for scraping resume hints; `None` disables capture.
     agent_binary: Option<&'static str>,
-    /// Set once we've observed the PTY reader thread disconnect.
     pub(crate) exited: bool,
-    /// Sticky flag set when an attempt to respawn the pane (e.g. after the
-    /// agent exits) fails. Prevents tight retry loops on persistent forkpty
-    /// errors.
     pub(crate) relaunch_failed: bool,
-    pub(crate) parser: vt100::Parser,
+    terminal: ghostty::Terminal,
+    render_state: ghostty::RenderState,
+    host_theme: crate::terminal_theme::TerminalTheme,
+    initial_default_foreground: Option<ghostty::RgbColor>,
+    initial_default_background: Option<ghostty::RgbColor>,
     writer: File,
     rx: Receiver<Vec<u8>>,
     child: Pid,
-    tmux_session: String,
     pub(crate) cols: u16,
     pub(crate) rows: u16,
-    pub(crate) scrollback: usize,
-    pub(crate) scrollback_max: usize,
     last_replayed_command: Option<String>,
     input_buffer: String,
     input_cursor: usize,
-    cached_view: Option<Text<'static>>,
-    view_dirty: bool,
-    first_paint_pending: bool,
-    /// Commander panels are UI-only and do not own a tmux session or PTY child.
+    /// Commander panels are UI-only and do not own a PTY child.
     stub: bool,
 }
 
@@ -98,6 +123,12 @@ impl Drop for Pane {
 impl Pane {
     pub(crate) fn new_commander(id: usize, rows: u16, cols: u16) -> Self {
         let (_tx, rx) = mpsc::channel();
+        let (terminal, render_state, initial_default_foreground, initial_default_background) =
+            make_ghostty_state(rows.max(1), cols.max(1)).unwrap_or_else(|_| {
+                let terminal = ghostty::Terminal::new(1, 1, 0).expect("commander terminal");
+                let render_state = ghostty::RenderState::new().expect("commander render state");
+                (terminal, render_state, None, None)
+            });
         Self {
             id,
             title: "Commander".to_string(),
@@ -107,23 +138,21 @@ impl Pane {
             agent_binary: None,
             exited: false,
             relaunch_failed: false,
-            parser: vt100::Parser::new(rows, cols, 0),
+            terminal,
+            render_state,
+            host_theme: crate::terminal_theme::TerminalTheme::default(),
+            initial_default_foreground,
+            initial_default_background,
             writer: File::open("/dev/null").unwrap_or_else(|_| {
                 File::create("/dev/null").expect("open /dev/null for commander stub pane")
             }),
             rx,
             child: Pid::from_raw(0),
-            tmux_session: String::new(),
             cols,
             rows,
-            scrollback: 0,
-            scrollback_max: 0,
             last_replayed_command: None,
             input_buffer: String::new(),
             input_cursor: 0,
-            cached_view: None,
-            view_dirty: false,
-            first_paint_pending: false,
             stub: true,
         }
     }
@@ -147,25 +176,13 @@ impl Pane {
         initial_scroll_offset: Option<usize>,
     ) -> anyhow::Result<Self> {
         let command: String = command.into();
-        // What we actually run inside the persistent tmux session: the resume
-        // hint if we have one, otherwise the canonical agent command.
         let pane_command = match resume_command.as_deref() {
             Some(line) => line.to_string(),
             None => resolve_login_shell_command(&command),
         };
-        let tmux_session = tmux_session_name(id);
-        ensure_tmux_session(&tmux_session, &pane_command)?;
-        let session_q = shell_quote(&tmux_session);
-        let command_q = shell_quote(&pane_command);
-        let exec_line = format!(
-            "tmux attach-session -t {session} 2>/dev/null || \
-             (tmux new-session -d -s {session} {command} >/dev/null 2>&1 && \
-              tmux set-option -t {session} status off >/dev/null 2>&1 && \
-              tmux attach-session -t {session} 2>/dev/null)",
-            session = session_q,
-            command = command_q
-        );
         let agent_binary = agent_binary_for_command(&command);
+        let rows = rows.max(1);
+        let cols = cols.max(1);
         let ws = Winsize {
             ws_row: rows,
             ws_col: cols,
@@ -177,7 +194,8 @@ impl Pane {
 
         match fork_result {
             ForkptyResult::Child => {
-                exec_command(&exec_line);
+                set_child_terminal_env();
+                exec_command(&pane_command);
             }
             ForkptyResult::Parent { child, master } => {
                 let reader_fd = unsafe { OwnedFd::from_raw_fd(dup(master.as_raw_fd())?) };
@@ -187,6 +205,13 @@ impl Pane {
 
                 thread::spawn(move || pump_pty_output(reader, tx));
 
+                let (
+                    mut terminal,
+                    mut render_state,
+                    initial_default_foreground,
+                    initial_default_background,
+                ) = make_ghostty_state(rows, cols)?;
+                resize_pty(writer.as_raw_fd(), rows, cols)?;
                 let mut pane = Self {
                     id,
                     title: title.into(),
@@ -196,65 +221,54 @@ impl Pane {
                     agent_binary,
                     exited: false,
                     relaunch_failed: false,
-                    parser: vt100::Parser::new(rows, cols, TMUX_HISTORY_LIMIT_USIZE),
+                    terminal,
+                    render_state,
+                    host_theme: crate::terminal_theme::TerminalTheme::default(),
+                    initial_default_foreground,
+                    initial_default_background,
                     writer,
                     rx,
                     child,
-                    tmux_session,
                     cols,
                     rows,
-                    scrollback: 0,
-                    scrollback_max: 0,
                     last_replayed_command: None,
                     input_buffer: String::new(),
                     input_cursor: 0,
-                    cached_view: None,
-                    view_dirty: true,
-                    first_paint_pending: true,
                     stub: false,
                 };
-                pane.replay_tmux_history();
-                pane.sync_scrollback();
                 if let Some(offset) = initial_scroll_offset.filter(|offset| *offset > 0) {
-                    let clamped = offset.min(pane.scrollback_max);
-                    if clamped > 0 {
-                        pane.scrollback = clamped;
-                        pane.parser.set_scrollback(clamped);
-                    }
-                    restore_tmux_scroll_position(&pane.tmux_session, offset);
+                    pane.set_scroll_offset_from_bottom(offset);
                 }
+                let _ = pane.render_state.update(&pane.terminal);
                 Ok(pane)
             }
         }
     }
 
     pub(crate) fn resize(&mut self, rows: u16, cols: u16) {
+        if self.stub {
+            self.rows = rows.max(1);
+            self.cols = cols.max(1);
+            return;
+        }
         if rows == self.rows && cols == self.cols {
             return;
         }
 
-        self.rows = rows;
-        self.cols = cols;
-
-        let ws = libc::winsize {
-            ws_row: rows,
-            ws_col: cols,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-
-        unsafe {
-            libc::ioctl(self.writer.as_raw_fd(), libc::TIOCSWINSZ, &ws);
-        }
-        self.parser.set_size(rows, cols);
-        self.sync_scrollback();
-        self.view_dirty = true;
+        let offset_from_bottom = self
+            .scroll_metrics()
+            .map(|metrics| metrics.offset_from_bottom)
+            .unwrap_or(0);
+        self.rows = rows.max(1);
+        self.cols = cols.max(1);
+        let _ = resize_pty(self.writer.as_raw_fd(), self.rows, self.cols);
+        let _ = self.terminal.resize(self.cols, self.rows, 8, 16);
+        let _ = self.render_state.update(&self.terminal);
+        self.set_scroll_offset_from_bottom(offset_from_bottom);
     }
 
-    /// Drain any pending PTY output into the parser. Returns true if any bytes
-    /// were processed (i.e. the rendered view may have changed).
     pub(crate) fn pump(&mut self) -> bool {
-        if self.stub || self.first_paint_pending {
+        if self.stub {
             return false;
         }
         let mut processed = false;
@@ -262,7 +276,8 @@ impl Pane {
         loop {
             match self.rx.try_recv() {
                 Ok(bytes) => {
-                    self.parser.process(&bytes);
+                    self.terminal.write(&bytes);
+                    let _ = self.render_state.update(&self.terminal);
                     processed = true;
                 }
                 Err(TryRecvError::Empty) => break,
@@ -272,49 +287,18 @@ impl Pane {
                 }
             }
         }
-        if processed {
-            self.sync_scrollback();
-            self.view_dirty = true;
-        }
         if disconnected && !self.exited {
             self.exited = true;
             self.capture_resume_command();
-            // The exit transition is itself a visual change worth redrawing.
-            self.view_dirty = true;
             processed = true;
         }
         processed
     }
 
-    /// Called by the UI renderer once the pane has been painted at least once.
-    /// New panes intentionally delay PTY output processing until this point so
-    /// tmux attach redraw artifacts don't flash before the pane frame appears.
-    pub(crate) fn mark_painted(&mut self) {
-        self.first_paint_pending = false;
-    }
+    pub(crate) fn mark_painted(&mut self) {}
 
-    /// Permanently close the persistent session backing this pane. This is
-    /// used when the user closes/replaces a pane, not when the whole app exits.
-    pub(crate) fn terminate_session(&self) {
-        if self.stub {
-            return;
-        }
-        let _ = Command::new("tmux")
-            .args(["kill-session", "-t", &self.tmux_session])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        wait_for_tmux_session_gone(&self.tmux_session, Duration::from_millis(300));
-    }
+    pub(crate) fn terminate_session(&self) {}
 
-    /// Spawn a fresh login shell into this pane, replacing the previous PTY
-    /// child. Called after the prior program (agent or shell) exits so the
-    /// pane stays usable instead of becoming a frozen dead view.
-    ///
-    /// The shell is only the replacement process. Keep the pane metadata
-    /// (`command`, `resume_command`, and `agent_binary`) pointed at the
-    /// original agent so persistence can bring the pane back where the agent
-    /// left off on the next launch.
     pub(crate) fn relaunch_as_shell(&mut self) -> anyhow::Result<()> {
         if self.stub {
             return Ok(());
@@ -331,8 +315,8 @@ impl Pane {
             LOGIN_SHELL_SENTINEL,
             None,
             None,
-            self.rows.max(1),
-            self.cols.max(1),
+            self.rows,
+            self.cols,
             None,
         )?;
         new.command = command;
@@ -341,8 +325,6 @@ impl Pane {
         new.last_replayed_command = last_replayed_command;
         new.agent_binary = agent_binary;
         let _ = new.replay_last_command();
-
-        // Drop sends SIGTERM/waitpid for the old (already-exited) child.
         *self = new;
         Ok(())
     }
@@ -384,71 +366,38 @@ impl Pane {
         Ok(())
     }
 
-    pub(crate) fn tmux_pane_path(&self) -> Option<std::path::PathBuf> {
-        let path = tmux_format_message(&self.tmux_session, "#{pane_current_path}")?;
-        if path.is_empty() {
-            return None;
-        }
-        Some(std::path::PathBuf::from(path))
+    pub(crate) fn tmux_pane_path(&self) -> Option<PathBuf> {
+        pane_cwd_from_pid(self.child.as_raw())
     }
 
-    /// Scroll offset to persist: local vt100 viewport plus tmux copy-mode position.
     pub(crate) fn persisted_scroll_offset(&self) -> usize {
-        self.scrollback.max(read_tmux_scroll_position(&self.tmux_session))
+        self.scroll_metrics()
+            .map(|metrics| metrics.offset_from_bottom)
+            .unwrap_or(0)
     }
 
-    fn replay_tmux_history(&mut self) {
-        let start = format!("-{TMUX_HISTORY_LIMIT}");
-        let Ok(output) = Command::new("tmux")
-            .args([
-                "capture-pane",
-                "-p",
-                "-e",
-                "-J",
-                "-S",
-                &start,
-                "-t",
-                &self.tmux_session,
-            ])
-            .output()
-        else {
-            return;
-        };
-        if output.status.success() && !output.stdout.is_empty() {
-            self.parser.process(&output.stdout);
-            if !output.stdout.ends_with(b"\n") {
-                self.parser.process(b"\n");
-            }
-            self.view_dirty = true;
-        }
+    pub(crate) fn scrolled_up(&self) -> bool {
+        self.persisted_scroll_offset() > 0
     }
 
-    /// Best-effort: scan whatever is currently on screen and store a resume
-    /// hint if one is visible. Idempotent and safe to call repeatedly; only
-    /// overwrites `resume_command` when a match is found.
+    pub(crate) fn scroll_lines_above_bottom(&self) -> usize {
+        self.persisted_scroll_offset()
+    }
+
     pub(crate) fn try_capture_resume_command(&mut self) {
         self.capture_resume_command();
     }
 
-    /// Scan the rendered terminal contents for the most recent line that
-    /// looks like a resume hint emitted by the agent and store it in
-    /// `self.resume_command`. No-op for panes without an agent binary.
     fn capture_resume_command(&mut self) {
         let Some(binary) = self.agent_binary else {
             return;
         };
-
-        // Temporarily clear the scrollback offset so we see the most recent
-        // output regardless of where the user scrolled.
-        let saved = self.scrollback;
-        self.parser.set_scrollback(0);
-        let rows: Vec<String> = {
-            let screen = self.parser.screen();
-            let (_, cols) = screen.size();
-            screen.rows(0, cols).collect()
-        };
-        self.parser.set_scrollback(saved);
-
+        let saved = self.scroll_metrics().map(|m| m.offset_from_bottom).unwrap_or(0);
+        self.terminal.scroll_viewport_bottom();
+        let rows = self.viewport_plain_rows();
+        if saved > 0 {
+            self.set_scroll_offset_from_bottom(saved);
+        }
         if let Some(line) = extract_resume_command(binary, &rows) {
             self.resume_command = Some(line);
         }
@@ -463,13 +412,11 @@ impl Pane {
         Ok(())
     }
 
-    /// Interrupt the running process, recall the previous shell line, and run it.
     pub(crate) fn refresh_terminal(&mut self) -> anyhow::Result<()> {
         if self.stub {
             return Ok(());
         }
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
         use crate::utils::key_to_bytes;
 
         const KEY_DELAY: Duration = Duration::from_millis(100);
@@ -488,7 +435,7 @@ impl Pane {
     }
 
     pub(crate) fn send_paste(&mut self, text: &str) -> anyhow::Result<()> {
-        if self.parser.screen().bracketed_paste() {
+        if self.input_state().map(|s| s.bracketed_paste).unwrap_or(false) {
             self.writer.write_all(b"\x1b[200~")?;
             self.writer.write_all(text.as_bytes())?;
             self.writer.write_all(b"\x1b[201~")?;
@@ -500,15 +447,17 @@ impl Pane {
     }
 
     pub(crate) fn send_mouse_wheel(&mut self, up: bool, x: u16, y: u16) -> anyhow::Result<bool> {
-        let screen = self.parser.screen();
-        if screen.mouse_protocol_mode() == MouseProtocolMode::None {
+        let Some(state) = self.input_state() else {
+            return Ok(false);
+        };
+        if state.mouse_protocol_mode == MouseProtocolMode::None {
             return Ok(false);
         }
 
         let button = if up { 64 } else { 65 };
         let x = x.min(self.cols.saturating_sub(1)).saturating_add(1);
         let y = y.min(self.rows.saturating_sub(1)).saturating_add(1);
-        let bytes = match screen.mouse_protocol_encoding() {
+        let bytes = match state.mouse_protocol_encoding {
             MouseProtocolEncoding::Sgr => format!("\x1b[<{};{};{}M", button, x, y).into_bytes(),
             MouseProtocolEncoding::Default | MouseProtocolEncoding::Utf8 => {
                 if x > 223 || y > 223 {
@@ -537,8 +486,10 @@ impl Pane {
         x: u16,
         y: u16,
     ) -> anyhow::Result<bool> {
-        let screen = self.parser.screen();
-        let mode = screen.mouse_protocol_mode();
+        let Some(state) = self.input_state() else {
+            return Ok(false);
+        };
+        let mode = state.mouse_protocol_mode;
         if mode == MouseProtocolMode::None {
             return Ok(false);
         }
@@ -555,10 +506,7 @@ impl Pane {
         }
 
         if matches!(event_kind, PaneMouseEventKind::Drag)
-            && !matches!(
-                mode,
-                MouseProtocolMode::ButtonMotion | MouseProtocolMode::AnyMotion
-            )
+            && !matches!(mode, MouseProtocolMode::ButtonMotion | MouseProtocolMode::AnyMotion)
         {
             return Ok(false);
         }
@@ -573,16 +521,18 @@ impl Pane {
         let code = match event_kind {
             PaneMouseEventKind::Down => button_code + modifier_bits,
             PaneMouseEventKind::Drag => button_code + modifier_bits + 32,
-            PaneMouseEventKind::Up => match screen.mouse_protocol_encoding() {
+            PaneMouseEventKind::Up => match state.mouse_protocol_encoding {
                 MouseProtocolEncoding::Sgr => button_code + modifier_bits,
-                MouseProtocolEncoding::Default | MouseProtocolEncoding::Utf8 => 3 + modifier_bits,
+                MouseProtocolEncoding::Default | MouseProtocolEncoding::Utf8 => {
+                    3 + modifier_bits
+                }
             },
         };
 
         let x = x.min(self.cols.saturating_sub(1)).saturating_add(1);
         let y = y.min(self.rows.saturating_sub(1)).saturating_add(1);
 
-        let bytes = match screen.mouse_protocol_encoding() {
+        let bytes = match state.mouse_protocol_encoding {
             MouseProtocolEncoding::Sgr => {
                 let suffix = if matches!(event_kind, PaneMouseEventKind::Up) {
                     'm'
@@ -633,8 +583,6 @@ impl Pane {
                 self.remove_tracked_char_at_cursor();
             }
             KeyCode::Up | KeyCode::Down => {
-                // Shell history state isn't observable to us, so avoid
-                // carrying stale partially-typed input across history jumps.
                 self.clear_pending_input();
             }
             KeyCode::Char(ch)
@@ -687,21 +635,169 @@ impl Pane {
         Ok(true)
     }
 
-    fn finalize_tracked_command(&mut self) {
-        let command = self.input_buffer.trim();
-        if !command.is_empty() {
-            self.last_command = Some(command.to_string());
-            self.last_replayed_command = None;
-            if let Some(agent_command) = agent_command_for_input(command) {
-                self.set_command(agent_command.to_string());
-            }
-        }
-        self.clear_pending_input();
-    }
-
     pub(crate) fn set_command(&mut self, command: String) {
         self.command = command;
         self.agent_binary = agent_binary_for_command(&self.command);
+    }
+
+    pub(crate) fn scroll_by(&mut self, delta: isize) -> bool {
+        let before = self.scroll_metrics().map(|m| m.offset_from_bottom);
+        self.terminal.scroll_viewport_delta(delta);
+        let after = self.scroll_metrics().map(|m| m.offset_from_bottom);
+        before != after
+    }
+
+    pub(crate) fn scroll_up(&mut self, lines: usize) -> bool {
+        self.scroll_by(-(lines.max(1) as isize))
+    }
+
+    pub(crate) fn scroll_down(&mut self, lines: usize) -> bool {
+        self.scroll_by(lines.max(1) as isize)
+    }
+
+    pub(crate) fn page_up(&mut self) -> bool {
+        self.scroll_up(self.rows.max(1) as usize)
+    }
+
+    pub(crate) fn page_down(&mut self) -> bool {
+        self.scroll_down(self.rows.max(1) as usize)
+    }
+
+    pub(crate) fn scroll_top(&mut self) -> bool {
+        let before = self.scroll_metrics().map(|m| m.offset_from_bottom);
+        self.terminal.scroll_viewport_top();
+        let after = self.scroll_metrics().map(|m| m.offset_from_bottom);
+        before != after
+    }
+
+    pub(crate) fn scroll_bottom(&mut self) -> bool {
+        let before = self.scroll_metrics().map(|m| m.offset_from_bottom);
+        self.terminal.scroll_viewport_bottom();
+        let after = self.scroll_metrics().map(|m| m.offset_from_bottom);
+        before != after
+    }
+
+    pub(crate) fn tmux_copy_mode_active(&self) -> bool {
+        false
+    }
+
+    pub(crate) fn leave_tmux_copy_mode(&self) {}
+
+    pub(crate) fn render_terminal(&mut self, frame: &mut Frame, area: Rect, show_cursor: bool) {
+        if self.stub || area.width == 0 || area.height == 0 {
+            return;
+        }
+        let show_cursor = show_cursor && !self.scrolled_up();
+        crate::ghostty_render::render_pane(
+            &self.terminal,
+            &mut self.render_state,
+            self.host_theme,
+            self.initial_default_foreground,
+            self.initial_default_background,
+            frame,
+            area,
+            show_cursor,
+        );
+    }
+
+    pub(crate) fn selected_text(&self, selection: PaneSelection) -> String {
+        let ((start_col, start_row), (end_col, end_row)) = normalized_selection(selection);
+        self.terminal
+            .read_text_viewport(
+                (start_col, u32::from(start_row)),
+                (end_col, u32::from(end_row)),
+                false,
+            )
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn recent_plain_text(&self) -> String {
+        self.viewport_plain_rows().join("\n")
+    }
+
+    pub(crate) fn cursor_position_in(&self, area: Rect) -> Option<(u16, u16)> {
+        let (col, row) = self.cursor_cell()?;
+        if area.width == 0 || area.height == 0 {
+            return None;
+        }
+        let col = col.min(area.width.saturating_sub(1));
+        let row = row.min(area.height.saturating_sub(1));
+        Some((area.x + col, area.y + row))
+    }
+
+    pub(crate) fn cursor_cell(&self) -> Option<(u16, u16)> {
+        if self.scrolled_up() {
+            return None;
+        }
+        let cursor = self.render_state.cursor_viewport().ok()??;
+        if self.render_state.cursor_visible().ok() != Some(true) {
+            return None;
+        }
+        let col = cursor.x.min(self.cols.saturating_sub(1));
+        let row = cursor.y.min(self.rows.saturating_sub(1));
+        Some((col, row))
+    }
+
+    fn scroll_metrics(&self) -> Option<ScrollMetrics> {
+        let scrollbar = self.terminal.scrollbar().ok()?;
+        Some(ScrollMetrics {
+            offset_from_bottom: scrollbar
+                .total
+                .saturating_sub(scrollbar.offset + scrollbar.len),
+            max_offset_from_bottom: scrollbar.total.saturating_sub(scrollbar.len),
+            viewport_rows: scrollbar.len,
+        })
+    }
+
+    fn set_scroll_offset_from_bottom(&mut self, lines: usize) {
+        self.terminal.scroll_viewport_bottom();
+        if lines > 0 {
+            self.terminal.scroll_viewport_delta(-(lines as isize));
+        }
+    }
+
+    fn viewport_plain_rows(&self) -> Vec<String> {
+        if self.rows == 0 {
+            return Vec::new();
+        }
+        let end_row = u32::from(self.rows.saturating_sub(1));
+        let end_col = self.cols.saturating_sub(1);
+        let text = self
+            .terminal
+            .read_text_viewport((0, 0), (end_col, end_row), false)
+            .unwrap_or_default();
+        text.lines().map(str::to_string).collect()
+    }
+
+    fn input_state(&self) -> Option<InputState> {
+        let bracketed_paste = self.terminal.mode_get(MODE_BRACKETED_PASTE).ok()?;
+        let mouse_sgr = self.terminal.mode_get(MODE_MOUSE_SGR).ok()?;
+        let mouse_utf8 = self.terminal.mode_get(MODE_MOUSE_UTF8).ok()?;
+        let _mouse_alternate_scroll = self.terminal.mode_get(MODE_MOUSE_ALTERNATE_SCROLL).ok()?;
+        let mouse_protocol_mode =
+            if self.terminal.mode_get(MODE_MOUSE_ANY_MOTION).ok()? {
+                MouseProtocolMode::AnyMotion
+            } else if self.terminal.mode_get(MODE_MOUSE_BUTTON_MOTION).ok()? {
+                MouseProtocolMode::ButtonMotion
+            } else if self.terminal.mode_get(MODE_MOUSE_PRESS_RELEASE).ok()? {
+                MouseProtocolMode::PressRelease
+            } else if self.terminal.mode_get(MODE_MOUSE_X10).ok()? {
+                MouseProtocolMode::Press
+            } else {
+                MouseProtocolMode::None
+            };
+        let mouse_protocol_encoding = if mouse_sgr {
+            MouseProtocolEncoding::Sgr
+        } else if mouse_utf8 {
+            MouseProtocolEncoding::Utf8
+        } else {
+            MouseProtocolEncoding::Default
+        };
+        Some(InputState {
+            bracketed_paste,
+            mouse_protocol_mode,
+            mouse_protocol_encoding,
+        })
     }
 
     fn insert_tracked_text(&mut self, text: &str) {
@@ -730,253 +826,71 @@ impl Pane {
         self.input_buffer.replace_range(start..end, "");
     }
 
-    fn sync_scrollback(&mut self) {
-        let desired = self.scrollback;
-
-        self.parser.set_scrollback(usize::MAX);
-        self.scrollback_max = self.parser.screen().scrollback();
-        self.scrollback = desired.min(self.scrollback_max);
-        self.parser.set_scrollback(self.scrollback);
-    }
-
-    pub(crate) fn scroll_by(&mut self, delta: isize) -> bool {
-        let next = if delta.is_negative() {
-            self.scrollback.saturating_sub((-delta) as usize)
-        } else {
-            self.scrollback.saturating_add(delta as usize)
-        };
-        let new_scrollback = next.min(self.scrollback_max);
-        if new_scrollback != self.scrollback {
-            self.scrollback = new_scrollback;
-            self.parser.set_scrollback(self.scrollback);
-            self.view_dirty = true;
-            return true;
-        }
-        false
-    }
-
-    pub(crate) fn scroll_up(&mut self) -> bool {
-        if self.scroll_by(1) {
-            return true;
-        }
-        self.tmux_scroll_lines(1, TmuxScrollDirection::Up)
-    }
-
-    pub(crate) fn scroll_down(&mut self) -> bool {
-        if self.scroll_by(-1) {
-            return true;
-        }
-        self.tmux_scroll_lines(1, TmuxScrollDirection::Down)
-    }
-
-    pub(crate) fn page_up(&mut self) -> bool {
-        let lines = self.rows.max(1) as usize;
-        if self.scroll_by(lines as isize) {
-            return true;
-        }
-        self.tmux_scroll_lines(lines, TmuxScrollDirection::Up)
-    }
-
-    pub(crate) fn page_down(&mut self) -> bool {
-        let lines = self.rows.max(1) as usize;
-        if self.scroll_by(-(lines as isize)) {
-            return true;
-        }
-        self.tmux_scroll_lines(lines, TmuxScrollDirection::Down)
-    }
-
-    pub(crate) fn scroll_top(&mut self) -> bool {
-        if self.scrollback_max > 0 && self.scrollback < self.scrollback_max {
-            self.scrollback = self.scrollback_max;
-            self.parser.set_scrollback(self.scrollback);
-            self.view_dirty = true;
-            return true;
-        }
-        self.tmux_scroll_to_history_edge(true)
-    }
-
-    pub(crate) fn scroll_bottom(&mut self) -> bool {
-        let mut changed = false;
-        if self.scrollback > 0 {
-            self.scrollback = 0;
-            self.parser.set_scrollback(self.scrollback);
-            self.view_dirty = true;
-            changed = true;
-        }
-        changed | self.tmux_scroll_to_history_edge(false)
-    }
-
-    fn tmux_scroll_lines(&mut self, lines: usize, direction: TmuxScrollDirection) -> bool {
-        if lines == 0 {
-            return false;
-        }
-        if !tmux_enter_copy_mode(&self.tmux_session) {
-            return false;
-        }
-        let command = match direction {
-            TmuxScrollDirection::Up => "scroll-up",
-            TmuxScrollDirection::Down => "scroll-down",
-        };
-        if !tmux_send_keys_x(
-            &self.tmux_session,
-            &["-N", &lines.to_string(), command],
-        ) {
-            return false;
-        }
-        self.view_dirty = true;
-        true
-    }
-
-    fn tmux_scroll_to_history_edge(&mut self, top: bool) -> bool {
-        if !tmux_enter_copy_mode(&self.tmux_session) {
-            return false;
-        }
-        let command = if top { "history-top" } else { "history-bottom" };
-        if !tmux_send_keys_x(&self.tmux_session, &[command]) {
-            return false;
-        }
-        self.view_dirty = true;
-        true
-    }
-
-    /// Returns the rendered terminal contents as a styled `Text`. The result is
-    /// cached and only rebuilt when the underlying screen has actually changed
-    /// (new PTY bytes, scroll, or resize). When clean, this just clones the
-    /// cached value.
-    pub(crate) fn styled_view(&mut self, selection: Option<PaneSelection>) -> Text<'static> {
-        if let Some(selection) = selection {
-            return self.build_styled_view(Some(selection));
-        }
-
-        let (screen_rows, _) = self.parser.screen().size();
-        if usize::from(screen_rows) != usize::from(self.rows) {
-            self.view_dirty = true;
-        }
-
-        if !self.view_dirty {
-            if let Some(cached) = &self.cached_view {
-                if cached.lines.len() == usize::from(self.rows) {
-                    return cached.clone();
-                }
-                self.view_dirty = true;
+    fn finalize_tracked_command(&mut self) {
+        let command = self.input_buffer.trim();
+        if !command.is_empty() {
+            self.last_command = Some(command.to_string());
+            self.last_replayed_command = None;
+            if let Some(agent_command) = agent_command_for_input(command) {
+                self.set_command(agent_command.to_string());
             }
         }
-        let text = self.build_styled_view(None);
-        self.cached_view = Some(text.clone());
-        self.view_dirty = false;
-        text
+        self.clear_pending_input();
     }
+}
 
-    pub(crate) fn selected_text(&self, selection: PaneSelection) -> String {
-        let ((start_col, start_row), (end_col, end_row)) = normalized_selection(selection);
-        self.parser.screen().contents_between(
-            start_row,
-            start_col,
-            end_row,
-            end_col.saturating_add(1),
-        )
+fn resize_pty(fd: RawFd, rows: u16, cols: u16) -> anyhow::Result<()> {
+    let size = libc::winsize {
+        ws_row: rows.max(1),
+        ws_col: cols.max(1),
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    if unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &size) } < 0 {
+        return Err(std::io::Error::last_os_error().into());
     }
+    Ok(())
+}
 
-    pub(crate) fn recent_plain_text(&mut self) -> String {
-        let saved = self.scrollback;
-        self.parser.set_scrollback(0);
-        let rows: Vec<String> = {
-            let screen = self.parser.screen();
-            let (_, cols) = screen.size();
-            screen.rows(0, cols).collect()
-        };
-        self.parser.set_scrollback(saved);
-        rows.join("\n")
+fn make_ghostty_state(
+    rows: u16,
+    cols: u16,
+) -> anyhow::Result<(
+    ghostty::Terminal,
+    ghostty::RenderState,
+    Option<ghostty::RgbColor>,
+    Option<ghostty::RgbColor>,
+)> {
+    let mut terminal = ghostty::Terminal::new(cols, rows, SCROLLBACK_LINES)?;
+    let _ = terminal.enable_grapheme_cluster_mode();
+    let _ = terminal.enable_kitty_graphics();
+    let mut render_state = ghostty::RenderState::new()?;
+    let initial_colors = render_state
+        .update(&terminal)
+        .ok()
+        .and_then(|_| render_state.colors().ok());
+    Ok((
+        terminal,
+        render_state,
+        initial_colors.map(|colors| colors.foreground),
+        initial_colors.map(|colors| colors.background),
+    ))
+}
+
+fn set_child_terminal_env() {
+    unsafe {
+        let term_name = CString::new("TERM").expect("TERM name");
+        let term_value = CString::new(PANE_TERM).expect("TERM value");
+        let colorterm_name = CString::new("COLORTERM").expect("COLORTERM name");
+        let colorterm_value = CString::new(PANE_COLORTERM).expect("COLORTERM value");
+        libc::setenv(term_name.as_ptr(), term_value.as_ptr(), 1);
+        libc::setenv(colorterm_name.as_ptr(), colorterm_value.as_ptr(), 1);
     }
+}
 
-    fn build_styled_view(&self, selection: Option<PaneSelection>) -> Text<'static> {
-        let screen = self.parser.screen();
-        let (rows, cols) = screen.size();
-        let rows = rows.min(self.rows);
-        let normalized = selection.map(normalized_selection);
-        let mut lines = Vec::with_capacity(usize::from(rows));
-
-        for row in 0..rows {
-            let mut spans: Vec<Span<'static>> = Vec::new();
-            let mut current_style: Option<Style> = None;
-            let mut current_text = String::new();
-
-            for col in 0..cols {
-                let Some(cell) = screen.cell(row, col) else {
-                    continue;
-                };
-                if cell.is_wide_continuation() {
-                    continue;
-                }
-
-                let text = if cell.has_contents() {
-                    cell.contents()
-                } else {
-                    " ".to_string()
-                };
-                let mut style = cell_style(cell);
-                if selection_contains(normalized, col, row) {
-                    style = style.fg(Color::Black).bg(Color::White);
-                }
-
-                if current_style == Some(style) {
-                    current_text.push_str(&text);
-                } else {
-                    if !current_text.is_empty() {
-                        let span = if let Some(style) = current_style.take() {
-                            Span::styled(std::mem::take(&mut current_text), style)
-                        } else {
-                            Span::raw(std::mem::take(&mut current_text))
-                        };
-                        spans.push(span);
-                    }
-                    current_style = Some(style);
-                    current_text.push_str(&text);
-                }
-            }
-
-            if !current_text.is_empty() {
-                let span = if let Some(style) = current_style.take() {
-                    Span::styled(current_text, style)
-                } else {
-                    Span::raw(current_text)
-                };
-                spans.push(span);
-            }
-
-            lines.push(Line::from(spans));
-        }
-
-        Text::from(lines)
-    }
-
-    pub(crate) fn cursor_position_in(&self, area: Rect) -> Option<(u16, u16)> {
-        let (col, row) = self.cursor_cell()?;
-        if area.width == 0 || area.height == 0 {
-            return None;
-        }
-        let col = col.min(area.width.saturating_sub(1));
-        let row = row.min(area.height.saturating_sub(1));
-        Some((area.x + col, area.y + row))
-    }
-
-    pub(crate) fn cursor_cell(&self) -> Option<(u16, u16)> {
-        if self.scrollback > 0 {
-            return None;
-        }
-
-        let screen = self.parser.screen();
-        if screen.hide_cursor() {
-            return None;
-        }
-
-        let (rows, cols) = screen.size();
-        let (row, col) = screen.cursor_position();
-        let row = row.min(rows.saturating_sub(1));
-        let col = col.min(cols.saturating_sub(1));
-
-        Some((col, row))
-    }
+fn pane_cwd_from_pid(pid: i32) -> Option<PathBuf> {
+    let path = format!("/proc/{pid}/cwd");
+    std::fs::read_link(path).ok()
 }
 
 fn normalized_selection(selection: PaneSelection) -> ((u16, u16), (u16, u16)) {
@@ -985,26 +899,6 @@ fn normalized_selection(selection: PaneSelection) -> ((u16, u16), (u16, u16)) {
     } else {
         (selection.end, selection.start)
     }
-}
-
-fn selection_contains(selection: Option<((u16, u16), (u16, u16))>, col: u16, row: u16) -> bool {
-    let Some(((start_col, start_row), (end_col, end_row))) = selection else {
-        return false;
-    };
-
-    if row < start_row || row > end_row {
-        return false;
-    }
-    if start_row == end_row {
-        return col >= start_col && col <= end_col;
-    }
-    if row == start_row {
-        return col >= start_col;
-    }
-    if row == end_row {
-        return col <= end_col;
-    }
-    true
 }
 
 fn mouse_modifier_bits(modifiers: KeyModifiers) -> u16 {
@@ -1021,47 +915,6 @@ fn mouse_modifier_bits(modifiers: KeyModifiers) -> u16 {
     bits
 }
 
-fn cell_style(cell: &vt100::Cell) -> Style {
-    let mut fg = vt100_color_to_tui(cell.fgcolor());
-    // Leave default terminal cells unset so the pane widget's base background
-    // can show through.
-    let mut bg = match cell.bgcolor() {
-        vt100::Color::Default => None,
-        color => vt100_color_to_tui(color),
-    };
-
-    if cell.inverse() {
-        std::mem::swap(&mut fg, &mut bg);
-    }
-
-    let mut style = Style::default();
-    if let Some(color) = fg {
-        style = style.fg(color);
-    }
-    if let Some(color) = bg {
-        style = style.bg(color);
-    }
-    if cell.bold() {
-        style = style.add_modifier(Modifier::BOLD);
-    }
-    if cell.italic() {
-        style = style.add_modifier(Modifier::ITALIC);
-    }
-    if cell.underline() {
-        style = style.add_modifier(Modifier::UNDERLINED);
-    }
-
-    style
-}
-
-fn vt100_color_to_tui(color: vt100::Color) -> Option<Color> {
-    match color {
-        vt100::Color::Default => None,
-        vt100::Color::Rgb(r, g, b) => Some(Color::Rgb(r, g, b)),
-        vt100::Color::Idx(i) => Some(Color::Indexed(i)),
-    }
-}
-
 fn pump_pty_output(mut reader: File, tx: mpsc::Sender<Vec<u8>>) {
     let mut buf = [0u8; 8192];
     loop {
@@ -1075,139 +928,6 @@ fn pump_pty_output(mut reader: File, tx: mpsc::Sender<Vec<u8>>) {
             Err(_) => break,
         }
     }
-}
-
-#[derive(Clone, Copy)]
-enum TmuxScrollDirection {
-    Up,
-    Down,
-}
-
-fn tmux_target(session: &str) -> String {
-    session.to_string()
-}
-
-fn tmux_run(args: &[&str]) -> bool {
-    Command::new("tmux")
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
-fn tmux_enter_copy_mode(session: &str) -> bool {
-    tmux_run(&["copy-mode", "-t", &tmux_target(session)])
-}
-
-fn tmux_send_keys_x(session: &str, command_args: &[&str]) -> bool {
-    let target = tmux_target(session);
-    let mut args = vec!["send-keys", "-t", target.as_str(), "-X"];
-    args.extend_from_slice(command_args);
-    tmux_run(&args)
-}
-
-fn tmux_format_message(session: &str, format: &str) -> Option<String> {
-    let target = tmux_target(session);
-    let output = Command::new("tmux")
-        .args([
-            "display-message",
-            "-p",
-            "-t",
-            target.as_str(),
-            "-F",
-            format,
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-fn read_tmux_scroll_position(session: &str) -> usize {
-    tmux_format_message(session, "#{scroll_position}")
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0)
-}
-
-fn restore_tmux_scroll_position(session: &str, offset: usize) {
-    if offset == 0 {
-        return;
-    }
-    if !tmux_enter_copy_mode(session) {
-        return;
-    }
-    let _ = tmux_send_keys_x(session, &["-N", &offset.to_string(), "scroll-up"]);
-}
-
-fn configure_tmux_session(session: &str) {
-    for (option, value) in [
-        ("status", "off"),
-        ("history-limit", TMUX_HISTORY_LIMIT),
-        ("mouse", "on"),
-    ] {
-        let _ = Command::new("tmux")
-            .args(["set-option", "-t", session, option, value])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-}
-
-fn ensure_tmux_session(session: &str, command: &str) -> anyhow::Result<()> {
-    let has_session = Command::new("tmux")
-        .args(["has-session", "-t", session])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false);
-    if !has_session {
-        let status = Command::new("tmux")
-            .args(["new-session", "-d", "-s", session, command])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?;
-        if !status.success() {
-            anyhow::bail!("failed to create tmux session {session}");
-        }
-    }
-
-    configure_tmux_session(session);
-    Ok(())
-}
-
-fn wait_for_tmux_session_gone(session: &str, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let exists = Command::new("tmux")
-            .args(["has-session", "-t", session])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
-        if !exists {
-            break;
-        }
-        if Instant::now() >= deadline {
-            break;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-}
-
-fn tmux_session_name(pane_id: usize) -> String {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in cwd.to_string_lossy().as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("codeui-{hash:016x}-pane-{pane_id}")
 }
 
 fn shell_quote(value: &str) -> String {
@@ -1227,33 +947,25 @@ fn shell_quote(value: &str) -> String {
 }
 
 fn exec_command(command: &str) -> ! {
-    // If the line contains no whitespace, treat it as a single binary name and
-    // exec directly (preserves prior behavior for the common case). Otherwise
-    // delegate to /bin/sh -c so multi-arg resume commands like
-    // `codex resume <id>` work correctly.
     if command.trim().is_empty() {
         unsafe { libc::_exit(1) }
     }
 
     if !command.contains(char::is_whitespace) {
-        let c = std::ffi::CString::new(command).unwrap();
+        let c = CString::new(command).unwrap();
         let args = [c.clone()];
         let _ = execvp(&c, &args);
         unsafe { libc::_exit(1) }
     }
 
-    let shell = std::ffi::CString::new("/bin/sh").unwrap();
-    let dash_c = std::ffi::CString::new("-c").unwrap();
-    let cmd = std::ffi::CString::new(command).unwrap();
+    let shell = CString::new("/bin/sh").unwrap();
+    let dash_c = CString::new("-c").unwrap();
+    let cmd = CString::new(command).unwrap();
     let args = [shell.clone(), dash_c, cmd];
     let _ = execvp(&shell, &args);
     unsafe { libc::_exit(1) }
 }
 
-/// Scan rendered rows from bottom to top for the most recent line containing
-/// `binary` as a token and at least one resume-style keyword. The captured
-/// substring is the binary occurrence through the end of the trimmed line,
-/// stripped of common surrounding punctuation (backticks, quotes, parens).
 fn extract_resume_command(binary: &str, rows: &[String]) -> Option<String> {
     let resume_keywords = [
         "resume",
@@ -1291,9 +1003,6 @@ fn extract_resume_command(binary: &str, rows: &[String]) -> Option<String> {
     None
 }
 
-/// Return the byte offset of `needle` inside `haystack` where the surrounding
-/// characters are non-alphanumeric (so we don't match "pipe" when looking for
-/// "pi").
 fn find_token(haystack: &str, needle: &str) -> Option<usize> {
     if needle.is_empty() {
         return None;
@@ -1351,7 +1060,6 @@ mod tests {
 
     #[test]
     fn ignores_substring_matches() {
-        // "pipe" must not be mistaken for the pi binary.
         let rows = vec!["pipe --continue".to_string()];
         assert_eq!(extract_resume_command("pi", &rows), None);
     }
@@ -1360,6 +1068,60 @@ mod tests {
     fn requires_resume_keyword() {
         let rows = vec!["codex hello world".to_string()];
         assert_eq!(extract_resume_command("codex", &rows), None);
+    }
+
+    #[test]
+    fn shell_output_reaches_ghostty_viewport() {
+        let mut pane =
+            Pane::new(0, "test", "echo code-ui-terminal-ok", None, None, 24, 80, None)
+                .expect("pane");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            pane.pump();
+            if pane.recent_plain_text().contains("code-ui-terminal-ok") {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "expected shell output in viewport, got {:?}",
+            pane.recent_plain_text()
+        );
+    }
+
+    #[test]
+    fn repeated_scroll_up_moves_more_than_one_notch() {
+        let mut terminal = ghostty::Terminal::new(80, 24, 256).expect("terminal");
+        let mut render_state = ghostty::RenderState::new().expect("render state");
+        for line in 0..40 {
+            terminal.write(format!("line-{line:02}\r\n").as_bytes());
+        }
+        let _ = render_state.update(&terminal);
+        let offset_from_bottom = |terminal: &ghostty::Terminal| {
+            let scrollbar = terminal.scrollbar().expect("scrollbar");
+            scrollbar
+                .total
+                .saturating_sub(scrollbar.offset + scrollbar.len)
+        };
+        assert_eq!(offset_from_bottom(&terminal), 0);
+        for _ in 0..5 {
+            terminal.scroll_viewport_delta(-3);
+        }
+        assert!(
+            offset_from_bottom(&terminal) >= 15,
+            "expected at least 15 lines of scrollback offset, got {}",
+            offset_from_bottom(&terminal)
+        );
+    }
+
+    #[test]
+    fn resize_keeps_pty_and_terminal_in_sync() {
+        let mut pane = Pane::new(0, "test", "cat", None, None, 12, 40, None).expect("pane");
+        pane.pump();
+        pane.resize(18, 100);
+        assert_eq!(pane.rows, 18);
+        assert_eq!(pane.cols, 100);
+        pane.send(b"x").expect("write after resize");
     }
 
     #[test]
@@ -1373,14 +1135,5 @@ mod tests {
             extract_resume_command("codex", &rows).as_deref(),
             Some("codex resume bbbb")
         );
-    }
-
-    #[test]
-    fn default_background_leaves_base_style_visible() {
-        let mut parser = vt100::Parser::new(1, 1, 0);
-        parser.process(b"A");
-        let cell = parser.screen().cell(0, 0).expect("cell");
-
-        assert_eq!(cell_style(cell).bg, None);
     }
 }

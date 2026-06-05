@@ -1,8 +1,11 @@
 mod app;
+mod ghostty;
+mod ghostty_render;
 mod git_status;
 mod git_worktree;
 mod layout;
 mod pane;
+mod terminal_theme;
 mod theme;
 mod ui;
 mod utils;
@@ -44,6 +47,7 @@ use ratatui::{
 };
 
 use app::{App, MousePointerShape};
+use pane::PaneSelection;
 use git_status::GitStatusCache;
 use layout::{
     clip_rect_to_frame, pane_borders, pane_inner_area, pane_title_bar_height,
@@ -416,7 +420,12 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                     let title = if is_commander {
                         commander_chrome_title_label()
                     } else {
-                        pane.chrome_title_label()
+                        let base = pane.chrome_title_label();
+                        if pane.scrolled_up() {
+                            format!("{base} ↑{}", pane.scroll_lines_above_bottom())
+                        } else {
+                            base
+                        }
                     };
                     render_panel_title_chrome(
                         f,
@@ -459,19 +468,13 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
 
                         let content_area = clip_rect_to_frame(inner, f.size());
 
-                        let pane_view =
-                            pane_view_for_render(pane.styled_view(selection), theme, focused);
-                        render_pane_text(
+                        pane.render_terminal(
                             f,
-                            pane_view,
                             content_area,
-                            Style::default().bg(bg_color(theme)),
+                            modal_is_none && focused,
                         );
-
-                        if modal_is_none && focused {
-                            if let Some((x, y)) = pane.cursor_position_in(content_area) {
-                                f.set_cursor(x, y);
-                            }
+                        if let Some(selection) = selection {
+                            render_pane_selection_highlight(f, content_area, selection, theme);
                         }
                     }
                 }
@@ -780,6 +783,51 @@ fn render_pane_swap_drop_overlay(f: &mut Frame<'_>, area: Rect, theme: Theme, st
     );
 }
 
+
+fn render_pane_selection_highlight(
+    f: &mut Frame<'_>,
+    area: Rect,
+    selection: PaneSelection,
+    theme: Theme,
+) {
+    if selection.start == selection.end || area.width == 0 || area.height == 0 {
+        return;
+    }
+    let (start_col, start_row, end_col, end_row) = if (selection.start.1, selection.start.0)
+        <= (selection.end.1, selection.end.0)
+    {
+        (
+            selection.start.0,
+            selection.start.1,
+            selection.end.0,
+            selection.end.1,
+        )
+    } else {
+        (
+            selection.end.0,
+            selection.end.1,
+            selection.start.0,
+            selection.start.1,
+        )
+    };
+    let highlight = Style::default()
+        .fg(theme.background)
+        .bg(theme.accent)
+        .add_modifier(Modifier::BOLD);
+    let buf = f.buffer_mut();
+    for row in start_row..=end_row.min(area.height.saturating_sub(1)) {
+        let col_start = if row == start_row { start_col } else { 0 };
+        let col_end = if row == end_row {
+            end_col
+        } else {
+            area.width.saturating_sub(1)
+        };
+        for col in col_start..=col_end.min(area.width.saturating_sub(1)) {
+            let cell = buf.get_mut(area.x + col, area.y + row);
+            cell.set_style(highlight);
+        }
+    }
+}
 
 /// Render terminal text one row at a time. A single multi-line `Paragraph` can
 /// write past the bottom of the frame when the rect is taller than the remaining
