@@ -66,6 +66,37 @@ That is it. You should see the split-pane UI.
 
 ---
 
+## First shortcuts (learn these right away)
+
+Do these **inside Code UI** (after `code-ui` is running).
+
+### Split the screen in half
+
+Click the pane you want to split so it is focused. Then hold **Ctrl+Alt** and press the **arrow key** for where the **new** pane should go:
+
+| Arrow | New pane appears… |
+|-------|-------------------|
+| **←** | to the **left** |
+| **→** | to the **right** |
+| **↑** | **above** |
+| **↓** | **below** |
+
+A small menu opens — pick what runs there (Terminal, Cursor, Codex, etc.) and press Enter.
+
+Think of it like pointing: *“put the new window that way.”*
+
+### Quit Code UI
+
+Press **Ctrl+Q** once (arms quit), then **Ctrl+Q** again to close.
+
+### More shortcuts
+
+- **Ctrl+Page Up** / **Ctrl+Page Down** — switch to another pane
+- **Ctrl+W** — close the pane you are in (not the whole app)
+- **Ctrl+Space** — full shortcut list inside the app
+
+---
+
 ## If `code-ui` is not found
 
 The installer puts the app in `~/.local/bin`. If your shell says `command not found`, run this once:
@@ -107,7 +138,7 @@ You can always add a normal **Terminal** pane with no agent.
 - **Split panes** — run multiple agents (or shells) in one window.
 - **Keeps running** — switch panes or close the UI; work continues in tmux behind the scenes.
 - **Remembers your layout** — saved in `.codeui/` inside each project (you do not commit this folder).
-- **Press Ctrl+Space** inside the app for keyboard shortcuts.
+- **Split and quit** — see [First shortcuts](#first-shortcuts-learn-these-right-away) above; **Ctrl+Space** for the full list in the app.
 
 Works best in a modern terminal (Ghostty, WezTerm, Kitty, Alacritty, Windows Terminal, etc.) with a mouse.
 
@@ -169,9 +200,9 @@ Press **Ctrl+Space** in the app to open the shortcuts help overlay (same list as
 
 | Shortcut | Action |
 |----------|--------|
-| Ctrl+Alt+↑ ↓ ← → | Split focused pane (opens agent picker) |
-| Ctrl+Shift+A | Split right |
-| Ctrl+Shift+B | Split down |
+| Ctrl+Alt+↑ ↓ ← → | Split focused pane — arrow = where the new pane goes (opens agent picker) |
+| Ctrl+Shift+A | Split right (quick, no arrow) |
+| Ctrl+Shift+B | Split down (quick, no arrow) |
 | Ctrl+Page Up / Page Down | Cycle pane focus |
 | Ctrl+W | Close focused pane |
 | Ctrl+↑ ↓ ← → | Move focus between panes and workspace sidebar |
