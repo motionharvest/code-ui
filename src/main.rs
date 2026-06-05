@@ -41,7 +41,6 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Text},
     widgets::{Block, BorderType, Borders, Paragraph},
     Frame, Terminal,
 };
@@ -829,10 +828,15 @@ fn render_pane_selection_highlight(
     }
 }
 
+#[cfg(test)]
+mod pane_render_helpers {
+    use super::*;
+    use ratatui::text::{Line, Text};
+
 /// Render terminal text one row at a time. A single multi-line `Paragraph` can
 /// write past the bottom of the frame when the rect is taller than the remaining
 /// space or ratatui expands wrapped rows.
-fn render_pane_text(f: &mut Frame<'_>, text: Text<'static>, area: Rect, style: Style) {
+pub(super) fn render_pane_text(f: &mut Frame<'_>, text: Text<'static>, area: Rect, style: Style) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -848,7 +852,7 @@ fn render_pane_text(f: &mut Frame<'_>, text: Text<'static>, area: Rect, style: S
     }
 }
 
-fn pane_view_for_render(view: Text<'static>, theme: Theme, focused: bool) -> Text<'static> {
+pub(super) fn pane_view_for_render(view: Text<'static>, theme: Theme, focused: bool) -> Text<'static> {
     if theme.passthrough {
         return view;
     }
@@ -860,11 +864,11 @@ fn pane_view_for_render(view: Text<'static>, theme: Theme, focused: bool) -> Tex
     monochrome_text(view, theme)
 }
 
-fn theme_text(text: Text<'static>, theme: Theme) -> Text<'static> {
+pub(super) fn theme_text(text: Text<'static>, theme: Theme) -> Text<'static> {
     transform_text(text, |style| theme_style(style, theme))
 }
 
-fn monochrome_text(text: Text<'static>, theme: Theme) -> Text<'static> {
+pub(super) fn monochrome_text(text: Text<'static>, theme: Theme) -> Text<'static> {
     transform_text(text, |style| monochrome_style(style, theme))
 }
 
@@ -1066,6 +1070,7 @@ fn color_distance_sq(a: (u8, u8, u8), b: (u8, u8, u8)) -> u32 {
     let dg = i32::from(a.1) - i32::from(b.1);
     let db = i32::from(a.2) - i32::from(b.2);
     (dr * dr + dg * dg + db * db) as u32
+}
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1492,8 +1497,10 @@ fn hard_wrap_with_cursor(
 
 #[cfg(test)]
 mod tests {
+    use super::pane_render_helpers::*;
     use super::*;
     use ratatui::style::Stylize;
+    use ratatui::text::{Line, Text};
 
     const TEST_PALETTE: &[Color] = &[
         Color::Rgb(20, 20, 24),

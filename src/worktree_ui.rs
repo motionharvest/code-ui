@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use ratatui::{
-    layout::{Alignment, Rect},
+    layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
@@ -93,7 +93,7 @@ pub(crate) fn worktree_row_state(
     entries: &[WorktreeInfo],
     entry_summaries: &[Option<GitSummary>],
     entry_snapshots: &[WorktreeGitSnapshot],
-    repo_root: &Path,
+    _repo_root: &Path,
     current_path: Option<&Path>,
     runtime_flags: &[(PathBuf, WorktreeRuntimeFlag)],
 ) -> WorktreeLifecycleState {
@@ -345,7 +345,7 @@ fn render_worktree_list(
     entries: &[WorktreeInfo],
     entry_states: &[WorktreeLifecycleState],
     repo_root: &Path,
-    current_path: Option<&Path>,
+    _current_path: Option<&Path>,
     selected_index: usize,
     list_column: WorktreeListColumn,
     focus: WorktreePickerFocus,
@@ -490,7 +490,7 @@ fn render_delete_confirm(
             Style::default().fg(theme.foreground)
         };
         f.render_widget(
-            Paragraph::new(format!("{marker}{label}")),
+            Paragraph::new(format!("{marker}{label}")).style(style),
             clip_rect_to_frame(row, frame),
         );
         y = next;
@@ -524,7 +524,7 @@ fn render_new_worktree_form(
             Style::default().fg(theme.foreground)
         };
         f.render_widget(
-            Paragraph::new(format!("{label} {value}")),
+            Paragraph::new(format!("{label} {value}")).style(style),
             clip_rect_to_frame(row, frame),
         );
         y = next;
@@ -654,7 +654,7 @@ fn render_commit_review(
 fn render_commit_message(
     f: &mut ratatui::Frame<'_>,
     area: Rect,
-    theme: Theme,
+    _theme: Theme,
     message: &str,
     selected_count: usize,
 ) {
@@ -685,7 +685,7 @@ fn render_commit_message(
 fn render_merge_confirm(
     f: &mut ratatui::Frame<'_>,
     area: Rect,
-    theme: Theme,
+    _theme: Theme,
     entries: &[WorktreeInfo],
     entry_summaries: &[Option<GitSummary>],
     entry_snapshots: &[WorktreeGitSnapshot],

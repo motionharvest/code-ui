@@ -1943,7 +1943,7 @@ pub(crate) fn worktree_picker_modal_area(
 }
 
 pub(crate) use crate::worktree_ui::{
-    worktree_picker_list_area, worktree_picker_list_hit_index, worktree_picker_status_column_hit,
+    worktree_picker_list_hit_index, worktree_picker_status_column_hit,
 };
 
 pub(crate) fn render_worktree_picker_modal(

@@ -156,19 +156,6 @@ pub(crate) fn branch_base_from_pane_name(name: &str) -> String {
     }
 }
 
-pub(crate) fn next_available_branch(git_root: &Path, base: &str) -> String {
-    if !branch_exists(git_root, base) {
-        return base.to_string();
-    }
-    for n in 1..1000 {
-        let candidate = format!("{base}-{n}");
-        if !branch_exists(git_root, &candidate) {
-            return candidate;
-        }
-    }
-    format!("{base}-extra")
-}
-
 fn branch_exists(git_root: &Path, branch: &str) -> bool {
     let Some(root) = git_root.to_str() else {
         return false;
@@ -185,41 +172,6 @@ fn branch_exists(git_root: &Path, branch: &str) -> bool {
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
-}
-
-pub(crate) fn sibling_worktree_path(git_root: &Path, branch: &str) -> PathBuf {
-    let parent = git_root
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from(".."));
-    let repo_name = git_root
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "repo".to_string());
-    let branch_suffix = branch.replace('/', "-");
-    parent.join(format!("{repo_name}-{branch_suffix}"))
-}
-
-pub(crate) fn next_available_worktree_path(git_root: &Path, branch: &str) -> PathBuf {
-    let base = sibling_worktree_path(git_root, branch);
-    if !base.exists() {
-        return base;
-    }
-    for n in 1..1000 {
-        let candidate = {
-            let parent = base.parent().unwrap_or_else(|| Path::new(".."));
-            let stem = base
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("worktree");
-            parent.join(format!("{stem}-{n}"))
-        };
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-    base
 }
 
 pub(crate) fn ensure_codeui_gitignored(git_root: &Path) -> anyhow::Result<()> {
@@ -438,10 +390,6 @@ pub(crate) fn worktree_git_snapshot(
     }
 }
 
-pub(crate) fn create_worktree(git_root: &Path, branch: &str) -> anyhow::Result<PathBuf> {
-    create_worktree_from_base(git_root, branch, branch, branch)
-}
-
 pub(crate) fn create_worktree_from_base(
     git_root: &Path,
     name: &str,
@@ -560,20 +508,6 @@ pub(crate) fn delete_worktree(
     Ok(())
 }
 
-pub(crate) fn worktree_is_deletable(
-    entry: &WorktreeInfo,
-    repo_root: &Path,
-    current_path: Option<&Path>,
-) -> bool {
-    if paths_equal(&entry.path, repo_root) {
-        return false;
-    }
-    if current_path.is_some_and(|path| paths_equal(path, &entry.path)) {
-        return false;
-    }
-    true
-}
-
 pub(crate) fn paths_equal(a: &Path, b: &Path) -> bool {
     if a == b {
         return true;
@@ -582,6 +516,21 @@ pub(crate) fn paths_equal(a: &Path, b: &Path) -> bool {
         .ok()
         .zip(fs::canonicalize(b).ok())
         .is_some_and(|(left, right)| left == right)
+}
+
+#[cfg(test)]
+fn sibling_worktree_path(git_root: &Path, branch: &str) -> PathBuf {
+    let parent = git_root
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(".."));
+    let repo_name = git_root
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "repo".to_string());
+    let branch_suffix = branch.replace('/', "-");
+    parent.join(format!("{repo_name}-{branch_suffix}"))
 }
 
 #[cfg(test)]

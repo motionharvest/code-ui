@@ -11,28 +11,14 @@ pub struct TerminalTheme {
     pub background: Option<RgbColor>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DefaultColorKind {
     Foreground,
     Background,
 }
 
-pub const HOST_COLOR_QUERY_SEQUENCE: &str = "\x1b]10;?\x1b\\\x1b]11;?\x1b\\";
-
-impl TerminalTheme {
-    pub fn with_color(mut self, kind: DefaultColorKind, color: RgbColor) -> Self {
-        match kind {
-            DefaultColorKind::Foreground => self.foreground = Some(color),
-            DefaultColorKind::Background => self.background = Some(color),
-        }
-        self
-    }
-
-    pub fn is_empty(self) -> bool {
-        self.foreground.is_none() && self.background.is_none()
-    }
-}
-
+#[cfg(test)]
 pub fn parse_default_color_response(sequence: &str) -> Option<(DefaultColorKind, RgbColor)> {
     let body = sequence.strip_prefix("\x1b]")?;
     let body = body
@@ -47,17 +33,7 @@ pub fn parse_default_color_response(sequence: &str) -> Option<(DefaultColorKind,
     Some((kind, parse_rgb_color(value)?))
 }
 
-pub fn osc_set_default_color_sequence(kind: DefaultColorKind, color: RgbColor) -> String {
-    let command = match kind {
-        DefaultColorKind::Foreground => 10,
-        DefaultColorKind::Background => 11,
-    };
-    format!(
-        "\x1b]{command};rgb:{:02x}/{:02x}/{:02x}\x1b\\",
-        color.r, color.g, color.b
-    )
-}
-
+#[cfg(test)]
 fn parse_rgb_color(value: &str) -> Option<RgbColor> {
     if let Some(rgb) = value.strip_prefix("rgb:") {
         let mut parts = rgb.split('/');
@@ -84,6 +60,7 @@ fn parse_rgb_color(value: &str) -> Option<RgbColor> {
     None
 }
 
+#[cfg(test)]
 fn parse_hex_component(component: &str) -> Option<u8> {
     if component.is_empty()
         || component.len() > 4

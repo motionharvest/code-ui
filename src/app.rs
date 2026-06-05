@@ -5081,7 +5081,7 @@ impl App {
     }
 
     fn handle_worktree_picker_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
-        let Some(mut picker) = self.modal.take() else {
+        let Some(picker) = self.modal.take() else {
             return Ok(());
         };
         let Modal::WorktreePicker {

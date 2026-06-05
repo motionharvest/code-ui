@@ -225,6 +225,7 @@ pub(crate) fn run_worktree_checks(worktree_path: &Path) -> CheckResults {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn format_worktree_changes(summary: &GitSummary) -> String {
     let mut out = String::new();
     if summary.unstaged > 0 {

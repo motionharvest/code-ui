@@ -16,6 +16,7 @@ pub(crate) enum WorktreeLifecycleState {
     ChecksFailed,
     MergeReady,
     Merged,
+    #[allow(dead_code)]
     Stale,
     Running,
     Checking,

@@ -206,8 +206,8 @@ impl Pane {
                 thread::spawn(move || pump_pty_output(reader, tx));
 
                 let (
-                    mut terminal,
-                    mut render_state,
+                    terminal,
+                    render_state,
                     initial_default_foreground,
                     initial_default_background,
                 ) = make_ghostty_state(rows, cols)?;
@@ -367,6 +367,9 @@ impl Pane {
     }
 
     pub(crate) fn tmux_pane_path(&self) -> Option<PathBuf> {
+        if self.stub {
+            return None;
+        }
         pane_cwd_from_pid(self.child.as_raw())
     }
 
@@ -644,7 +647,11 @@ impl Pane {
         let before = self.scroll_metrics().map(|m| m.offset_from_bottom);
         self.terminal.scroll_viewport_delta(delta);
         let after = self.scroll_metrics().map(|m| m.offset_from_bottom);
-        before != after
+        let changed = before != after;
+        if changed {
+            let _ = self.render_state.update(&self.terminal);
+        }
+        changed
     }
 
     pub(crate) fn scroll_up(&mut self, lines: usize) -> bool {
@@ -667,14 +674,22 @@ impl Pane {
         let before = self.scroll_metrics().map(|m| m.offset_from_bottom);
         self.terminal.scroll_viewport_top();
         let after = self.scroll_metrics().map(|m| m.offset_from_bottom);
-        before != after
+        let changed = before != after;
+        if changed {
+            let _ = self.render_state.update(&self.terminal);
+        }
+        changed
     }
 
     pub(crate) fn scroll_bottom(&mut self) -> bool {
         let before = self.scroll_metrics().map(|m| m.offset_from_bottom);
         self.terminal.scroll_viewport_bottom();
         let after = self.scroll_metrics().map(|m| m.offset_from_bottom);
-        before != after
+        let changed = before != after;
+        if changed {
+            let _ = self.render_state.update(&self.terminal);
+        }
+        changed
     }
 
     pub(crate) fn tmux_copy_mode_active(&self) -> bool {
@@ -715,16 +730,6 @@ impl Pane {
         self.viewport_plain_rows().join("\n")
     }
 
-    pub(crate) fn cursor_position_in(&self, area: Rect) -> Option<(u16, u16)> {
-        let (col, row) = self.cursor_cell()?;
-        if area.width == 0 || area.height == 0 {
-            return None;
-        }
-        let col = col.min(area.width.saturating_sub(1));
-        let row = row.min(area.height.saturating_sub(1));
-        Some((area.x + col, area.y + row))
-    }
-
     pub(crate) fn cursor_cell(&self) -> Option<(u16, u16)> {
         if self.scrolled_up() {
             return None;
@@ -754,6 +759,7 @@ impl Pane {
         if lines > 0 {
             self.terminal.scroll_viewport_delta(-(lines as isize));
         }
+        let _ = self.render_state.update(&self.terminal);
     }
 
     fn viewport_plain_rows(&self) -> Vec<String> {
@@ -1072,9 +1078,17 @@ mod tests {
 
     #[test]
     fn shell_output_reaches_ghostty_viewport() {
-        let mut pane =
-            Pane::new(0, "test", "echo code-ui-terminal-ok", None, None, 24, 80, None)
-                .expect("pane");
+        let mut pane = Pane::new(
+            10_001,
+            "test",
+            "sh -c 'echo code-ui-terminal-ok; exec cat'",
+            None,
+            None,
+            24,
+            80,
+            None,
+        )
+        .expect("pane");
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
             pane.pump();
@@ -1116,7 +1130,8 @@ mod tests {
 
     #[test]
     fn resize_keeps_pty_and_terminal_in_sync() {
-        let mut pane = Pane::new(0, "test", "cat", None, None, 12, 40, None).expect("pane");
+        let mut pane =
+            Pane::new(10_002, "test", "cat", None, None, 12, 40, None).expect("pane");
         pane.pump();
         pane.resize(18, 100);
         assert_eq!(pane.rows, 18);
