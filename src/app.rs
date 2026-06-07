@@ -29,7 +29,9 @@ use crate::{
         placement_is_adjacent, save_persisted_layout, DebugContainer, DebugPlacement,
         ExposedSides, Node, PersistedWorkspace, Placement, ResizeBoundary, SplitSide,
     },
-    pane::{Pane, PaneMouseEventKind, PaneSelection, MOUSE_SCROLL_LINES},
+    pane::{
+        Pane, PaneMouseEventKind, PaneSelection, SelectionAnchor, MOUSE_SCROLL_LINES,
+    },
     theme::{load_persisted_theme_index, save_persisted_theme, Theme, THEMES},
     ui::{
         default_agent_index, help_close_button_area,
@@ -123,8 +125,8 @@ struct DragPaneMouse {
 #[derive(Clone, Copy)]
 struct TextSelection {
     pane_id: usize,
-    start: (u16, u16),
-    end: (u16, u16),
+    anchor: SelectionAnchor,
+    cursor: SelectionAnchor,
     active: bool,
 }
 
@@ -1217,13 +1219,60 @@ impl App {
     }
 
     fn start_text_selection(&mut self, pane_id: usize, cell: (u16, u16)) {
+        let Some(pane) = self.pane(pane_id) else {
+            return;
+        };
+        let Some(anchor) = pane.selection_anchor_from_viewport(cell.0, cell.1) else {
+            return;
+        };
         self.text_selection = Some(TextSelection {
             pane_id,
-            start: cell,
-            end: cell,
+            anchor,
+            cursor: anchor,
             active: true,
         });
         self.drag_pane_mouse = None;
+    }
+
+    fn scroll_text_selection_pane(&mut self, pane_id: usize, lines: isize) -> usize {
+        let Some(pane) = self.pane_mut(pane_id) else {
+            return 0;
+        };
+        let before = pane.scroll_metrics().map(|m| m.viewport_offset);
+        if lines.is_negative() {
+            pane.scroll_up(lines.unsigned_abs());
+        } else if lines > 0 {
+            pane.scroll_down(lines as usize);
+        }
+        let after = pane.scroll_metrics().map(|m| m.viewport_offset);
+        before
+            .zip(after)
+            .map(|(before, after)| before.abs_diff(after))
+            .unwrap_or(0)
+    }
+
+    fn extend_selection_cursor_for_scroll(
+        &mut self,
+        selection: &mut TextSelection,
+        lines_scrolled_up: isize,
+    ) {
+        let Some(pane) = self.pane(selection.pane_id) else {
+            return;
+        };
+        let Some(metrics) = pane.scroll_metrics() else {
+            return;
+        };
+        if lines_scrolled_up == 0 {
+            return;
+        }
+        let top = metrics.viewport_offset as u32;
+        let bottom = top
+            .saturating_add(metrics.viewport_rows.saturating_sub(1) as u32);
+        if lines_scrolled_up > 0 {
+            selection.cursor.screen_row = selection.cursor.screen_row.min(top);
+        } else {
+            selection.cursor.screen_row = selection.cursor.screen_row.max(bottom);
+        }
     }
 
     fn update_text_selection(&mut self, size: Rect, mouse: &MouseEvent) -> bool {
@@ -1241,13 +1290,57 @@ impl App {
                     return false;
                 };
                 if let Some(cell) = Self::pane_mouse_cell(inner, mouse.column, mouse.row) {
-                    selection.end = cell;
+                    const EDGE_SCROLL_LINES: isize = 1;
+                    if cell.1 == 0 {
+                        let scrolled =
+                            self.scroll_text_selection_pane(selection.pane_id, -EDGE_SCROLL_LINES);
+                        if scrolled > 0 {
+                            self.extend_selection_cursor_for_scroll(
+                                &mut selection,
+                                scrolled as isize,
+                            );
+                        }
+                    } else if cell.1 == inner.height.saturating_sub(1) {
+                        let scrolled =
+                            self.scroll_text_selection_pane(selection.pane_id, EDGE_SCROLL_LINES);
+                        if scrolled > 0 {
+                            self.extend_selection_cursor_for_scroll(
+                                &mut selection,
+                                -(scrolled as isize),
+                            );
+                        }
+                    }
+                    if let Some(pane) = self.pane(selection.pane_id) {
+                        if let Some(cursor) =
+                            pane.selection_anchor_from_viewport(cell.0, cell.1)
+                        {
+                            selection.cursor = cursor;
+                        }
+                    }
                     self.text_selection = Some(selection);
                     return true;
                 }
             }
+            MouseEventKind::ScrollUp => {
+                let scrolled = self
+                    .scroll_text_selection_pane(selection.pane_id, -(MOUSE_SCROLL_LINES as isize));
+                if scrolled > 0 {
+                    self.extend_selection_cursor_for_scroll(&mut selection, scrolled as isize);
+                }
+                self.text_selection = Some(selection);
+                return true;
+            }
+            MouseEventKind::ScrollDown => {
+                let scrolled = self
+                    .scroll_text_selection_pane(selection.pane_id, MOUSE_SCROLL_LINES as isize);
+                if scrolled > 0 {
+                    self.extend_selection_cursor_for_scroll(&mut selection, -(scrolled as isize));
+                }
+                self.text_selection = Some(selection);
+                return true;
+            }
             MouseEventKind::Up(MouseButton::Left) => {
-                if selection.start == selection.end {
+                if selection.anchor == selection.cursor {
                     self.text_selection = None;
                     return true;
                 }
@@ -1265,16 +1358,13 @@ impl App {
         let Some(selection) = self.text_selection else {
             return Ok(false);
         };
-        if selection.start == selection.end {
+        if selection.anchor == selection.cursor {
             return Ok(false);
         }
         let Some(pane) = self.pane(selection.pane_id) else {
             return Ok(false);
         };
-        let text = pane.selected_text(PaneSelection {
-            start: selection.start,
-            end: selection.end,
-        });
+        let text = pane.selected_text_from_anchors(selection.anchor, selection.cursor);
         if text.is_empty() {
             return Ok(false);
         }
@@ -1301,7 +1391,15 @@ impl App {
             .filter(|selection| selection.pane_id == pane_id)
         {
             let mut selection = selection;
-            selection.end = move_cell(selection.end, delta, cols, rows);
+            let viewport_cursor = pane
+                .viewport_coords_from_anchor(selection.cursor)
+                .unwrap_or(cursor);
+            let moved_cell = move_cell(viewport_cursor, delta, cols, rows);
+            if let Some(moved) =
+                pane.selection_anchor_from_viewport(moved_cell.0, moved_cell.1)
+            {
+                selection.cursor = moved;
+            }
             selection
         } else {
             let selected = if delta.is_negative() {
@@ -1309,10 +1407,13 @@ impl App {
             } else {
                 cursor
             };
+            let Some(anchor) = pane.selection_anchor_from_viewport(selected.0, selected.1) else {
+                return false;
+            };
             TextSelection {
                 pane_id,
-                start: selected,
-                end: selected,
+                anchor,
+                cursor: anchor,
                 active: false,
             }
         };
@@ -1322,12 +1423,9 @@ impl App {
     }
 
     pub(crate) fn pane_selection(&self, pane_id: usize) -> Option<PaneSelection> {
-        self.text_selection
-            .filter(|selection| selection.pane_id == pane_id)
-            .map(|selection| PaneSelection {
-                start: selection.start,
-                end: selection.end,
-            })
+        let selection = self.text_selection.filter(|selection| selection.pane_id == pane_id)?;
+        let pane = self.pane(pane_id)?;
+        pane.visible_viewport_selection(selection.anchor, selection.cursor)
     }
 
     fn forward_active_pane_mouse_drag(
@@ -1554,7 +1652,7 @@ impl App {
         {
             let has_text_selection = self
                 .text_selection
-                .is_some_and(|selection| selection.start != selection.end);
+                .is_some_and(|selection| selection.anchor != selection.cursor);
             if self.copy_text_selection()? || has_text_selection {
                 return Ok(());
             }
@@ -2833,7 +2931,6 @@ impl App {
                 mouse.column,
                 mouse.row,
             )
-                || placement.refresh_hit(mouse.column, mouse.row)
                 || placement.maximize_hit(mouse.column, mouse.row)
                 || placement.close_hit(mouse.column, mouse.row);
             if !chrome_hit {
@@ -2851,18 +2948,6 @@ impl App {
                     return Ok(());
                 }
             }
-        }
-
-        if clicked && placement.refresh_hit(mouse.column, mouse.row) {
-            self.focus_pane(placement.pane_id);
-            if let Some(pane) = self
-                .panes
-                .iter_mut()
-                .find(|pane| pane.id == placement.pane_id)
-            {
-                pane.refresh_terminal()?;
-            }
-            return Ok(());
         }
 
         if clicked && placement.maximize_hit(mouse.column, mouse.row) {

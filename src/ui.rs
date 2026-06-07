@@ -293,9 +293,10 @@ pub(crate) fn render_panel_title_chrome(
                     pane_title_controls_icons_area(panel_area, show_right_edge)
                 {
                     let maximize_icon = if is_maximized { "🗗" } else { "⛶" };
+                    let focus_label = if is_maximized { " BACK" } else { " FOCUS" };
                     let pad = " ".repeat(PANE_CONTROLS_PADDING as usize);
                     let controls_text =
-                        format!("{pad}↻{pad}{maximize_icon}{pad}✕{pad}");
+                        format!("{pad}{maximize_icon}{focus_label}{pad}✕{pad}");
 
                     let bar_start = title_rule_start;
                     let bar_width = icons_area.x.saturating_sub(bar_start);

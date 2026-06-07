@@ -41,9 +41,16 @@ const MODE_MOUSE_ANY_MOTION: u16 = 1003;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ScrollMetrics {
+    pub viewport_offset: usize,
     pub offset_from_bottom: usize,
     pub max_offset_from_bottom: usize,
     pub viewport_rows: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SelectionAnchor {
+    pub col: u16,
+    pub screen_row: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -726,6 +733,88 @@ impl Pane {
             .unwrap_or_default()
     }
 
+    pub(crate) fn selection_anchor_from_viewport(&self, col: u16, viewport_row: u16) -> Option<SelectionAnchor> {
+        let metrics = self.scroll_metrics()?;
+        Some(SelectionAnchor {
+            col,
+            screen_row: metrics.viewport_offset as u32 + u32::from(viewport_row),
+        })
+    }
+
+    pub(crate) fn viewport_coords_from_anchor(&self, anchor: SelectionAnchor) -> Option<(u16, u16)> {
+        let metrics = self.scroll_metrics()?;
+        if anchor.screen_row < metrics.viewport_offset as u32 {
+            return None;
+        }
+        let viewport_row = anchor.screen_row - metrics.viewport_offset as u32;
+        if viewport_row >= metrics.viewport_rows as u32 {
+            return None;
+        }
+        Some((anchor.col, viewport_row as u16))
+    }
+
+    pub(crate) fn selected_text_from_anchors(
+        &self,
+        anchor: SelectionAnchor,
+        cursor: SelectionAnchor,
+    ) -> String {
+        let ((start_col, start_row), (end_col, end_row)) = normalized_anchor_pair(anchor, cursor);
+        self.terminal
+            .read_text_screen((start_col, start_row), (end_col, end_row), false)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn visible_viewport_selection(
+        &self,
+        anchor: SelectionAnchor,
+        cursor: SelectionAnchor,
+    ) -> Option<PaneSelection> {
+        if anchor == cursor {
+            return None;
+        }
+        let metrics = self.scroll_metrics()?;
+        let offset = metrics.viewport_offset;
+        let height = metrics.viewport_rows;
+        if height == 0 {
+            return None;
+        }
+        let (start, end) = if (anchor.screen_row, anchor.col) <= (cursor.screen_row, cursor.col) {
+            (anchor, cursor)
+        } else {
+            (cursor, anchor)
+        };
+        let last_visible = offset + height.saturating_sub(1);
+        if start.screen_row as usize > last_visible && end.screen_row as usize > last_visible {
+            return None;
+        }
+        if (end.screen_row as usize) < offset && (start.screen_row as usize) < offset {
+            return None;
+        }
+
+        let start_row = start
+            .screen_row
+            .saturating_sub(offset as u32)
+            .min(height.saturating_sub(1) as u32) as u16;
+        let end_row = end
+            .screen_row
+            .saturating_sub(offset as u32)
+            .min(height.saturating_sub(1) as u32) as u16;
+        let start_col = if (start.screen_row as usize) < offset {
+            0
+        } else {
+            start.col
+        };
+        let end_col = if end.screen_row as usize > last_visible {
+            self.cols.saturating_sub(1)
+        } else {
+            end.col
+        };
+        Some(PaneSelection {
+            start: (start_col, start_row),
+            end: (end_col, end_row),
+        })
+    }
+
     pub(crate) fn recent_plain_text(&self) -> String {
         self.viewport_plain_rows().join("\n")
     }
@@ -743,9 +832,10 @@ impl Pane {
         Some((col, row))
     }
 
-    fn scroll_metrics(&self) -> Option<ScrollMetrics> {
+    pub(crate) fn scroll_metrics(&self) -> Option<ScrollMetrics> {
         let scrollbar = self.terminal.scrollbar().ok()?;
         Some(ScrollMetrics {
+            viewport_offset: scrollbar.offset,
             offset_from_bottom: scrollbar
                 .total
                 .saturating_sub(scrollbar.offset + scrollbar.len),
@@ -904,6 +994,17 @@ fn normalized_selection(selection: PaneSelection) -> ((u16, u16), (u16, u16)) {
         (selection.start, selection.end)
     } else {
         (selection.end, selection.start)
+    }
+}
+
+fn normalized_anchor_pair(
+    anchor: SelectionAnchor,
+    cursor: SelectionAnchor,
+) -> ((u16, u32), (u16, u32)) {
+    if (anchor.screen_row, anchor.col) <= (cursor.screen_row, cursor.col) {
+        ((anchor.col, anchor.screen_row), (cursor.col, cursor.screen_row))
+    } else {
+        ((cursor.col, cursor.screen_row), (anchor.col, anchor.screen_row))
     }
 }
 
@@ -1100,6 +1201,23 @@ mod tests {
         panic!(
             "expected shell output in viewport, got {:?}",
             pane.recent_plain_text()
+        );
+    }
+
+    #[test]
+    fn screen_selection_reads_scrolled_history() {
+        let mut terminal = ghostty::Terminal::new(6, 3, 256).expect("terminal");
+        for i in 0..8 {
+            terminal.write(format!("row{i}\r\n").as_bytes());
+        }
+        terminal.scroll_viewport_delta(-2);
+        let top = terminal.scrollbar().expect("scrollbar").offset as u32;
+        let text = terminal
+            .read_text_screen((0, top), (4, top + 2), false)
+            .expect("selection text");
+        assert!(
+            text.contains("row3") || text.contains("row4") || text.contains("row5"),
+            "unexpected selection text {text:?} at top={top}"
         );
     }
 

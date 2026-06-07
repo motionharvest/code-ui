@@ -234,13 +234,16 @@ pub(crate) const PANE_TITLE_TEXT_PADDING: u16 = 1;
 pub(crate) const PANE_TITLE_LEFT_PADDING: u16 = 4;
 pub(crate) const PANE_CONTROLS_PADDING: u16 = 1;
 const PANE_CONTROL_ICON_COLUMNS: u16 = 1;
+const PANE_FOCUS_LABEL_COLUMNS: u16 = 6; // " FOCUS"
+const PANE_FOCUS_BUTTON_COLUMNS: u16 = PANE_CONTROL_ICON_COLUMNS + PANE_FOCUS_LABEL_COLUMNS;
 const PANE_CONTROLS_CORNER_COLUMNS: u16 = 2;
-const PANE_CONTROLS_MIN_WIDTH: u16 = 13;
+const PANE_CONTROLS_MIN_WIDTH: u16 = 15;
 
 pub(crate) fn pane_title_controls_icons_width(_show_right_edge: bool) -> u16 {
     PANE_CONTROLS_PADDING
-        .saturating_mul(4)
-        .saturating_add(PANE_CONTROL_ICON_COLUMNS.saturating_mul(3))
+        .saturating_mul(3)
+        .saturating_add(PANE_FOCUS_BUTTON_COLUMNS)
+        .saturating_add(PANE_CONTROL_ICON_COLUMNS)
 }
 
 pub(crate) fn pane_title_controls_width(_show_right_edge: bool) -> u16 {
@@ -279,24 +282,11 @@ pub(crate) fn pane_title_top_right_corner_area(area: Rect, show_right_edge: bool
     })
 }
 
-pub(crate) fn pane_refresh_button_area(area: Rect, show_right_edge: bool) -> Option<Rect> {
+pub(crate) fn pane_maximize_button_area(area: Rect, show_right_edge: bool) -> Option<Rect> {
     pane_title_controls_area(area, show_right_edge).map(|controls| Rect {
         x: controls.x.saturating_add(PANE_CONTROLS_PADDING),
         y: controls.y,
-        width: PANE_CONTROL_ICON_COLUMNS,
-        height: 1,
-    })
-}
-
-pub(crate) fn pane_maximize_button_area(area: Rect, show_right_edge: bool) -> Option<Rect> {
-    pane_title_controls_area(area, show_right_edge).map(|controls| Rect {
-        x: controls
-            .x
-            .saturating_add(PANE_CONTROLS_PADDING)
-            .saturating_add(PANE_CONTROL_ICON_COLUMNS)
-            .saturating_add(PANE_CONTROLS_PADDING),
-        y: controls.y,
-        width: PANE_CONTROL_ICON_COLUMNS,
+        width: PANE_FOCUS_BUTTON_COLUMNS,
         height: 1,
     })
 }
@@ -306,9 +296,7 @@ pub(crate) fn pane_close_button_area(area: Rect, show_right_edge: bool) -> Optio
         x: controls
             .x
             .saturating_add(PANE_CONTROLS_PADDING)
-            .saturating_add(PANE_CONTROL_ICON_COLUMNS)
-            .saturating_add(PANE_CONTROLS_PADDING)
-            .saturating_add(PANE_CONTROL_ICON_COLUMNS)
+            .saturating_add(PANE_FOCUS_BUTTON_COLUMNS)
             .saturating_add(PANE_CONTROLS_PADDING),
         y: controls.y,
         width: PANE_CONTROL_ICON_COLUMNS,
@@ -338,8 +326,8 @@ pub(crate) fn pane_title_bar_area(area: Rect, title_bar_height: u16) -> Rect {
     }
 }
 
-/// Columns reserved on the right of the title bar for refresh / maximize / close
-/// controls (`ui.rs` rendering must stay in sync).
+/// Columns reserved on the right of the title bar for focus / close controls
+/// (`ui.rs` rendering must stay in sync).
 pub(crate) fn pane_title_chrome_reserve(pane_area_width: u16, show_right_edge: bool) -> u16 {
     if pane_area_width >= PANE_CONTROLS_MIN_WIDTH {
         pane_title_controls_width(show_right_edge)
@@ -600,11 +588,6 @@ impl Placement {
             title_bar_height,
         )
         .is_some_and(|area| contains(area, x, y))
-    }
-
-    pub(crate) fn refresh_hit(&self, x: u16, y: u16) -> bool {
-        pane_refresh_button_area(self.area, !self.exposed.right)
-            .is_some_and(|area| contains(area, x, y))
     }
 
     pub(crate) fn maximize_hit(&self, x: u16, y: u16) -> bool {
@@ -1949,9 +1932,9 @@ mod tests {
             height: 20,
         };
         let close = pane_close_button_area(area, false).expect("close button area");
-        assert_eq!(close.x, area.right().saturating_sub(2));
-        assert_eq!(pane_title_controls_width(false), 9);
-        assert_eq!(pane_title_controls_width(true), 9);
+        assert_eq!(close.x, 46);
+        assert_eq!(pane_title_controls_width(false), 13);
+        assert_eq!(pane_title_controls_width(true), 13);
     }
 
     #[test]
@@ -1981,9 +1964,9 @@ mod tests {
             height: 20,
         };
         let close = pane_close_button_area(area, true).expect("close button area");
-        assert_eq!(close.x, area.right().saturating_sub(2));
-        assert_eq!(pane_title_controls_width(true), 9);
-        assert_eq!(pane_title_controls_width(false), 9);
+        assert_eq!(close.x, 46);
+        assert_eq!(pane_title_controls_width(true), 13);
+        assert_eq!(pane_title_controls_width(false), 13);
     }
 
     #[test]
