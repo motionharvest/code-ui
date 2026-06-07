@@ -1912,10 +1912,40 @@ pub(crate) fn adjacent_overlap(current: Rect, candidate: Rect, side: SplitSide) 
     }
 }
 
+/// Screen-row span `[start, end)` where `current` shares its right edge with `right_neighbor`.
+pub(crate) fn adjacent_right_edge_y_range(current: Rect, right_neighbor: Rect) -> Option<(u16, u16)> {
+    if current.right() != right_neighbor.x {
+        return None;
+    }
+    let start = current.y.max(right_neighbor.y);
+    let end = current.bottom().min(right_neighbor.bottom());
+    if start < end {
+        Some((start, end))
+    } else {
+        None
+    }
+}
+
 pub(crate) fn overlap(start_a: u16, end_a: u16, start_b: u16, end_b: u16) -> u16 {
     let start = start_a.max(start_b);
     let end = end_a.min(end_b);
     end.saturating_sub(start)
+}
+
+pub(crate) fn y_segments_outside(
+    start: u16,
+    end: u16,
+    hidden: (u16, u16),
+) -> Vec<(u16, u16)> {
+    let mut segments = Vec::with_capacity(2);
+    if start < hidden.0 {
+        segments.push((start, hidden.0.min(end)));
+    }
+    if hidden.1 < end {
+        segments.push((hidden.1.max(start), end));
+    }
+    segments.retain(|(segment_start, segment_end)| segment_start < segment_end);
+    segments
 }
 
 #[cfg(test)]
@@ -2284,5 +2314,27 @@ mod tests {
             vertical_boundaries[0].divider_area.unwrap().width,
             area.width
         );
+    }
+
+    #[test]
+    fn adjacent_right_edge_y_range_matches_shared_vertical_span() {
+        let tall = Rect::new(0, 0, 40, 30);
+        let top_right = Rect::new(40, 0, 40, 10);
+        assert_eq!(
+            adjacent_right_edge_y_range(tall, top_right),
+            Some((0, 10))
+        );
+
+        let bottom_right = Rect::new(40, 10, 40, 20);
+        assert_eq!(
+            adjacent_right_edge_y_range(tall, bottom_right),
+            Some((10, 30))
+        );
+    }
+
+    #[test]
+    fn y_segments_outside_splits_around_hidden_span() {
+        assert_eq!(y_segments_outside(1, 11, (4, 7)), vec![(1, 4), (7, 11)]);
+        assert_eq!(y_segments_outside(1, 11, (1, 11)), Vec::<(u16, u16)>::new());
     }
 }

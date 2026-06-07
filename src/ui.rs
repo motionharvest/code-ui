@@ -77,6 +77,102 @@ fn pane_bottom_line(bottom_width: usize) -> String {
     }
 }
 
+fn render_vertical_edge_column(
+    f: &mut ratatui::Frame<'_>,
+    x: u16,
+    y_start: u16,
+    y_end: u16,
+    edge_style: Style,
+) {
+    if y_start >= y_end {
+        return;
+    }
+
+    let height = y_end.saturating_sub(y_start);
+    let column = "│\n".repeat(height.saturating_sub(1) as usize) + "│";
+    f.render_widget(
+        Paragraph::new(column)
+            .alignment(Alignment::Left)
+            .style(edge_style),
+        Rect {
+            x,
+            y: y_start,
+            width: 1,
+            height,
+        },
+    );
+}
+
+/// Draws the internal right border for panes that share a column divider, omitting
+/// rows covered by `hidden_y` (where a focused neighbor sits to the right).
+/// Top and bottom frame corners (`╮`, `╯`) always render on top of the vertical spans.
+pub(crate) fn render_pane_internal_right_edge(
+    f: &mut ratatui::Frame<'_>,
+    panel_area: Rect,
+    title_y: u16,
+    edge_style: Style,
+    show_bottom_edge: bool,
+    hidden_y: (u16, u16),
+) {
+    use crate::layout::y_segments_outside;
+
+    if panel_area.width == 0 || panel_area.height == 0 {
+        return;
+    }
+
+    let x = panel_area.right().saturating_sub(1);
+    let bottom_y = panel_area.bottom().saturating_sub(1);
+    // Title and bottom rows carry horizontal chrome (`─╮`, `╰─╯`); only draw │ between them.
+    let vertical_top = title_y.saturating_add(1);
+    let vertical_bottom = bottom_y.saturating_sub(1);
+
+    if vertical_top <= vertical_bottom {
+        for (segment_start, segment_end) in
+            y_segments_outside(vertical_top, vertical_bottom.saturating_add(1), hidden_y)
+        {
+            render_vertical_edge_column(f, x, segment_start, segment_end, edge_style);
+        }
+    }
+
+    f.render_widget(
+        Paragraph::new("╮")
+            .alignment(Alignment::Left)
+            .style(edge_style),
+        Rect {
+            x,
+            y: title_y,
+            width: 1,
+            height: 1,
+        },
+    );
+
+    if show_bottom_edge || panel_area.width >= 2 {
+        f.render_widget(
+            Paragraph::new("╯")
+                .alignment(Alignment::Left)
+                .style(edge_style),
+            Rect {
+                x,
+                y: bottom_y,
+                width: 1,
+                height: 1,
+            },
+        );
+    } else {
+        f.render_widget(
+            Paragraph::new("│")
+                .alignment(Alignment::Left)
+                .style(edge_style),
+            Rect {
+                x,
+                y: bottom_y,
+                width: 1,
+                height: 1,
+            },
+        );
+    }
+}
+
 fn render_screen_edges(
     f: &mut ratatui::Frame<'_>,
     panel_area: Rect,
@@ -101,33 +197,22 @@ fn render_screen_edges(
     };
 
     if vertical_top <= vertical_bottom {
-        let vertical_height = vertical_bottom.saturating_sub(vertical_top) + 1;
         if touches_outer_left {
-            let column = "│\n".repeat(vertical_height.saturating_sub(1) as usize) + "│";
-            f.render_widget(
-                Paragraph::new(column)
-                    .alignment(Alignment::Left)
-                    .style(edge_style),
-                Rect {
-                    x: panel_area.x,
-                    y: vertical_top,
-                    width: 1,
-                    height: vertical_height,
-                },
+            render_vertical_edge_column(
+                f,
+                panel_area.x,
+                vertical_top,
+                vertical_bottom.saturating_add(1),
+                edge_style,
             );
         }
         if touches_outer_right {
-            let column = "│\n".repeat(vertical_height.saturating_sub(1) as usize) + "│";
-            f.render_widget(
-                Paragraph::new(column)
-                    .alignment(Alignment::Left)
-                    .style(edge_style),
-                Rect {
-                    x: panel_area.right().saturating_sub(1),
-                    y: vertical_top,
-                    width: 1,
-                    height: vertical_height,
-                },
+            render_vertical_edge_column(
+                f,
+                panel_area.right().saturating_sub(1),
+                vertical_top,
+                vertical_bottom.saturating_add(1),
+                edge_style,
             );
         }
     }
@@ -356,9 +441,8 @@ pub(crate) fn render_panel_title_chrome(
 
         if show_bottom_edge && panel_area.width >= 2 {
             let bottom_y = panel_area.bottom().saturating_sub(1);
-            let bottom_line = pane_bottom_line(panel_area.width as usize);
             f.render_widget(
-                Paragraph::new(bottom_line)
+                Paragraph::new(pane_bottom_line(panel_area.width as usize))
                     .alignment(Alignment::Left)
                     .style(edge_style),
                 Rect {

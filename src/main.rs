@@ -13,7 +13,7 @@ mod worktree_lifecycle;
 mod worktree_ui;
 
 use std::{
-    collections::BTreeSet,
+    collections::BTreeMap,
     env,
     io::{self, Write},
     process::Command,
@@ -49,14 +49,14 @@ use app::{App, MousePointerShape};
 use pane::PaneSelection;
 use git_status::GitStatusCache;
 use layout::{
-    clip_rect_to_frame, pane_borders, pane_inner_area, pane_title_bar_height,
-    placement_is_adjacent, SplitSide,
+    adjacent_right_edge_y_range, clip_rect_to_frame, pane_borders, pane_inner_area,
+    pane_title_bar_height, pane_title_y, placement_is_adjacent, SplitSide,
 };
 use theme::Theme;
 use ui::{
     commander_chrome_title_label, compute_top_bar_layout,
     render_help_modal, render_new_pane_picker_modal, render_panel_settings_modal,
-    render_panel_title_chrome, render_theme_modal, render_top_chrome,
+    render_panel_title_chrome, render_pane_internal_right_edge, render_theme_modal, render_top_chrome,
     render_worktree_picker_modal, render_workspace_settings_modal, render_workspace_sidebar,
     bg_color, COMMANDER_COMMAND,
 };
@@ -317,7 +317,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                 let focused_pane_id = (app.sidebar_workspace_focused().is_none()
                     && !app.sidebar_add_button_focused())
                 .then_some(app.focused);
-                let mut suppress_right_edge_for = BTreeSet::new();
+                let mut hidden_right_edge_y: BTreeMap<usize, (u16, u16)> = BTreeMap::new();
                 if let Some(focused_id) = focused_pane_id {
                     if let Some(focused_placement) =
                         placements.iter().find(|placement| placement.pane_id == focused_id)
@@ -330,7 +330,12 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                                     SplitSide::Right,
                                 )
                             {
-                                suppress_right_edge_for.insert(placement.pane_id);
+                                if let Some(range) = adjacent_right_edge_y_range(
+                                    placement.area,
+                                    focused_placement.area,
+                                ) {
+                                    hidden_right_edge_y.insert(placement.pane_id, range);
+                                }
                             }
                         }
                     }
@@ -385,11 +390,15 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         Style::default().fg(outline_color).bg(bg_color(theme));
                     let edge_style = title_row_style;
 
+                    let show_right_edge = !placement.exposed.right;
+                    let hidden_right_edge_y =
+                        hidden_right_edge_y.get(&placement.pane_id).copied();
+
                     let mut borders = pane_borders(placement.exposed);
                     if focused && !placement.exposed.left {
                         borders |= Borders::LEFT;
                     }
-                    if suppress_right_edge_for.contains(&placement.pane_id) {
+                    if hidden_right_edge_y.is_some() && show_right_edge {
                         borders &= !Borders::RIGHT;
                     }
 
@@ -440,10 +449,23 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         theme,
                         true,
                         is_maximized,
-                        !placement.exposed.right,
+                        show_right_edge,
                         !placement.exposed.bottom,
                         !placement.exposed.left,
                     );
+
+                    if let Some(hidden_y) = hidden_right_edge_y {
+                        if show_right_edge {
+                            render_pane_internal_right_edge(
+                                f,
+                                pane_area,
+                                pane_title_y(pane_area),
+                                edge_style,
+                                !placement.exposed.bottom,
+                                hidden_y,
+                            );
+                        }
+                    }
 
                     let inner = pane_inner_area(pane_area, placement.exposed, is_commander);
                     if inner.width > 0 && inner.height > 0 {
